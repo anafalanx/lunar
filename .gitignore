@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+dist/
+debug/
+build.log
+*.res
+*.obj
+*.o
+
+# Editor
+.vscode/
+*.swp
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Vendored sources (fetched on demand)
+vendor/
+
+

@@ -1,0 +1,10 @@
+[project]
+name = "lunar-tools"
+version = "0.2.0"
+description = "Build and packaging tooling for the Lunar clock app."
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
