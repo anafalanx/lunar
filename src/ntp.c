@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "ntp.h"
+#include "clock.h"
 
 #define NTP_HOST             "pool.ntp.org"
 #define NTP_PORT             "123"
@@ -30,7 +31,8 @@ static int64_t FtToMs(FILETIME ft) {
     return (int64_t)(u.QuadPart / 10000LL) - (int64_t)FT_EPOCH_DELTA_MS;
 }
 
-static int NtpQueryOnce(int64_t *outOffsetMs) {
+static int NtpQueryOnce(int64_t *outOffsetMs, int64_t *outNtpUtcMs,
+                        int64_t *outQpcAtT4) {
     unsigned char pkt[48];
     memset(pkt, 0, sizeof(pkt));
     pkt[0] = 0x23;  // LI=0, VN=4, Mode=3 (client)
@@ -57,6 +59,7 @@ static int NtpQueryOnce(int64_t *outOffsetMs) {
 
     int recvd = recv(s, (char *)pkt, (int)sizeof(pkt), 0);
     FILETIME ft4; GetSystemTimeAsFileTime(&ft4);
+    int64_t qpcT4 = Clock_Qpc();           // monotonic anchor point
     closesocket(s);
     if (recvd != (int)sizeof(pkt)) return 0;
 
@@ -93,7 +96,12 @@ static int NtpQueryOnce(int64_t *outOffsetMs) {
     int64_t t4_ms = FtToMs(ft4);
 
     // offset = ((t2 - t1) + (t3 - t4)) / 2
-    *outOffsetMs = ((t2_ms - t1_ms) + (t3_ms - t4_ms)) / 2;
+    int64_t offset = ((t2_ms - t1_ms) + (t3_ms - t4_ms)) / 2;
+    *outOffsetMs = offset;
+    // True UTC as of the instant we captured t4 / qpcT4: our system
+    // clock at t4 plus the measured offset.
+    *outNtpUtcMs = t4_ms + offset;
+    *outQpcAtT4  = qpcT4;
     return 1;
 }
 
@@ -101,12 +109,12 @@ static DWORD WINAPI SyncThreadProc(LPVOID param) {
     (void)param;
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
-        int64_t off = 0;
-        if (NtpQueryOnce(&off)) {
-            FILETIME now; GetSystemTimeAsFileTime(&now);
+        int64_t off = 0, ntpUtc = 0, qpcT4 = 0;
+        if (NtpQueryOnce(&off, &ntpUtc, &qpcT4)) {
+            Clock_OnSyncedNtpUtc(ntpUtc, qpcT4);
             InterlockedExchange64(&g_offsetMs, off);
             InterlockedExchange64(&g_lastSuccessTick, (LONG64)GetTickCount64());
-            InterlockedExchange64(&g_lastSuccessUtc, (LONG64)FtToMs(now));
+            InterlockedExchange64(&g_lastSuccessUtc, (LONG64)ntpUtc);
         }
         WSACleanup();
     }

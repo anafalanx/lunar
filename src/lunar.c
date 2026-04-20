@@ -41,6 +41,7 @@
 #include <string.h>
 
 #include "ntp.h"
+#include "clock.h"
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -51,7 +52,7 @@
 #define DEFAULT_W        600
 #define DEFAULT_H        600
 #define TICK_MS          200           // 5 fps sweep cadence
-#define NTP_INTERVAL_MS  (3600 * 1000) // re-sync once an hour
+#define NTP_INTERVAL_MS  (600 * 1000)  // re-sync every 10 minutes
 
 // System-menu command IDs. Must be in 1..0xEFFF (>= 0xF000 is reserved).
 #define IDM_ALWAYS_ON_TOP 0x1001
@@ -748,11 +749,10 @@ static void DrawDial(float cx, float cy, float S, const Palette *pal,
 static void Paint(void) {
     if (FAILED(CreateDeviceResources())) return;
 
-    // Compute current NTP-corrected wall time.
-    struct timespec ts; timespec_get(&ts, TIME_UTC);
-    int64_t displayMs = (int64_t)ts.tv_sec * 1000LL
-                      + (int64_t)(ts.tv_nsec / 1000000)
-                      + Ntp_OffsetMs();
+    // Read the disciplined clockwork time. Clock_NowUtcMs() is
+    // QPC-driven, NTP-disciplined, and falls back to the raw system
+    // clock only until we land our first sync this run.
+    int64_t displayMs = Clock_NowUtcMs();
     time_t  t  = (time_t)(displayMs / 1000);
     int     ms = (int)   (displayMs % 1000);
     if (ms < 0) { ms += 1000; t -= 1; }
@@ -864,11 +864,8 @@ static HBITMAP RenderClockToBitmap(int w, int h) {
     HRESULT hr = ID2D1RenderTarget_CreateSolidColorBrush(
         g_rt, &black, NULL, &g_brush);
     if (SUCCEEDED(hr)) {
-        // Current NTP-corrected wall time (same logic as Paint()).
-        struct timespec ts; timespec_get(&ts, TIME_UTC);
-        int64_t displayMs = (int64_t)ts.tv_sec * 1000LL
-                          + (int64_t)(ts.tv_nsec / 1000000)
-                          + Ntp_OffsetMs();
+        // Current disciplined UTC (same source as Paint()).
+        int64_t displayMs = Clock_NowUtcMs();
         time_t  t  = (time_t)(displayMs / 1000);
         int     ms = (int)   (displayMs % 1000);
         if (ms < 0) { ms += 1000; t -= 1; }
@@ -965,12 +962,28 @@ static void ShowAbout(void) {
                  L"Last NTP sync: %02d:%02d:%02d  (%lld %s ago)",
                  lt.tm_hour, lt.tm_min, lt.tm_sec, (long long)n, unit);
     }
-    wchar_t msg[384];
-    swprintf(msg, 384,
+    wchar_t msg[512];
+    int32_t ppm = Clock_RatePpm();
+    int64_t off = Clock_OffsetMs();
+    wchar_t disciplineLine[160];
+    if (!Clock_IsDisciplined()) {
+        swprintf(disciplineLine, 160,
+                 L"Clockwork: system time (not yet disciplined)");
+    } else if (ppm == 0 && off == 0) {
+        swprintf(disciplineLine, 160,
+                 L"Clockwork: disciplined (single sample, rate pending)");
+    } else {
+        swprintf(disciplineLine, 160,
+                 L"Clockwork: %+d ppm, %+lld ms vs system",
+                 (int)ppm, (long long)off);
+    }
+    swprintf(msg, 512,
              L"Lunar 0.2.0\n\n"
              L"A minimalist analog clock.\n"
              L"Native Win32 + Direct2D.\n\n"
+             L"%s\n"
              L"%s",
+             disciplineLine,
              sync);
     MessageBoxW(g_hwnd, msg, L"About Lunar", MB_ICONINFORMATION | MB_OK);
 }
@@ -1024,10 +1037,7 @@ static void Tick(void) {
     }
 
     // Minute-crossing beep detection.
-    struct timespec ts; timespec_get(&ts, TIME_UTC);
-    int64_t displayMs = (int64_t)ts.tv_sec * 1000LL
-                      + (int64_t)(ts.tv_nsec / 1000000)
-                      + Ntp_OffsetMs();
+    int64_t displayMs = Clock_NowUtcMs();
     time_t t  = (time_t)(displayMs / 1000);
     int    ms = (int)   (displayMs % 1000);
     if (ms < 0) { ms += 1000; t -= 1; }
@@ -1230,6 +1240,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (r != IDOK) return 0;
         }
         SaveWindowState(hwnd, g_alwaysOnTop);
+        Clock_Shutdown();
         DestroyWindow(hwnd);
         return 0;
 
@@ -1341,6 +1352,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     if (g_alwaysOnTop) ApplyAlwaysOnTop(1);
 
     // Kick off the first NTP sync as soon as the window exists.
+    Clock_Init();
     Ntp_Start();
     g_lastNtpKickMs = GetTickCount();
 

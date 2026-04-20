@@ -46,6 +46,7 @@ def main() -> int:
         TESTS / "test_core.c",   # #includes ../src/lunar.c with LUNAR_NO_MAIN
         SRC  / "sysvol.c",
         SRC  / "ntp.c",
+        SRC  / "clock.c",
     ]
     # No -mwindows: we want a console main(). -Werror to catch new warnings.
     cmd = [

@@ -108,6 +108,7 @@ def main() -> None:
         str(SRC / "lunar.c"),
         str(SRC / "sysvol.c"),
         str(SRC / "ntp.c"),
+        str(SRC / "clock.c"),
         str(res),
         # Direct2D + DirectWrite for rendering; winmm for PlaySound;
         # ole32 for COM plumbing that sysvol.c and D2D rely on;

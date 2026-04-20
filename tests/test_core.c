@@ -363,6 +363,84 @@ static void test_ntp_header_validation(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Disciplined clock: anchor + PLL behaviour.
+// ---------------------------------------------------------------------------
+//
+// Clock_Init/OnSyncedNtpUtc/NowUtcMs are tied to Windows time internally,
+// but the core math can be exercised by feeding synthetic QPC values and
+// reading Clock_RatePpm() / Clock_OffsetMs(). We don't cover the
+// ProjectLocked() slew curve here (hard to script against the real QPC);
+// we cover the PLL convergence and the snap threshold.
+
+static void test_clock_discipline(void) {
+    // Redirect APPDATA so we don't clobber the user's discipline.dat.
+    wchar_t scratchW[MAX_PATH + 32];
+    wchar_t cwd[MAX_PATH]; GetCurrentDirectoryW(MAX_PATH, cwd);
+    _snwprintf(scratchW, MAX_PATH + 32, L"%ls\\build\\test_scratch", cwd);
+    _wmkdir(scratchW);
+    wchar_t envsetW[MAX_PATH + 48];
+    _snwprintf(envsetW, MAX_PATH + 48, L"APPDATA=%ls", scratchW);
+    _wputenv(envsetW);
+
+    // Kill any stale discipline file from a previous run.
+    wchar_t discPath[MAX_PATH];
+    _snwprintf(discPath, MAX_PATH, L"%ls\\Lunar\\discipline.dat", scratchW);
+    _wremove(discPath);
+
+    Clock_Init();
+
+    // Not disciplined yet: must return 0 rate.
+    CHECK_EQ_INT(Clock_IsDisciplined(), 0);
+    CHECK_EQ_INT(Clock_RatePpm(), 0);
+
+    // Simulate an NTP sample. Use the REAL QPC so ProjectLocked's deltas
+    // are consistent with subsequent samples we'll feed it.
+    int64_t qpcFreq;
+    { LARGE_INTEGER f; QueryPerformanceFrequency(&f); qpcFreq = f.QuadPart; }
+
+    int64_t t0_utc;
+    { FILETIME ft; GetSystemTimeAsFileTime(&ft);
+      ULARGE_INTEGER u; u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+      t0_utc = (int64_t)(u.QuadPart / 10000LL) - 11644473600000LL; }
+    int64_t t0_qpc = Clock_Qpc();
+    Clock_OnSyncedNtpUtc(t0_utc, t0_qpc);
+    CHECK_EQ_INT(Clock_IsDisciplined(), 1);
+    CHECK_EQ_INT(Clock_RatePpm(), 0);   // only one sample => rate undefined
+
+    // Second sample: pretend 1 hour of QPC elapsed, and the server says
+    // we drifted +100 ms. Observed rate correction = +100 ms / 3.6e6 ms
+    // = +27.7 ppm. EMA alpha = 0.25, starting from 0 => new rate ~= 6-7 ppm.
+    int64_t oneHourQpc = t0_qpc + qpcFreq * 3600;
+    int64_t t1_utc     = t0_utc + 3600LL * 1000 + 100;  // server says +100ms
+    Clock_OnSyncedNtpUtc(t1_utc, oneHourQpc);
+    int32_t r1 = Clock_RatePpm();
+    CHECK(r1 >= 5 && r1 <= 9);   // 27.7 * 0.25 = 6.9
+
+    // Third sample another hour later, again +100 ms drift vs our
+    // (still-too-slow) rate of ~7 ppm. EMA should pull us further up.
+    int64_t twoHourQpc = t0_qpc + qpcFreq * 7200;
+    int64_t t2_utc     = t1_utc + 3600LL * 1000 + 100;
+    Clock_OnSyncedNtpUtc(t2_utc, twoHourQpc);
+    int32_t r2 = Clock_RatePpm();
+    CHECK(r2 > r1);            // PLL is converging toward ~28 ppm
+    CHECK(r2 < 35);            // but clamped/smoothed, not overshooting
+
+    // Clock_Shutdown must persist r2 and a >30-day-old timestamp must
+    // be rejected on reload. First shutdown+reload with fresh timestamp
+    // should restore r2 as the bootstrap.
+    Clock_Shutdown();
+
+    // Reset in-memory state (simulate app restart) and verify the
+    // bootstrap rate is loaded.
+    Clock_Init();
+    CHECK_EQ_INT(Clock_IsDisciplined(), 0);     // not disciplined until first sync
+    // First sync after restart: bootstrap rate should be applied.
+    int64_t rs_qpc = Clock_Qpc();
+    Clock_OnSyncedNtpUtc(t0_utc + 100000, rs_qpc);
+    CHECK_EQ_INT(Clock_RatePpm(), r2);           // loaded bootstrap
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -376,6 +454,7 @@ int main(void) {
     test_hand_geometry();
     test_minute_guard();
     test_ntp_header_validation();
+    test_clock_discipline();
 
     printf("\n%d checks, %d failed\n", g_pass + g_fail, g_fail);
     return g_fail == 0 ? 0 : 1;
