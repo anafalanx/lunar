@@ -1372,9 +1372,9 @@ static void LogViewer_CopyToClipboard(void) {
 
 static void LogViewer_LayoutChildren(HWND hwnd) {
     RECT rc; GetClientRect(hwnd, &rc);
-    int pad = 8;
-    int btnH = 26;
-    int btnW = 100;
+    int pad = 10;
+    int btnH = 32;
+    int btnW = 120;
     int editBottom = rc.bottom - btnH - pad * 2;
     HWND edit    = GetDlgItem(hwnd, IDC_LOG_EDIT);
     HWND refresh = GetDlgItem(hwnd, IDC_LOG_REFRESH);
@@ -1394,7 +1394,7 @@ static LRESULT CALLBACK LogWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HINSTANCE hi = (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE);
         // Use a monospace font so columns line up.
         LOGFONTW lf = {0};
-        lf.lfHeight = -12;
+        lf.lfHeight = -16;
         lf.lfWeight = FW_NORMAL;
         lf.lfCharSet = DEFAULT_CHARSET;
         lf.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
@@ -1482,7 +1482,7 @@ static void ShowLogViewer(void) {
     }
     g_logWnd = CreateWindowExW(0, kClass, L"Lunar \x2014 Log (last 24h)",
                                WS_OVERLAPPEDWINDOW,
-                               CW_USEDEFAULT, CW_USEDEFAULT, 760, 480,
+                               CW_USEDEFAULT, CW_USEDEFAULT, 1100, 720,
                                g_hwnd, NULL, hi, NULL);
     if (g_logWnd) {
         ShowWindow(g_logWnd, SW_SHOWNORMAL);

@@ -558,23 +558,34 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
     // (disciplined if this cycle was OK, untrusted-fallback otherwise).
     AuditWrite(trust, maxSpread, snapshot);
 
-    // Mirror a compact summary into the rolling in-memory log so the
+    // Mirror a detailed summary into the rolling in-memory log so the
     // "Log" menu item can show recent cycles without hitting disk.
+    // One header line + one line per slot carrying offset (vs. cycle
+    // consensus), RTT, and server-believed UTC so operators can see
+    // exactly what each source returned.
     {
         int okCount = 0;
         for (int i = 0; i < NTP_SOURCE_COUNT; i++)
             if (snapshot[i].ok) okCount++;
         const char *ntsLabel = snapshot[NTP_NTS_SLOT].label
                                ? snapshot[NTP_NTS_SLOT].label : "NTS--";
-        Log_Append("ntp: cycle %s  ok=%d/%d  spread=%lldms  anchor=%s  "
-                   "NIST=%s PTB=%s NICT=%s",
+        Log_Append("ntp: cycle %s  ok=%d/%d  spread=%lldms  anchor=%s",
                    (trust == TRUST_OK) ? "OK" : "INOP",
                    okCount, NTP_SOURCE_COUNT,
                    (long long)maxSpread,
-                   snapshot[NTP_NTS_SLOT].ok ? ntsLabel : "(NTS failed)",
-                   snapshot[0].ok ? "ok" : "--",
-                   snapshot[1].ok ? "ok" : "--",
-                   snapshot[2].ok ? "ok" : "--");
+                   snapshot[NTP_NTS_SLOT].ok ? ntsLabel : "(NTS failed)");
+        for (int i = 0; i < NTP_SOURCE_COUNT; i++) {
+            const char *lbl = snapshot[i].label ? snapshot[i].label : "?";
+            if (snapshot[i].ok) {
+                Log_Append("  [%d] %-18s ok    offset=%+lldms  rtt=%ums  utc=%lld",
+                           i, lbl,
+                           (long long)snapshot[i].offsetMs,
+                           (unsigned)snapshot[i].rttMs,
+                           (long long)snapshot[i].ntpUtcMs);
+            } else {
+                Log_Append("  [%d] %-18s FAIL", i, lbl);
+            }
+        }
     }
 
     // Legacy accessors (About dialog etc.) only record on OK cycles.
