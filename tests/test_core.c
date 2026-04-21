@@ -965,6 +965,195 @@ static void test_ntske_parse_errors(void) {
 }
 
 // ---------------------------------------------------------------------------
+// NTS-SNTP extension field codec -- RFC 8915 §5 round-trip
+// ---------------------------------------------------------------------------
+
+#include "../src/nts_ef.h"
+
+// Helper: craft a server reply that mirrors RFC 8915's server-side AEAD.
+// Packet = 48-byte header
+//          + Unique Identifier (echoed)
+//          + Authenticator (s2c_key, nonce, AD=preceding bytes, PT=N new cookies).
+static size_t build_server_reply(uint8_t *out, size_t cap,
+                                 const uint8_t hdr[48],
+                                 const uint8_t *echo_uid,
+                                 const uint8_t nonce[16],
+                                 const uint8_t s2c_key[32],
+                                 const uint8_t *new_cookies,
+                                 size_t new_cookie_len,
+                                 size_t n_new_cookies) {
+    size_t pos = 0;
+    memcpy(out, hdr, 48);
+    pos = 48;
+
+    // Unique Identifier extension
+    out[pos++] = 0x01; out[pos++] = 0x04;
+    out[pos++] = 0x00; out[pos++] = 36;          // 4 + 32
+    memcpy(out + pos, echo_uid, 32);
+    pos += 32;
+
+    // Build plaintext = concatenated NTS Cookie extensions
+    uint8_t pt[512] = {0};
+    size_t  pt_len = 0;
+    for (size_t i = 0; i < n_new_cookies; i++) {
+        size_t total = (4 + new_cookie_len + 3) & ~(size_t)3u;
+        if (total < 16) total = 16;
+        pt[pt_len++] = 0x02; pt[pt_len++] = 0x04;
+        pt[pt_len++] = (uint8_t)(total >> 8);
+        pt[pt_len++] = (uint8_t)(total & 0xff);
+        memcpy(pt + pt_len, new_cookies + i * new_cookie_len, new_cookie_len);
+        pt_len += new_cookie_len;
+        while (pt_len % 4) pt[pt_len++] = 0;
+    }
+
+    // Authenticator header + nonce-len + ct-len
+    size_t auth_pos = pos;
+    size_t ct_len = pt_len + 16;                 // tag + enc(plaintext)
+    size_t auth_total = (4 + 4 + 16 + ct_len + 3) & ~(size_t)3u;
+
+    out[pos++] = 0x04; out[pos++] = 0x04;
+    out[pos++] = (uint8_t)(auth_total >> 8);
+    out[pos++] = (uint8_t)(auth_total & 0xff);
+    out[pos++] = 0x00; out[pos++] = 16;          // nonce len
+    out[pos++] = (uint8_t)(ct_len >> 8);
+    out[pos++] = (uint8_t)(ct_len & 0xff);
+    memcpy(out + pos, nonce, 16);
+    pos += 16;
+
+    // SIV-encrypt the plaintext with AD = [in[0..auth_pos], nonce]
+    SivSlice ad[2] = { { out, auth_pos }, { nonce, 16 } };
+    uint8_t siv_out[1024];
+    if (Siv_Encrypt(s2c_key, ad, 2, pt, pt_len, siv_out) != 0) return 0;
+    memcpy(out + pos, siv_out, ct_len);
+    pos += ct_len;
+
+    while (pos - auth_pos < auth_total) out[pos++] = 0;
+
+    (void)cap;
+    return pos;
+}
+
+static void test_nts_ef_roundtrip(void) {
+    // Keys: 32 bytes C2S and 32 bytes S2C (arbitrary; any random).
+    uint8_t c2s_key[32], s2c_key[32];
+    for (int i = 0; i < 32; i++) { c2s_key[i] = (uint8_t)(0x10 + i); s2c_key[i] = (uint8_t)(0x80 + i); }
+
+    uint8_t ntp_hdr[48] = {0};
+    ntp_hdr[0] = 0x23;                              // LI=0, VN=4, Mode=3
+
+    uint8_t uid[32];
+    for (int i = 0; i < 32; i++) uid[i] = (uint8_t)(0xAB ^ i);
+    uint8_t nonce_c[16];
+    for (int i = 0; i < 16; i++) nonce_c[i] = (uint8_t)(0x55 + i);
+
+    uint8_t cookie[64];
+    for (int i = 0; i < 64; i++) cookie[i] = (uint8_t)(0xC0 + i);
+
+    uint8_t req[512];
+    size_t  req_len = 0;
+    int rc = NtsEf_BuildRequest(ntp_hdr, uid, nonce_c,
+                                cookie, sizeof cookie,
+                                /*n_placeholder=*/3,
+                                c2s_key,
+                                req, sizeof req, &req_len);
+    CHECK_EQ_INT(rc, 0);
+
+    // Minimum expected size: 48 + 36 (UID) + 68 (cookie) + 3*68 (placeholders)
+    //                       + 40 (auth) = 396.
+    CHECK_EQ_INT(req_len, 48 + 36 + 68 + 3 * 68 + 40);
+
+    // Now verify self-consistency by running the parser over a
+    // server-shape reply we craft using the SAME SIV primitive.
+    // The server echoes UID, uses s2c_key, and returns 4 new cookies
+    // (one for the spent cookie + 3 placeholder tops-up).
+    uint8_t new_cookies[4 * 64];
+    for (int i = 0; i < 4 * 64; i++) new_cookies[i] = (uint8_t)(0xF0 + (i & 0x0F));
+    uint8_t nonce_s[16];
+    for (int i = 0; i < 16; i++) nonce_s[i] = (uint8_t)(0xAA + i);
+
+    uint8_t hdr_reply[48] = {0};
+    hdr_reply[0] = 0x24;      // server mode
+    hdr_reply[1] = 1;         // stratum
+    // Transmit Timestamp non-zero so a real NTP validator wouldn't
+    // reject (not that our codec reads it -- it's just AD bytes).
+    hdr_reply[40] = 0x12; hdr_reply[41] = 0x34;
+
+    uint8_t reply[512];
+    size_t  reply_len = build_server_reply(reply, sizeof reply,
+                                           hdr_reply, uid, nonce_s, s2c_key,
+                                           new_cookies, 64, 4);
+    CHECK(reply_len > 0);
+
+    uint8_t got_cookies[NTSKE_MAX_COOKIES][NTSKE_MAX_COOKIE_LEN];
+    size_t  got_lens[NTSKE_MAX_COOKIES];
+    size_t  got_n = 99;
+
+    rc = NtsEf_ParseResponse(reply, reply_len, uid, s2c_key,
+                             got_cookies, got_lens, &got_n);
+    CHECK_EQ_INT(rc, 0);
+    CHECK_EQ_INT(got_n, 4);
+    for (size_t i = 0; i < 4; i++) {
+        CHECK_EQ_INT(got_lens[i], 64);
+        CHECK(bufs_eq(got_cookies[i], new_cookies + i * 64, 64));
+    }
+}
+
+static void test_nts_ef_tamper(void) {
+    uint8_t s2c_key[32];
+    for (int i = 0; i < 32; i++) s2c_key[i] = (uint8_t)(0xE0 + i);
+    uint8_t uid[32], nonce_s[16];
+    for (int i = 0; i < 32; i++) uid[i]     = (uint8_t)(0x10 + i);
+    for (int i = 0; i < 16; i++) nonce_s[i] = (uint8_t)(0x20 + i);
+
+    uint8_t new_c[64];
+    for (int i = 0; i < 64; i++) new_c[i] = (uint8_t)(0x88 + i);
+
+    uint8_t hdr_s[48] = {0}; hdr_s[0] = 0x24; hdr_s[1] = 1;
+
+    uint8_t reply[512];
+    size_t  reply_len = build_server_reply(reply, sizeof reply,
+                                           hdr_s, uid, nonce_s, s2c_key,
+                                           new_c, 64, 1);
+    CHECK(reply_len > 0);
+
+    uint8_t gc[NTSKE_MAX_COOKIES][NTSKE_MAX_COOKIE_LEN];
+    size_t  gl[NTSKE_MAX_COOKIES];
+    size_t  gn;
+
+    // 1) Clean parse succeeds.
+    CHECK_EQ_INT(NtsEf_ParseResponse(reply, reply_len, uid, s2c_key, gc, gl, &gn), 0);
+
+    // 2) Flip one byte of the UID in the reply -> mismatch, fail.
+    reply[52] ^= 0x01;
+    CHECK_EQ_INT(NtsEf_ParseResponse(reply, reply_len, uid, s2c_key, gc, gl, &gn), -1);
+    reply[52] ^= 0x01;
+
+    // 3) Flip one byte of the NTP header -> AD mismatch, SIV fails.
+    reply[10] ^= 0x80;
+    CHECK_EQ_INT(NtsEf_ParseResponse(reply, reply_len, uid, s2c_key, gc, gl, &gn), -1);
+    reply[10] ^= 0x80;
+
+    // 4) Flip one byte of the ciphertext -> SIV auth fails.
+    // Find the Ciphertext field: ends at reply_len.
+    reply[reply_len - 4] ^= 0x40;
+    CHECK_EQ_INT(NtsEf_ParseResponse(reply, reply_len, uid, s2c_key, gc, gl, &gn), -1);
+    reply[reply_len - 4] ^= 0x40;
+
+    // 5) Wrong S2C key -> SIV auth fails.
+    uint8_t bad_key[32];
+    memcpy(bad_key, s2c_key, 32); bad_key[0] ^= 1;
+    CHECK_EQ_INT(NtsEf_ParseResponse(reply, reply_len, uid, bad_key, gc, gl, &gn), -1);
+
+    // 6) Truncate to below 48 bytes -> reject.
+    CHECK_EQ_INT(NtsEf_ParseResponse(reply, 47, uid, s2c_key, gc, gl, &gn), -1);
+
+    // 7) Parse with a different sent UID -> reject.
+    uint8_t wrong_uid[32];
+    memcpy(wrong_uid, uid, 32); wrong_uid[5] ^= 0x02;
+    CHECK_EQ_INT(NtsEf_ParseResponse(reply, reply_len, wrong_uid, s2c_key, gc, gl, &gn), -1);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -986,6 +1175,8 @@ int main(void) {
     test_ntske_client_request();
     test_ntske_parse_valid();
     test_ntske_parse_errors();
+    test_nts_ef_roundtrip();
+    test_nts_ef_tamper();
 
     printf("\n%d checks, %d failed\n", g_pass + g_fail, g_fail);
     return g_fail == 0 ? 0 : 1;
