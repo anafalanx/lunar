@@ -1168,6 +1168,36 @@ static void test_nts_ef_tamper(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Rolling log buffer
+// ---------------------------------------------------------------------------
+
+#include "../src/logbuf.h"
+
+static void test_logbuf_basic(void) {
+    Log_Append("alpha=%d", 1);
+    Log_Append("beta %s", "two");
+
+    char out[2048];
+    size_t w = Log_Snapshot(out, sizeof out);
+    CHECK(w > 0);
+    CHECK(strstr(out, "alpha=1") != NULL);
+    CHECK(strstr(out, "beta two") != NULL);
+    // alpha appears before beta (ring stores in append order).
+    CHECK(strstr(out, "alpha=1") < strstr(out, "beta two"));
+    // Each line ends in CRLF.
+    CHECK(strstr(out, "alpha=1\r\n") != NULL);
+}
+
+static void test_logbuf_truncation(void) {
+    // Snapshot into a tiny buffer must NUL-terminate at cap-1.
+    char small[16];
+    memset(small, 0x55, sizeof small);
+    Log_Append("some-fresh-line");
+    Log_Snapshot(small, sizeof small);
+    CHECK_EQ_INT(small[sizeof small - 1], 0);
+}
+
+// ---------------------------------------------------------------------------
 // NTS provider pool -- pins populated, PickProvider returns an entry
 // ---------------------------------------------------------------------------
 
@@ -1233,6 +1263,8 @@ int main(void) {
     test_nts_ef_roundtrip();
     test_nts_ef_tamper();
     test_nts_pool_pins();
+    test_logbuf_basic();
+    test_logbuf_truncation();
 
     printf("\n%d checks, %d failed\n", g_pass + g_fail, g_fail);
     return g_fail == 0 ? 0 : 1;

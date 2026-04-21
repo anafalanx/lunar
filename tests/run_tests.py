@@ -55,6 +55,7 @@ def main() -> int:
         SRC  / "sysvol.c",
         SRC  / "ntp.c",
         SRC  / "clock.c",
+        SRC  / "logbuf.c",
         SRC  / "siv.c",
         SRC  / "nts_ke.c",
         SRC  / "nts_ef.c",

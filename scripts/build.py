@@ -263,6 +263,7 @@ def main() -> None:
         str(SRC / "sysvol.c"),
         str(SRC / "ntp.c"),
         str(SRC / "clock.c"),
+        str(SRC / "logbuf.c"),
         str(SRC / "siv.c"),
         str(SRC / "nts_ke.c"),
         str(SRC / "nts_ef.c"),

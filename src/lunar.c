@@ -42,6 +42,7 @@
 
 #include "ntp.h"
 #include "clock.h"
+#include "logbuf.h"
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -64,6 +65,7 @@
 #define IDM_SETTINGS      0x1003
 #define IDM_ABOUT         0x1004
 #define IDM_SYNC_NOW      0x1005
+#define IDM_LOG           0x1006
 
 // Settings dialog + controls.
 #define IDD_SETTINGS          100
@@ -1184,6 +1186,7 @@ static void InstallSystemMenuItems(void) {
     InsertMenuW(sys, 0, MF_BYPOSITION | MF_STRING, IDM_ABOUT,         L"&About Lunar");
     InsertMenuW(sys, 0, MF_BYPOSITION | MF_STRING, IDM_SETTINGS,      L"&Settings\x2026");
     InsertMenuW(sys, 0, MF_BYPOSITION | MF_STRING, IDM_SYNC_NOW,      L"Sync clock &now");
+    InsertMenuW(sys, 0, MF_BYPOSITION | MF_STRING, IDM_LOG,           L"&Log\x2026");
     InsertMenuW(sys, 0, MF_BYPOSITION | MF_STRING, IDM_TEST_BEEP,     L"&Test beep");
     InsertMenuW(sys, 0, MF_BYPOSITION | MF_STRING, IDM_ALWAYS_ON_TOP, L"Always on &top");
     SyncAlwaysOnTopCheck();
@@ -1295,6 +1298,197 @@ static void ShowAbout(void) {
              sourcesBlock,
              sync);
     MessageBoxW(g_hwnd, msg, L"About Lunar", MB_ICONINFORMATION | MB_OK);
+}
+
+// ---------------------------------------------------------------------------
+// Log viewer
+// ---------------------------------------------------------------------------
+//
+// A top-level window hosting a read-only multiline edit control.
+// Single-instance: if already open, we just re-focus it. The edit
+// control contents are refreshed from logbuf on open and whenever
+// the user clicks "Refresh". "Copy" places the whole log on the
+// clipboard as CF_UNICODETEXT.
+
+#define IDC_LOG_EDIT      2001
+#define IDC_LOG_REFRESH   2002
+#define IDC_LOG_COPY      2003
+#define IDC_LOG_CLOSE     2004
+
+static HWND g_logWnd     = NULL;
+static HWND g_logEdit    = NULL;
+
+// Load the current log snapshot into the edit control.
+static void LogViewer_RefreshText(void) {
+    if (!g_logEdit) return;
+    size_t need = Log_Snapshot(NULL, 0);
+    if (need == 0) {
+        SetWindowTextW(g_logEdit, L"(log is empty)");
+        return;
+    }
+    // Allocate UTF-8 buffer then convert to UTF-16 for the control.
+    char *u8 = (char *)malloc(need + 1);
+    if (!u8) { SetWindowTextW(g_logEdit, L"(out of memory)"); return; }
+    size_t wrote = Log_Snapshot(u8, need + 1);
+    u8[wrote] = 0;
+
+    int wide_len = MultiByteToWideChar(CP_UTF8, 0, u8, -1, NULL, 0);
+    if (wide_len <= 0) { free(u8); return; }
+    wchar_t *w = (wchar_t *)malloc((size_t)wide_len * sizeof(wchar_t));
+    if (!w) { free(u8); return; }
+    MultiByteToWideChar(CP_UTF8, 0, u8, -1, w, wide_len);
+    free(u8);
+
+    SetWindowTextW(g_logEdit, w);
+    // Scroll to bottom so the most recent line is visible.
+    int n = GetWindowTextLengthW(g_logEdit);
+    SendMessageW(g_logEdit, EM_SETSEL, (WPARAM)n, (LPARAM)n);
+    SendMessageW(g_logEdit, EM_SCROLLCARET, 0, 0);
+
+    free(w);
+}
+
+// Copy the edit-control contents to the clipboard as CF_UNICODETEXT.
+static void LogViewer_CopyToClipboard(void) {
+    if (!g_logEdit) return;
+    int n = GetWindowTextLengthW(g_logEdit);
+    if (n <= 0) return;
+    // +1 for NUL.
+    HGLOBAL h = GlobalAlloc(GMEM_MOVEABLE, ((size_t)n + 1) * sizeof(wchar_t));
+    if (!h) return;
+    wchar_t *p = (wchar_t *)GlobalLock(h);
+    if (!p) { GlobalFree(h); return; }
+    GetWindowTextW(g_logEdit, p, n + 1);
+    GlobalUnlock(h);
+    if (!OpenClipboard(g_logWnd)) { GlobalFree(h); return; }
+    EmptyClipboard();
+    if (!SetClipboardData(CF_UNICODETEXT, h)) {
+        // Ownership only transfers on success; otherwise we must free.
+        GlobalFree(h);
+    }
+    CloseClipboard();
+    Log_Append("log: copied %d chars to clipboard", n);
+}
+
+static void LogViewer_LayoutChildren(HWND hwnd) {
+    RECT rc; GetClientRect(hwnd, &rc);
+    int pad = 8;
+    int btnH = 26;
+    int btnW = 100;
+    int editBottom = rc.bottom - btnH - pad * 2;
+    HWND edit    = GetDlgItem(hwnd, IDC_LOG_EDIT);
+    HWND refresh = GetDlgItem(hwnd, IDC_LOG_REFRESH);
+    HWND copy    = GetDlgItem(hwnd, IDC_LOG_COPY);
+    HWND close   = GetDlgItem(hwnd, IDC_LOG_CLOSE);
+    if (edit)
+        MoveWindow(edit,    pad, pad, rc.right - 2 * pad, editBottom - pad, TRUE);
+    int by = editBottom + pad;
+    if (refresh) MoveWindow(refresh, pad,                             by, btnW, btnH, TRUE);
+    if (copy)    MoveWindow(copy,    pad + btnW + pad,                by, btnW, btnH, TRUE);
+    if (close)   MoveWindow(close,   rc.right - pad - btnW,           by, btnW, btnH, TRUE);
+}
+
+static LRESULT CALLBACK LogWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        HINSTANCE hi = (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE);
+        // Use a monospace font so columns line up.
+        LOGFONTW lf = {0};
+        lf.lfHeight = -12;
+        lf.lfWeight = FW_NORMAL;
+        lf.lfCharSet = DEFAULT_CHARSET;
+        lf.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
+        wcscpy_s(lf.lfFaceName, 32, L"Consolas");
+        HFONT font = CreateFontIndirectW(&lf);
+
+        g_logEdit = CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"EDIT", L"",
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | WS_HSCROLL
+            | ES_MULTILINE | ES_AUTOVSCROLL | ES_AUTOHSCROLL | ES_READONLY,
+            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)IDC_LOG_EDIT, hi, NULL);
+        if (g_logEdit && font)
+            SendMessageW(g_logEdit, WM_SETFONT, (WPARAM)font, TRUE);
+
+        CreateWindowExW(0, L"BUTTON", L"Refresh",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)IDC_LOG_REFRESH, hi, NULL);
+        CreateWindowExW(0, L"BUTTON", L"Copy all",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON,
+            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)IDC_LOG_COPY, hi, NULL);
+        CreateWindowExW(0, L"BUTTON", L"Close",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | BS_DEFPUSHBUTTON,
+            0, 0, 10, 10, hwnd, (HMENU)(INT_PTR)IDC_LOG_CLOSE, hi, NULL);
+
+        // Propagate the font to all buttons too.
+        if (font) {
+            SendMessageW(GetDlgItem(hwnd, IDC_LOG_REFRESH), WM_SETFONT, (WPARAM)font, TRUE);
+            SendMessageW(GetDlgItem(hwnd, IDC_LOG_COPY),    WM_SETFONT, (WPARAM)font, TRUE);
+            SendMessageW(GetDlgItem(hwnd, IDC_LOG_CLOSE),   WM_SETFONT, (WPARAM)font, TRUE);
+        }
+
+        LogViewer_LayoutChildren(hwnd);
+        LogViewer_RefreshText();
+        return 0;
+    }
+
+    case WM_SIZE:
+        LogViewer_LayoutChildren(hwnd);
+        return 0;
+
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDC_LOG_REFRESH: LogViewer_RefreshText();       return 0;
+        case IDC_LOG_COPY:    LogViewer_CopyToClipboard();   return 0;
+        case IDC_LOG_CLOSE:   DestroyWindow(hwnd);           return 0;
+        }
+        break;
+
+    case WM_CLOSE:
+        DestroyWindow(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        g_logWnd  = NULL;
+        g_logEdit = NULL;
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void ShowLogViewer(void) {
+    // Single-instance: re-focus an existing window.
+    if (g_logWnd) {
+        LogViewer_RefreshText();
+        ShowWindow(g_logWnd, SW_SHOWNORMAL);
+        SetForegroundWindow(g_logWnd);
+        return;
+    }
+    static const wchar_t kClass[] = L"LunarLogWnd";
+    static int s_registered = 0;
+    HINSTANCE hi = GetModuleHandleW(NULL);
+    if (!s_registered) {
+        WNDCLASSEXW wc = {0};
+        wc.cbSize        = sizeof wc;
+        wc.lpfnWndProc   = LogWndProc;
+        wc.hInstance     = hi;
+        wc.hCursor       = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+        wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.lpszClassName = kClass;
+        wc.hIcon         = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(1),
+                                             IMAGE_ICON, 0, 0, LR_DEFAULTSIZE);
+        wc.hIconSm       = wc.hIcon;
+        RegisterClassExW(&wc);
+        s_registered = 1;
+    }
+    g_logWnd = CreateWindowExW(0, kClass, L"Lunar \x2014 Log (last 24h)",
+                               WS_OVERLAPPEDWINDOW,
+                               CW_USEDEFAULT, CW_USEDEFAULT, 760, 480,
+                               g_hwnd, NULL, hi, NULL);
+    if (g_logWnd) {
+        ShowWindow(g_logWnd, SW_SHOWNORMAL);
+        UpdateWindow(g_logWnd);
+    }
+    Log_Append("log: viewer opened");
 }
 
 static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM lp) {
@@ -1605,11 +1799,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_alwaysOnTop = !g_alwaysOnTop;
             ApplyAlwaysOnTop(g_alwaysOnTop);
             SyncAlwaysOnTopCheck();
+            Log_Append("user: always-on-top -> %s",
+                       g_alwaysOnTop ? "on" : "off");
             return 0;
-        case IDM_TEST_BEEP: PlayBeep();       return 0;
-        case IDM_SETTINGS:  ShowSettings();   return 0;
-        case IDM_SYNC_NOW:  Ntp_Start();      return 0;
-        case IDM_ABOUT:     ShowAbout();      return 0;
+        case IDM_TEST_BEEP: Log_Append("user: test beep"); PlayBeep(); return 0;
+        case IDM_SETTINGS:  Log_Append("user: opened Settings"); ShowSettings();   return 0;
+        case IDM_SYNC_NOW:  Log_Append("user: manual Sync Now"); Ntp_Start();      return 0;
+        case IDM_LOG:       ShowLogViewer(); return 0;
+        case IDM_ABOUT:     Log_Append("user: opened About"); ShowAbout();      return 0;
         }
         break;
     }
@@ -1620,6 +1817,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                 MB_OKCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2);
             if (r != IDOK) return 0;
         }
+        Log_Append("app: shutting down");
         SaveWindowState(hwnd, g_alwaysOnTop);
         Clock_Shutdown();
         DestroyWindow(hwnd);
@@ -1734,6 +1932,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
 
     // Kick off the first NTP sync as soon as the window exists.
     Clock_Init();
+    Log_Append("app: Lunar 0.2 started; initiating first NTP sync");
     Ntp_Start();
     g_lastNtpKickMs = GetTickCount();
 

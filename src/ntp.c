@@ -32,6 +32,7 @@
 #include "ntp.h"
 #include "clock.h"
 #include "nts.h"
+#include "logbuf.h"
 
 #define NTP_PORT             "123"
 #define NTP_TIMEOUT_MS       3000
@@ -557,6 +558,25 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
     // (disciplined if this cycle was OK, untrusted-fallback otherwise).
     AuditWrite(trust, maxSpread, snapshot);
 
+    // Mirror a compact summary into the rolling in-memory log so the
+    // "Log" menu item can show recent cycles without hitting disk.
+    {
+        int okCount = 0;
+        for (int i = 0; i < NTP_SOURCE_COUNT; i++)
+            if (snapshot[i].ok) okCount++;
+        const char *ntsLabel = snapshot[NTP_NTS_SLOT].label
+                               ? snapshot[NTP_NTS_SLOT].label : "NTS--";
+        Log_Append("ntp: cycle %s  ok=%d/%d  spread=%lldms  anchor=%s  "
+                   "NIST=%s PTB=%s NICT=%s",
+                   (trust == TRUST_OK) ? "OK" : "INOP",
+                   okCount, NTP_SOURCE_COUNT,
+                   (long long)maxSpread,
+                   snapshot[NTP_NTS_SLOT].ok ? ntsLabel : "(NTS failed)",
+                   snapshot[0].ok ? "ok" : "--",
+                   snapshot[1].ok ? "ok" : "--",
+                   snapshot[2].ok ? "ok" : "--");
+    }
+
     // Legacy accessors (About dialog etc.) only record on OK cycles.
     if (trust == TRUST_OK) {
         // g_offsetMs legacy meaning ("median offset") no longer
@@ -648,12 +668,18 @@ TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
 
 void Ntp_Start(void) {
     if (!g_csInit) { InitializeCriticalSection(&g_cs); g_csInit = 1; }
-    if (InterlockedCompareExchange(&g_running, 1, 0) != 0) return;
+    if (InterlockedCompareExchange(&g_running, 1, 0) != 0) {
+        Log_Append("ntp: sync requested but a cycle is already in flight");
+        return;
+    }
+    Log_Append("ntp: cycle start (4 slots: NIST, PTB, NICT, NTS)");
     HANDLE th = CreateThread(NULL, 0, AggregatorProc, NULL, 0, NULL);
     if (th) {
         CloseHandle(th);
     } else {
         InterlockedExchange(&g_running, 0);
+        Log_Append("ntp: CreateThread failed (err=%lu); cycle aborted",
+                   (unsigned long)GetLastError());
     }
 }
 
