@@ -1,6 +1,8 @@
-// ntp.h -- Parallel SNTP client. Queries three independent national
-// metrology institutes (NIST USA, PTB Germany, NICT Japan) in parallel
-// and exposes per-source results for concurrence checking.
+// ntp.h -- Parallel SNTP + NTS client. Queries three independent
+// unauthenticated stratum-1 SNTP sources (NIST USA, PTB Germany,
+// NICT Japan) plus, in slot 3, one NTS-authenticated SNTP source
+// drawn per-cycle from a rotating pool (see src/nts.c). Exposes
+// per-source results for concurrence checking.
 #ifndef LUNAR_NTP_H
 #define LUNAR_NTP_H
 
@@ -11,14 +13,20 @@
 extern "C" {
 #endif
 
-#define NTP_SOURCE_COUNT 3
+// Four slots: 0..2 are the three core SNTP sources, slot 3 is the
+// NTS-authenticated rotating source. The NTS slot's `label` is filled
+// in at runtime from the provider picked for that cycle, or "NTS--"
+// if no provider is available (e.g. no pins populated in this build).
+#define NTP_SOURCE_COUNT     4
+#define NTP_CORE_COUNT       3
+#define NTP_NTS_SLOT         3
 
 // One source's outcome from the most recent polling cycle. `label` is a
-// static string ("NIST" / "PTB" / "NICT") owned by ntp.c. When ok==0
-// every other field is meaningless.
+// short static string ("NIST" / "PTB" / "NICT" / "NTS:<provider>"
+// owned by ntp.c). When ok==0 every other field is meaningless.
 typedef struct {
     int         ok;          // 1 if this source returned a valid reply
-    int64_t     offsetMs;    // (NTP - local system) in ms
+    int64_t     offsetMs;    // (this source - cycle consensus) in ms, display-only
     int64_t     ntpUtcMs;    // server-believed UTC at QPC capture moment
     int64_t     qpcAtT4;     // QPC tick at t4 (reply received)
     uint32_t    rttMs;       // round-trip time in ms
@@ -29,19 +37,18 @@ typedef struct {
 // at any time; no-ops if a cycle is already in flight.
 void    Ntp_Start(void);
 
-// True iff ANY source has succeeded within the fresh window (2 h).
-// The concurrence-based trust state lives in a separate module
-// (added in the next step); this accessor stays behavior-compatible.
+// True iff the clockwork has been anchored within the fresh window.
+// Unchanged contract from the 3-source era.
 int     Ntp_IsSynced(void);
 
 // Legacy accessors: the offset and wall-clock UTC of the most recent
-// successful sample (median pick of the trio). Zero when never synced.
+// successful sample. Zero when never synced.
 int64_t Ntp_OffsetMs(void);
 int64_t Ntp_LastSyncUtcMs(void);
 
-// Largest pairwise offset spread from the most recent polling cycle,
-// in milliseconds. Zero before the first cycle. Updated regardless
-// of trust verdict (useful in the title bar / audit readout).
+// Largest deviation (ms) among successful sources from the last cycle's
+// consensus (projected to a common QPC moment). Zero before the first
+// cycle.
 int64_t Ntp_LastSpreadMs(void);
 
 // Copy the latest per-source results out of ntp.c under its lock.
@@ -50,13 +57,21 @@ int     Ntp_GetResults(NtpSourceResult out[NTP_SOURCE_COUNT]);
 
 // Pure concurrence evaluator. Given a set of per-source results,
 // returns the trust verdict and, when the verdict is TRUST_OK, the
-// best (median) utcMs and its matching QPC tick. maxSpreadMs receives
-// the largest pairwise offset spread among successful sources (0 if
-// fewer than 2 succeeded).
+// best utcMs and its matching QPC tick. maxSpreadMs receives the
+// largest absolute deviation of a source from the consensus anchor
+// (0 if fewer than 2 sources succeeded).
 //
-// Verdict rules (binary, no degraded middle ground):
-//   3 ok + max pairwise spread <= 200 ms  -> TRUST_OK (median feeds)
-//   anything else                         -> TRUST_INOP
+// Verdict rules (binary; no degraded middle ground). NTS slot is the
+// trust anchor: if NTS fails, the verdict is INOP regardless of what
+// the core trio reports. The NTS sample is cryptographically
+// authenticated, so an adversary spoofing plain SNTP cannot shift the
+// anchor without also defeating TLS + the SPKI pin.
+//
+//   NTS slot not ok                                    -> TRUST_INOP
+//   NTS ok, fewer than 2 core sources agree (<= 200 ms
+//     projected offset from the NTS anchor)            -> TRUST_INOP
+//   NTS ok, >= 2 of 3 core sources agree               -> TRUST_OK,
+//     anchor = NTS (utcMs, qpcAtT4).
 //
 // This function is pure: no globals, no I/O. Exposed here so the test
 // harness can exercise the math directly.

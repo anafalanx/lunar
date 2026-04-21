@@ -42,6 +42,8 @@
 
 #include "nts.h"
 #include "nts_ke.h"
+#include "nts_ef.h"
+#include "clock.h"
 
 // ---------------------------------------------------------------------------
 // Provider pool
@@ -412,4 +414,154 @@ cleanup:
         mbedtls_platform_zeroize(out, sizeof *out);
     }
     return rc;
+}
+
+// ---------------------------------------------------------------------------
+// Nts_FetchSample -- KE + one authenticated SNTP round trip
+// ---------------------------------------------------------------------------
+
+#define NTP_EPOCH_DELTA_S  2208988800ULL
+#define NTS_UDP_TIMEOUT_MS 3000
+#define NTS_UDP_MAX_PKT    1500
+
+static int parse_sntp_reply(const uint8_t *pkt, size_t pkt_len,
+                            int64_t *out_t2_ms, int64_t *out_t3_ms)
+{
+    if (pkt_len < 48) return 0;
+    uint8_t li      = (pkt[0] >> 6) & 0x3;
+    uint8_t vn      = (pkt[0] >> 3) & 0x7;
+    uint8_t mode    =  pkt[0]       & 0x7;
+    uint8_t stratum =  pkt[1];
+    if (li == 3)                       return 0;
+    if (vn != 3 && vn != 4)            return 0;
+    if (mode != 4)                     return 0;
+    if (stratum == 0 || stratum >= 16) return 0;
+
+    uint32_t secBE, fracBE;
+    memcpy(&secBE,  pkt + 32, 4); memcpy(&fracBE, pkt + 36, 4);
+    uint32_t t2_s = ntohl(secBE), t2_frac = ntohl(fracBE);
+    memcpy(&secBE,  pkt + 40, 4); memcpy(&fracBE, pkt + 44, 4);
+    uint32_t t3_s = ntohl(secBE), t3_frac = ntohl(fracBE);
+    if (t2_s == 0 || t3_s == 0) return 0;
+
+    *out_t2_ms = ((int64_t)t2_s - (int64_t)NTP_EPOCH_DELTA_S) * 1000
+                 + (int64_t)(((uint64_t)t2_frac * 1000ULL) >> 32);
+    *out_t3_ms = ((int64_t)t3_s - (int64_t)NTP_EPOCH_DELTA_S) * 1000
+                 + (int64_t)(((uint64_t)t3_frac * 1000ULL) >> 32);
+    return 1;
+}
+
+int Nts_FetchSample(const NtsProvider *p,
+                    int64_t  *out_ntpUtcMs,
+                    int64_t  *out_qpcAtT4,
+                    uint32_t *out_rttMs)
+{
+    if (p == NULL || out_ntpUtcMs == NULL || out_qpcAtT4 == NULL
+        || out_rttMs == NULL) return 0;
+    *out_ntpUtcMs = 0; *out_qpcAtT4 = 0; *out_rttMs = 0;
+
+    // Phase 1: NTS-KE. Nts_DoKe runs its own WSAStartup/Cleanup pair
+    // and clears `ke` on failure, so we just inherit its verdict.
+    NtsKeResult ke;
+    if (Nts_DoKe(p, &ke) != 0 || !ke.ok || ke.cookie_count == 0) return 0;
+
+    const char *host = ke.ntp_host[0] ? ke.ntp_host : p->host;
+    uint16_t    port = ke.ntp_port    ? ke.ntp_port : 123;
+
+    // Phase 2: build the authenticated SNTP request.
+    uint8_t hdr[48];
+    memset(hdr, 0, sizeof hdr);
+    hdr[0] = 0x23;   // LI=0, VN=4, Mode=3 (client)
+
+    uint8_t uid[NTS_UNIQUE_ID_LEN], nonce[NTS_NONCE_LEN];
+    if (BCryptGenRandom(NULL, uid, sizeof uid,
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) goto fail;
+    if (BCryptGenRandom(NULL, nonce, sizeof nonce,
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) goto fail;
+
+    uint8_t pkt[NTS_UDP_MAX_PKT];
+    size_t  pkt_len = 0;
+    if (NtsEf_BuildRequest(hdr, uid, nonce,
+                           ke.cookies[0], ke.cookie_len[0],
+                           0 /* no placeholder cookies */,
+                           ke.c2s_key,
+                           pkt, sizeof pkt, &pkt_len) != 0) goto fail;
+
+    // Phase 3: UDP exchange with QPC-bracketed timing.
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) goto fail;
+
+    int           rc = 0;
+    SOCKET        s  = INVALID_SOCKET;
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family   = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+
+    char portbuf[8];
+    snprintf(portbuf, sizeof portbuf, "%u", (unsigned)port);
+    if (getaddrinfo(host, portbuf, &hints, &res) != 0 || res == NULL) goto udp_done;
+
+    s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (s == INVALID_SOCKET) goto udp_done;
+
+    DWORD tmo = NTS_UDP_TIMEOUT_MS;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof tmo);
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tmo, sizeof tmo);
+
+    int64_t qpcT1 = Clock_Qpc();
+    int sent = sendto(s, (const char *)pkt, (int)pkt_len, 0,
+                      res->ai_addr, (int)res->ai_addrlen);
+    if (sent != (int)pkt_len) goto udp_done;
+
+    uint8_t reply[NTS_UDP_MAX_PKT];
+    int recvd = recv(s, (char *)reply, (int)sizeof reply, 0);
+    int64_t qpcT4 = Clock_Qpc();
+    if (recvd <= 0) goto udp_done;
+
+    // Phase 4: authenticate + parse. ParseResponse does the SIV check,
+    // enforces the Authenticator is the final extension, and matches
+    // our UID in constant time. If anything's off we drop the sample.
+    uint8_t new_cookies[NTSKE_MAX_COOKIES][NTSKE_MAX_COOKIE_LEN];
+    size_t  new_lens[NTSKE_MAX_COOKIES];
+    size_t  new_cnt = 0;
+    if (NtsEf_ParseResponse(reply, (size_t)recvd, uid, ke.s2c_key,
+                            new_cookies, new_lens, &new_cnt) != 0) goto udp_done;
+
+    int64_t t2_ms = 0, t3_ms = 0;
+    if (!parse_sntp_reply(reply, (size_t)recvd, &t2_ms, &t3_ms)) goto udp_done;
+
+    int64_t qpcFreq = Clock_QpcFreq();
+    if (qpcFreq <= 0) goto udp_done;
+    int64_t rtt = ((qpcT4 - qpcT1) * 1000LL + qpcFreq / 2) / qpcFreq;
+    if (rtt < 0) rtt = 0;
+    int64_t serverProc = t3_ms - t2_ms;
+    if (serverProc < 0) serverProc = 0;
+    int64_t netRtt = rtt - serverProc;
+    if (netRtt < 0) netRtt = 0;
+
+    *out_ntpUtcMs = t3_ms + netRtt / 2;
+    *out_qpcAtT4  = qpcT4;
+    *out_rttMs    = (uint32_t)(rtt > 0x7fffffff ? 0x7fffffff : rtt);
+    rc = 1;
+
+    // Newly harvested cookies are discarded in this stateless model;
+    // the next cycle performs a fresh KE and gets new ones. See
+    // nts.h commentary. Zeroise any key material we've touched.
+    mbedtls_platform_zeroize(new_cookies, sizeof new_cookies);
+
+udp_done:
+    if (res) freeaddrinfo(res);
+    if (s != INVALID_SOCKET) closesocket(s);
+    WSACleanup();
+    mbedtls_platform_zeroize(uid,   sizeof uid);
+    mbedtls_platform_zeroize(nonce, sizeof nonce);
+    mbedtls_platform_zeroize(pkt,   sizeof pkt);
+    mbedtls_platform_zeroize(&ke,   sizeof ke);
+    return rc;
+
+fail:
+    mbedtls_platform_zeroize(&ke, sizeof ke);
+    return 0;
 }

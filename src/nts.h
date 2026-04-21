@@ -75,6 +75,32 @@ const NtsProvider *Nts_PickProvider(void);
 // shared state beyond lazy-initialised RNG).
 int Nts_DoKe(const NtsProvider *p, NtsKeResult *out);
 
+// Fetch one NTS-authenticated SNTP timing sample.
+//
+// Runs a full NTS-KE handshake against `p`, then issues exactly one
+// SNTP v4 query to the resulting NTP endpoint using the first cookie
+// and fresh random UID/nonce. The reply is authenticated with SIV
+// (RFC 5297) using the S2C exporter key and validated the same way
+// the unencrypted client validates a plain SNTP reply (LI / VN / Mode
+// / stratum / non-zero timestamps).
+//
+// Timing is QPC-only; the Windows system clock is never consulted.
+// The output is shaped the same way ntp.c's plain-SNTP query reports,
+// so the aggregator can treat this as just another source:
+//
+//   *out_ntpUtcMs  : server-believed UTC at the moment *out_qpcAtT4
+//                    was sampled (includes half-net-RTT compensation).
+//   *out_qpcAtT4   : QPC tick at which the reply was received.
+//   *out_rttMs     : measured round-trip time in milliseconds.
+//
+// Returns 1 on success, 0 on any failure (no pin populated, KE
+// failure, DNS/socket failure, authentication failure, malformed
+// reply, etc.). All key material is zeroised before return.
+int Nts_FetchSample(const NtsProvider *p,
+                    int64_t  *out_ntpUtcMs,
+                    int64_t  *out_qpcAtT4,
+                    uint32_t *out_rttMs);
+
 #ifdef __cplusplus
 }
 #endif
