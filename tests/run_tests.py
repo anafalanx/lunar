@@ -24,6 +24,11 @@ TESTS = ROOT / "tests"
 BUILD = ROOT / "build" / "tests"
 UCRT_BIN = Path(r"C:\msys64\ucrt64\bin")
 
+# Reuse build.py's cached mbedTLS archive builder so the tests link
+# against exactly the same static library as the shipped binary.
+sys.path.insert(0, str(ROOT / "scripts"))
+from build import build_mbedtls_archive, MBEDTLS_DIR   # noqa: E402
+
 
 def find(name: str) -> Path:
     p = shutil.which(name)
@@ -41,12 +46,16 @@ def main() -> int:
     BUILD.mkdir(parents=True, exist_ok=True)
     gcc = find("gcc")
 
+    # Ensure the mbedTLS static archive is built (cached after first run).
+    mbedtls_archive = build_mbedtls_archive(gcc)
+
     exe = BUILD / "test_core.exe"
     src = [
         TESTS / "test_core.c",   # #includes ../src/lunar.c with LUNAR_NO_MAIN
         SRC  / "sysvol.c",
         SRC  / "ntp.c",
         SRC  / "clock.c",
+        SRC  / "siv.c",
     ]
     # No -mwindows: we want a console main(). -Werror to catch new warnings.
     cmd = [
@@ -55,11 +64,17 @@ def main() -> int:
         "-Wall", "-Wextra", "-Wno-unused-function", "-Werror",
         "-std=c11",
         "-static-libgcc", "-static",
+        "-ffunction-sections", "-fdata-sections",
+        f"-I{MBEDTLS_DIR / 'include'}",
+        f"-I{ROOT / 'third_party'}",
+        "-DMBEDTLS_CONFIG_FILE=<lunar_mbedtls_config.h>",
         "-o", str(exe),
         *[str(p) for p in src],
+        str(mbedtls_archive),
+        "-Wl,--gc-sections",
         "-ld2d1", "-ldwrite", "-lwinmm",
         "-luser32", "-lkernel32", "-lgdi32", "-lcomctl32", "-lshell32",
-        "-luxtheme", "-lole32", "-lws2_32", "-ldwmapi",
+        "-luxtheme", "-lole32", "-lws2_32", "-ldwmapi", "-ladvapi32",
     ]
     print("==> Compiling tests")
     print("   ", " ".join(cmd))
