@@ -56,6 +56,7 @@ def main() -> int:
         SRC  / "ntp.c",
         SRC  / "clock.c",
         SRC  / "siv.c",
+        SRC  / "nts_ke.c",
     ]
     # No -mwindows: we want a console main(). -Werror to catch new warnings.
     cmd = [

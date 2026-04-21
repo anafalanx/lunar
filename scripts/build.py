@@ -264,6 +264,7 @@ def main() -> None:
         str(SRC / "ntp.c"),
         str(SRC / "clock.c"),
         str(SRC / "siv.c"),
+        str(SRC / "nts_ke.c"),
         str(res),
         # Static archive goes AFTER the objects so the linker sees the
         # undefined symbols first; standard GCC link-order rule.

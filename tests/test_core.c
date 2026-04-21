@@ -765,6 +765,206 @@ static void test_siv_edge_cases(void) {
 }
 
 // ---------------------------------------------------------------------------
+// NTS-KE record codec -- RFC 8915 §4 serialise/parse on hand-crafted bytes
+// ---------------------------------------------------------------------------
+
+#include "../src/nts_ke.h"
+
+static void test_ntske_client_request(void) {
+    // The fixed client request must be exactly 16 bytes:
+    //   Record 1 (NextProtocol, critical, body len 2, body [0x0000]) = 6
+    //   Record 2 (AEAD,         critical, body len 2, body [0x000F]) = 6
+    //   Record 3 (EndOfMessage, critical, body len 0)                = 4
+    // All critical bits set.
+    uint8_t buf[64] = { 0xaa };
+    size_t n = NtsKe_BuildClientRequest(buf, sizeof buf);
+    CHECK_EQ_INT(n, 16);
+
+    // Record 1: type 0x8001, len 2, body 0x0000
+    CHECK_EQ_INT(buf[0], 0x80);
+    CHECK_EQ_INT(buf[1], 0x01);
+    CHECK_EQ_INT(buf[2], 0x00);
+    CHECK_EQ_INT(buf[3], 0x02);
+    CHECK_EQ_INT(buf[4], 0x00);
+    CHECK_EQ_INT(buf[5], 0x00);
+    // Record 2: type 0x8004, len 2, body 0x000F
+    CHECK_EQ_INT(buf[6],  0x80);
+    CHECK_EQ_INT(buf[7],  0x04);
+    CHECK_EQ_INT(buf[8],  0x00);
+    CHECK_EQ_INT(buf[9],  0x02);
+    CHECK_EQ_INT(buf[10], 0x00);
+    CHECK_EQ_INT(buf[11], 0x0f);
+    // Record 3: type 0x8000, len 0
+    CHECK_EQ_INT(buf[12], 0x80);
+    CHECK_EQ_INT(buf[13], 0x00);
+    CHECK_EQ_INT(buf[14], 0x00);
+    CHECK_EQ_INT(buf[15], 0x00);
+
+    // Small output buffer must refuse cleanly.
+    CHECK_EQ_INT(NtsKe_BuildClientRequest(buf, 10), 0);
+    CHECK_EQ_INT(NtsKe_BuildClientRequest(NULL, 64), 0);
+}
+
+// Small helper: append a record to a mutable buffer.
+static size_t append_rec(uint8_t *buf, size_t pos,
+                         uint16_t type_crit, const uint8_t *body, uint16_t blen) {
+    buf[pos++] = (uint8_t)(type_crit >> 8);
+    buf[pos++] = (uint8_t)(type_crit & 0xff);
+    buf[pos++] = (uint8_t)(blen >> 8);
+    buf[pos++] = (uint8_t)(blen & 0xff);
+    if (blen && body) { memcpy(buf + pos, body, blen); pos += blen; }
+    return pos;
+}
+
+static void test_ntske_parse_valid(void) {
+    // Build a realistic server response:
+    //   NextProtocol=[NTPv4] crit
+    //   AEAD=[SIV-CMAC-256] crit
+    //   3x NewCookie (16 bytes each, non-critical)
+    //   NTPv4Port=4123 (non-critical)
+    //   NTPv4Server="ntp.example.org" (non-critical)
+    //   EndOfMessage crit
+    uint8_t buf[512];
+    size_t  pos = 0;
+
+    uint8_t np_body[2]  = { 0x00, 0x00 };
+    uint8_t aead_body[2]= { 0x00, 0x0f };
+    uint8_t cookie1[16] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    uint8_t cookie2[16] = { 0xaa, 0xbb, 0xcc };
+    uint8_t cookie3[16] = { 0xff };
+    uint8_t port_body[2]= { 0x10, 0x1b };     // 4123
+    const char *host    = "ntp.example.org";
+
+    pos = append_rec(buf, pos, 0x8001, np_body, 2);
+    pos = append_rec(buf, pos, 0x8004, aead_body, 2);
+    pos = append_rec(buf, pos, 0x0005, cookie1, 16);
+    pos = append_rec(buf, pos, 0x0005, cookie2, 16);
+    pos = append_rec(buf, pos, 0x0005, cookie3, 16);
+    pos = append_rec(buf, pos, 0x0007, port_body, 2);
+    pos = append_rec(buf, pos, 0x0006, (const uint8_t *)host, (uint16_t)strlen(host));
+    pos = append_rec(buf, pos, 0x8000, NULL, 0);
+
+    NtsKeResponse r;
+    CHECK_EQ_INT(NtsKe_ParseResponse(buf, pos, &r), 1);
+    CHECK(r.ok);
+    CHECK(r.proto_ok);
+    CHECK(r.aead_ok);
+    CHECK_EQ_INT(r.cookie_count, 3);
+    CHECK_EQ_INT(r.cookie_len[0], 16);
+    CHECK_EQ_INT(r.cookie_len[1], 16);
+    CHECK_EQ_INT(r.cookie_len[2], 16);
+    CHECK(bufs_eq(r.cookies[0], cookie1, 16));
+    CHECK(bufs_eq(r.cookies[1], cookie2, 16));
+    CHECK(bufs_eq(r.cookies[2], cookie3, 16));
+    CHECK_EQ_INT(r.ntp_port, 4123);
+    CHECK_EQ_STR(r.ntp_host, "ntp.example.org");
+    CHECK_EQ_INT(r.error_code, 0);
+}
+
+static void test_ntske_parse_errors(void) {
+    NtsKeResponse r;
+
+    // 1) Missing End-of-Message: parser must reject.
+    {
+        uint8_t buf[32]; size_t pos = 0;
+        uint8_t np[2] = {0,0}, ae[2] = {0,15}, ck[8] = {0xc0};
+        pos = append_rec(buf, pos, 0x8001, np, 2);
+        pos = append_rec(buf, pos, 0x8004, ae, 2);
+        pos = append_rec(buf, pos, 0x0005, ck, 8);
+        CHECK_EQ_INT(NtsKe_ParseResponse(buf, pos, &r), 0);
+        CHECK_EQ_INT(r.ok, 0);
+    }
+
+    // 2) Server sends Error record -> parse fails, code captured.
+    {
+        uint8_t buf[32]; size_t pos = 0;
+        uint8_t err[2] = { 0x00, 0x02 };   // code 2 (Internal Server Error)
+        pos = append_rec(buf, pos, 0x8002, err, 2);
+        CHECK_EQ_INT(NtsKe_ParseResponse(buf, pos, &r), 0);
+        CHECK_EQ_INT(r.ok, 0);
+        CHECK_EQ_INT(r.error_code, 2);
+    }
+
+    // 3) Missing AEAD agreement -> fail.
+    {
+        uint8_t buf[32]; size_t pos = 0;
+        uint8_t np[2] = {0,0}, ck[8] = {0xc0};
+        pos = append_rec(buf, pos, 0x8001, np, 2);
+        pos = append_rec(buf, pos, 0x0005, ck, 8);
+        pos = append_rec(buf, pos, 0x8000, NULL, 0);
+        CHECK_EQ_INT(NtsKe_ParseResponse(buf, pos, &r), 0);
+    }
+
+    // 4) No cookies -> fail (server must supply at least one).
+    {
+        uint8_t buf[32]; size_t pos = 0;
+        uint8_t np[2] = {0,0}, ae[2] = {0,15};
+        pos = append_rec(buf, pos, 0x8001, np, 2);
+        pos = append_rec(buf, pos, 0x8004, ae, 2);
+        pos = append_rec(buf, pos, 0x8000, NULL, 0);
+        CHECK_EQ_INT(NtsKe_ParseResponse(buf, pos, &r), 0);
+    }
+
+    // 5) Unknown record with critical bit -> fail.
+    {
+        uint8_t buf[32]; size_t pos = 0;
+        uint8_t np[2] = {0,0}, ae[2] = {0,15}, ck[8] = {0xc0};
+        pos = append_rec(buf, pos, 0x8001, np, 2);
+        pos = append_rec(buf, pos, 0x8004, ae, 2);
+        pos = append_rec(buf, pos, 0x0005, ck, 8);
+        pos = append_rec(buf, pos, 0x8042, NULL, 0);   // unknown critical
+        pos = append_rec(buf, pos, 0x8000, NULL, 0);
+        CHECK_EQ_INT(NtsKe_ParseResponse(buf, pos, &r), 0);
+    }
+
+    // 6) Unknown record with critical bit CLEAR -> ignored, success.
+    {
+        uint8_t buf[32]; size_t pos = 0;
+        uint8_t np[2] = {0,0}, ae[2] = {0,15}, ck[8] = {0xc0};
+        pos = append_rec(buf, pos, 0x8001, np, 2);
+        pos = append_rec(buf, pos, 0x8004, ae, 2);
+        pos = append_rec(buf, pos, 0x0005, ck, 8);
+        pos = append_rec(buf, pos, 0x0042, NULL, 0);   // unknown non-critical
+        pos = append_rec(buf, pos, 0x8000, NULL, 0);
+        CHECK_EQ_INT(NtsKe_ParseResponse(buf, pos, &r), 1);
+        CHECK_EQ_INT(r.cookie_count, 1);
+    }
+
+    // 7) Truncated body length -> fail.
+    {
+        uint8_t buf[6] = { 0x80, 0x01, 0x00, 0x10, 0x00, 0x00 };  // claims 16-byte body
+        CHECK_EQ_INT(NtsKe_ParseResponse(buf, sizeof buf, &r), 0);
+    }
+
+    // 8) Trailing bytes after End-of-Message -> fail.
+    {
+        uint8_t buf[32]; size_t pos = 0;
+        uint8_t np[2] = {0,0}, ae[2] = {0,15}, ck[8] = {0xc0};
+        pos = append_rec(buf, pos, 0x8001, np, 2);
+        pos = append_rec(buf, pos, 0x8004, ae, 2);
+        pos = append_rec(buf, pos, 0x0005, ck, 8);
+        pos = append_rec(buf, pos, 0x8000, NULL, 0);
+        buf[pos++] = 0x55;       // extra byte
+        CHECK_EQ_INT(NtsKe_ParseResponse(buf, pos, &r), 0);
+    }
+
+    // 9) NTPv4-server record with non-ASCII bytes -> host left empty but
+    // (non-critical) overall parse still succeeds.
+    {
+        uint8_t buf[64]; size_t pos = 0;
+        uint8_t np[2] = {0,0}, ae[2] = {0,15}, ck[8] = {0xc0};
+        uint8_t bad_host[] = { 'n', 't', 'p', 0x01, 'x' };
+        pos = append_rec(buf, pos, 0x8001, np, 2);
+        pos = append_rec(buf, pos, 0x8004, ae, 2);
+        pos = append_rec(buf, pos, 0x0005, ck, 8);
+        pos = append_rec(buf, pos, 0x0006, bad_host, sizeof bad_host);
+        pos = append_rec(buf, pos, 0x8000, NULL, 0);
+        CHECK_EQ_INT(NtsKe_ParseResponse(buf, pos, &r), 1);
+        CHECK_EQ_INT(r.ntp_host[0], 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -783,6 +983,9 @@ int main(void) {
     test_siv_rfc5297_appendix_a1();
     test_siv_rfc5297_appendix_a2();
     test_siv_edge_cases();
+    test_ntske_client_request();
+    test_ntske_parse_valid();
+    test_ntske_parse_errors();
 
     printf("\n%d checks, %d failed\n", g_pass + g_fail, g_fail);
     return g_fail == 0 ? 0 : 1;
