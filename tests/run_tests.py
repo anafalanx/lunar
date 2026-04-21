@@ -58,6 +58,7 @@ def main() -> int:
         SRC  / "siv.c",
         SRC  / "nts_ke.c",
         SRC  / "nts_ef.c",
+        SRC  / "nts.c",
     ]
     # No -mwindows: we want a console main(). -Werror to catch new warnings.
     cmd = [
@@ -77,6 +78,7 @@ def main() -> int:
         "-ld2d1", "-ldwrite", "-lwinmm",
         "-luser32", "-lkernel32", "-lgdi32", "-lcomctl32", "-lshell32",
         "-luxtheme", "-lole32", "-lws2_32", "-ldwmapi", "-ladvapi32",
+        "-lbcrypt",
     ]
     print("==> Compiling tests")
     print("   ", " ".join(cmd))

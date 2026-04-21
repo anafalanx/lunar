@@ -266,6 +266,7 @@ def main() -> None:
         str(SRC / "siv.c"),
         str(SRC / "nts_ke.c"),
         str(SRC / "nts_ef.c"),
+        str(SRC / "nts.c"),
         str(res),
         # Static archive goes AFTER the objects so the linker sees the
         # undefined symbols first; standard GCC link-order rule.
@@ -278,6 +279,7 @@ def main() -> None:
         "-ld2d1", "-ldwrite", "-lwinmm",
         "-luser32", "-lkernel32", "-lgdi32", "-lcomctl32", "-lshell32",
         "-luxtheme", "-lole32", "-lws2_32", "-ldwmapi", "-ladvapi32",
+        "-lbcrypt",
     )
     log(f"{exe}  ({exe.stat().st_size / 1048576:.2f} MB)")
 
