@@ -53,10 +53,6 @@ int     Clock_IsDisciplined(void);
 // rate).
 int32_t Clock_RatePpm(void);
 
-// Offset from the raw Windows system clock, in milliseconds
-// (disciplined time minus system time). Zero before the first sync.
-int64_t Clock_OffsetMs(void);
-
 // Fed by ntp.c after a validated SNTP reply: ntpUtcMs is what the NTP
 // server believes UTC was "now" as of this call. localQpc is the QPC
 // value captured when t4 was measured, so we don't charge the network
@@ -99,6 +95,11 @@ TrustState Clock_Trust(void);
 
 // Convenience for ntp.c: read the QPC at a defined moment.
 int64_t Clock_Qpc(void);
+
+// QPC tick frequency (ticks per second). Needed by callers that
+// measure intervals themselves (e.g. the SNTP worker timing its
+// round-trip in QPC ticks).
+int64_t Clock_QpcFreq(void);
 
 #ifdef __cplusplus
 }

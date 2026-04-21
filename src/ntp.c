@@ -22,7 +22,6 @@
 #define NTP_PORT             "123"
 #define NTP_TIMEOUT_MS       3000
 #define NTP_EPOCH_DELTA_S    2208988800ULL        // seconds between 1900 and 1970
-#define FT_EPOCH_DELTA_MS    11644473600000ULL    // 1601 -> 1970 in ms
 #define FRESH_WINDOW_MS      (2LL * 60LL * 60LL * 1000LL) // 2 hours
 
 // --- Source list ---------------------------------------------------------
@@ -56,18 +55,26 @@ static volatile LONG64  g_lastSuccessUtc  = 0;   // UTC ms at any-ok
 static volatile LONG64  g_lastSpreadMs    = 0;   // last cycle's spread
 static volatile LONG    g_running         = 0;
 
-static int64_t FtToMs(FILETIME ft) {
-    ULARGE_INTEGER u;
-    u.LowPart  = ft.dwLowDateTime;
-    u.HighPart = ft.dwHighDateTime;
-    return (int64_t)(u.QuadPart / 10000LL) - (int64_t)FT_EPOCH_DELTA_MS;
-}
-
 // --- Single-source query -------------------------------------------------
 
 // Run one SNTP exchange against a specific host. Writes the result fields
 // on success; returns 1 on success, 0 on any error (DNS, socket, timeout,
 // invalid header, zero timestamps).
+//
+// QPC-only timing: we do NOT read the Windows system clock. T1 and T4
+// are taken from QueryPerformanceCounter; only the server's reply
+// timestamps (T2, T3 in NTP epoch) supply real UTC. The result's
+// ntpUtcMs is "the real UTC at the moment qpcAtT4 was sampled":
+//
+//   rtt_ms         = (qpcT4 - qpcT1) * 1000 / qpcFreq
+//   server_proc_ms = t3_ms - t2_ms
+//   net_rtt_ms     = max(0, rtt_ms - server_proc_ms)
+//   half_net_ms    = net_rtt_ms / 2
+//   ntpUtcMs       = t3_ms + half_net_ms    // UTC at our local qpcT4
+//
+// outOffsetMs is kept for API compatibility but repurposed: it now
+// carries ntpUtcMs (absolute UTC at qpcAtT4). The aggregator projects
+// those values onto a common QPC moment before computing concurrence.
 static int NtpQueryHost(const char *host,
                         int64_t *outOffsetMs,
                         int64_t *outNtpUtcMs,
@@ -91,15 +98,14 @@ static int NtpQueryHost(const char *host,
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof(tmo));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tmo, sizeof(tmo));
 
-    FILETIME ft1; GetSystemTimeAsFileTime(&ft1);
+    int64_t qpcT1 = Clock_Qpc();
     int sent = sendto(s, (const char *)pkt, (int)sizeof(pkt), 0,
                       res->ai_addr, (int)res->ai_addrlen);
     freeaddrinfo(res);
     if (sent != (int)sizeof(pkt)) { closesocket(s); return 0; }
 
     int recvd = recv(s, (char *)pkt, (int)sizeof(pkt), 0);
-    FILETIME ft4; GetSystemTimeAsFileTime(&ft4);
-    int64_t qpcT4 = Clock_Qpc();           // monotonic anchor point
+    int64_t qpcT4 = Clock_Qpc();
     closesocket(s);
     if (recvd != (int)sizeof(pkt)) return 0;
 
@@ -131,17 +137,22 @@ static int NtpQueryHost(const char *host,
                     + (int64_t)(((uint64_t)t2_frac * 1000ULL) >> 32);
     int64_t t3_ms = ((int64_t)t3_s - (int64_t)NTP_EPOCH_DELTA_S) * 1000
                     + (int64_t)(((uint64_t)t3_frac * 1000ULL) >> 32);
-    int64_t t1_ms = FtToMs(ft1);
-    int64_t t4_ms = FtToMs(ft4);
 
-    int64_t offset = ((t2_ms - t1_ms) + (t3_ms - t4_ms)) / 2;
-    int64_t rtt    = (t4_ms - t1_ms) - (t3_ms - t2_ms);
+    int64_t qpcFreq = Clock_QpcFreq();
+    if (qpcFreq <= 0) return 0;
+    int64_t rtt = ((qpcT4 - qpcT1) * 1000LL + qpcFreq / 2) / qpcFreq;
     if (rtt < 0) rtt = 0;
 
-    *outOffsetMs = offset;
-    *outNtpUtcMs = t4_ms + offset;
+    int64_t serverProc = t3_ms - t2_ms;
+    if (serverProc < 0) serverProc = 0;
+    int64_t netRtt = rtt - serverProc;
+    if (netRtt < 0) netRtt = 0;
+
+    *outNtpUtcMs = t3_ms + netRtt / 2;
     *outQpcAtT4  = qpcT4;
     *outRttMs    = (uint32_t)(rtt > 0x7fffffff ? 0x7fffffff : rtt);
+    // offsetMs carries absolute UTC at qpcAtT4 (legacy field reused).
+    *outOffsetMs = *outNtpUtcMs;
     return 1;
 }
 
@@ -254,29 +265,49 @@ static void FormatIsoUtc(int64_t utcMs, char *out, size_t n) {
     int    msec = (int)(utcMs % 1000);
     if (msec < 0) { msec += 1000; secs -= 1; }
     struct tm tm = { 0 };
-#ifdef _WIN32
+    // gmtime_s is pure arithmetic: Unix epoch seconds to Y/M/D/h/m/s.
+    // It does NOT read the system clock. Safe to use while remaining
+    // independent of the Windows wall clock.
     gmtime_s(&tm, &secs);
-#else
-    tm = *gmtime(&secs);
-#endif
     _snprintf(out, n, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
               tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
               tm.tm_hour, tm.tm_min, tm.tm_sec, msec);
 }
 
+// Timestamp helper for audit-log lines when no trusted UTC is yet
+// available. We refuse to read the Windows system clock, so use the
+// monotonic QPC counter since process start instead. The line will be
+// marked with a '~' prefix so readers know this is a relative stamp,
+// not real UTC.
+//
+//   T+000012.345s    -- 12.345 seconds since the clockwork was created
+static void FormatRelativeStamp(char *out, size_t n) {
+    static int64_t s_anchorQpc = 0;
+    static int     s_anchored  = 0;
+    if (!s_anchored) {
+        s_anchorQpc = Clock_Qpc();
+        s_anchored  = 1;
+    }
+    int64_t freq = Clock_QpcFreq();
+    if (freq <= 0) freq = 1;
+    int64_t ticks = Clock_Qpc() - s_anchorQpc;
+    int64_t totalMs = (ticks * 1000LL + freq / 2) / freq;
+    if (totalMs < 0) totalMs = 0;
+    int64_t secs = totalMs / 1000;
+    int     ms   = (int)(totalMs % 1000);
+    _snprintf(out, n, "T+%06lld.%03ds", (long long)secs, ms);
+}
+
 // Grab the best timestamp we have: disciplined clock if OK, otherwise
-// system clock with a '~' marker. Returns 1 if the stamp is trusted.
+// a QPC-relative "T+seconds since process start" marker. Returns 1 if
+// the stamp is trusted wall-clock UTC.
 static int BestLogStamp(char *out, size_t n) {
     int64_t utcMs = 0;
     if (Clock_NowUtcMs(&utcMs)) {
         FormatIsoUtc(utcMs, out, n);
         return 1;
     }
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
-    int64_t sysMs = (int64_t)(t / 10000ULL) - (int64_t)FT_EPOCH_DELTA_MS;
-    FormatIsoUtc(sysMs, out, n);
+    FormatRelativeStamp(out, n);
     return 0;
 }
 
@@ -402,6 +433,39 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
     int64_t    maxSpread = 0;
     TrustState trust = Ntp_Concur(snapshot, &bestUtcMs, &bestQpc, &maxSpread);
 
+    // Rewrite snapshot[i].offsetMs to the MEANINGFUL display value:
+    // this source's deviation from the cycle consensus, projected to
+    // a common QPC moment. That's what the audit log and About dialog
+    // want to show (per-source agreement with the trio).
+    {
+        int64_t qpcFreq = Clock_QpcFreq();
+        if (qpcFreq <= 0) qpcFreq = 1;
+        // Consensus reference: the OK cycle's bestQpc if we have it,
+        // otherwise an arbitrary successful source's qpcAtT4. If no
+        // source succeeded we just zero all offsetMs.
+        int64_t refQpc = bestQpc;
+        int64_t refUtc = bestUtcMs;
+        if (trust != TRUST_OK) {
+            int picked = -1;
+            for (int i = 0; i < NTP_SOURCE_COUNT; i++) {
+                if (snapshot[i].ok) { picked = i; break; }
+            }
+            if (picked >= 0) {
+                refQpc = snapshot[picked].qpcAtT4;
+                refUtc = snapshot[picked].ntpUtcMs;
+            }
+        }
+        for (int i = 0; i < NTP_SOURCE_COUNT; i++) {
+            if (!snapshot[i].ok) { snapshot[i].offsetMs = 0; continue; }
+            int64_t dq = refQpc - snapshot[i].qpcAtT4;
+            int64_t dms = (dq >= 0)
+                ? (dq * 1000LL + qpcFreq / 2) / qpcFreq
+                : (dq * 1000LL - qpcFreq / 2) / qpcFreq;
+            int64_t projected = snapshot[i].ntpUtcMs + dms;
+            snapshot[i].offsetMs = projected - refUtc;
+        }
+    }
+
     // Publish shared state.
     if (g_csInit) EnterCriticalSection(&g_cs);
     for (int i = 0; i < NTP_SOURCE_COUNT; i++) g_results[i] = snapshot[i];
@@ -420,12 +484,11 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
 
     // Legacy accessors (About dialog etc.) only record on OK cycles.
     if (trust == TRUST_OK) {
-        // Median offset of the three: recompute to match the fed sample.
-        int64_t offs[3] = {
-            snapshot[0].offsetMs, snapshot[1].offsetMs, snapshot[2].offsetMs
-        };
-        qsort(offs, 3, sizeof(int64_t), CmpI64);
-        InterlockedExchange64(&g_offsetMs,        offs[1]);
+        // g_offsetMs legacy meaning ("median offset") no longer
+        // applies -- we don't read the system clock. Publish 0; the
+        // per-source offsetMs values on the snapshot (deviation from
+        // consensus) are what the About dialog displays now.
+        InterlockedExchange64(&g_offsetMs,        0);
         InterlockedExchange64(&g_lastSuccessTick, (LONG64)GetTickCount64());
         InterlockedExchange64(&g_lastSuccessUtc,  (LONG64)bestUtcMs);
     }
@@ -441,6 +504,16 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
 //
 // Given per-source results, compute the trust verdict. See ntp.h for
 // contract. No globals, no I/O -- safe to call from anywhere.
+//
+// Each source captured its qpcAtT4 at a slightly different moment (the
+// three workers run in parallel but reply at different times). We
+// therefore cannot compare ntpUtcMs values directly -- a naive diff
+// would include the local elapsed time between captures. Instead we
+// project every source's UTC estimate onto a common QPC moment (the
+// median qpcAtT4) using the local QPC frequency, then measure the
+// pairwise spread on those projected values. This is a purely
+// arithmetic operation on QPC (monotonic tick counter) and NTP-server
+// timestamps; the Windows system clock is never consulted.
 TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
                       int64_t *outBestUtcMs,
                       int64_t *outBestQpc,
@@ -452,41 +525,65 @@ TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
     if (outMaxSpreadMs) *outMaxSpreadMs = 0;
 
     int     nok = 0;
-    int64_t offs[NTP_SOURCE_COUNT];
     int64_t utcs[NTP_SOURCE_COUNT];
     int64_t qpcs[NTP_SOURCE_COUNT];
     for (int i = 0; i < NTP_SOURCE_COUNT; i++) {
         if (results[i].ok) {
-            offs[nok] = results[i].offsetMs;
             utcs[nok] = results[i].ntpUtcMs;
             qpcs[nok] = results[i].qpcAtT4;
             nok++;
         }
     }
 
+    // Below-unanimity is INOP regardless of agreement -- no degraded
+    // middle ground. Still compute a spread so the audit log has
+    // something informative.
+    int64_t qpcFreq = Clock_QpcFreq();
+    if (qpcFreq <= 0) qpcFreq = 1;
+
     if (nok != NTP_SOURCE_COUNT) {
-        // Compute spread among whatever succeeded, for the audit log,
-        // but the verdict is already INOP.
         if (nok >= 2) {
-            int64_t s[NTP_SOURCE_COUNT];
-            for (int i = 0; i < nok; i++) s[i] = offs[i];
-            qsort(s, (size_t)nok, sizeof(int64_t), CmpI64);
-            if (outMaxSpreadMs) *outMaxSpreadMs = s[nok - 1] - s[0];
+            // Project to the first source's qpc as an arbitrary reference.
+            int64_t ref = qpcs[0];
+            int64_t proj[NTP_SOURCE_COUNT];
+            for (int i = 0; i < nok; i++) {
+                int64_t dq = ref - qpcs[i];
+                int64_t dms = (dq >= 0)
+                    ? (dq * 1000LL + qpcFreq / 2) / qpcFreq
+                    : (dq * 1000LL - qpcFreq / 2) / qpcFreq;
+                proj[i] = utcs[i] + dms;
+            }
+            qsort(proj, (size_t)nok, sizeof(int64_t), CmpI64);
+            if (outMaxSpreadMs) *outMaxSpreadMs = proj[nok - 1] - proj[0];
         }
         return TRUST_INOP;
     }
 
-    int64_t sorted[3] = { offs[0], offs[1], offs[2] };
-    qsort(sorted, 3, sizeof(int64_t), CmpI64);
-    int64_t spread = sorted[2] - sorted[0];
+    // Three successes. Project every sample to the median qpc.
+    int64_t sortedQpc[3] = { qpcs[0], qpcs[1], qpcs[2] };
+    qsort(sortedQpc, 3, sizeof(int64_t), CmpI64);
+    int64_t refQpc = sortedQpc[1];
+
+    int64_t proj[3];
+    for (int i = 0; i < 3; i++) {
+        int64_t dq = refQpc - qpcs[i];
+        int64_t dms = (dq >= 0)
+            ? (dq * 1000LL + qpcFreq / 2) / qpcFreq
+            : (dq * 1000LL - qpcFreq / 2) / qpcFreq;
+        proj[i] = utcs[i] + dms;
+    }
+    int64_t sortedProj[3] = { proj[0], proj[1], proj[2] };
+    qsort(sortedProj, 3, sizeof(int64_t), CmpI64);
+    int64_t spread = sortedProj[2] - sortedProj[0];
     if (outMaxSpreadMs) *outMaxSpreadMs = spread;
 
     if (spread > CONCUR_THRESHOLD_MS) return TRUST_INOP;
 
-    // Feed the median source.
-    int64_t medianOff = sorted[1];
-    for (int k = 0; k < nok; k++) {
-        if (offs[k] == medianOff) {
+    // Feed the source whose projected UTC is the median. Return its
+    // original ntpUtcMs and qpcAtT4 so the clockwork anchor is exact.
+    int64_t medianProj = sortedProj[1];
+    for (int k = 0; k < 3; k++) {
+        if (proj[k] == medianProj) {
             if (outBestUtcMs) *outBestUtcMs = utcs[k];
             if (outBestQpc)   *outBestQpc   = qpcs[k];
             break;

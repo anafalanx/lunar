@@ -32,6 +32,7 @@ static int64_t    g_anchorQpc    = 0;    // QPC at anchor
 static int64_t    g_anchorUtcMs  = 0;    // disciplined UTC at anchor (ms)
 static int32_t    g_ratePpm      = 0;    // parts per million offset from 1.0
 static int32_t    g_loadedRatePpm = 0;   // rate read from disk at startup
+static int64_t    g_loadedLastSync = 0;  // UTC at save time (for staleness chk)
 static int        g_haveSample   = 0;    // at least one NTP sample THIS run
 static int        g_haveRate     = 0;    // two+ samples: rate is measured
 static int64_t    g_lastSyncUtcMs = 0;   // UTC at last successful sync
@@ -50,21 +51,14 @@ static TrustState g_trust         = TRUST_INOP;
 #define SLEW_THRESHOLD_MS    2000   // residual above this snaps instead
 #define SLEW_WINDOW_MS       60000  // slew small residuals over ~60 s
 
-// Read the raw Windows system clock as UTC ms since 1970.
-static int64_t RawSystemUtcMs(void) {
-    FILETIME ft;
-    GetSystemTimeAsFileTime(&ft);
-    ULARGE_INTEGER u;
-    u.LowPart  = ft.dwLowDateTime;
-    u.HighPart = ft.dwHighDateTime;
-    // 100-ns ticks since 1601 -> ms since 1970
-    return (int64_t)(u.QuadPart / 10000LL) - 11644473600000LL;
-}
-
 int64_t Clock_Qpc(void) {
     LARGE_INTEGER q;
     QueryPerformanceCounter(&q);
     return q.QuadPart;
+}
+
+int64_t Clock_QpcFreq(void) {
+    return g_qpcFreq;
 }
 
 static void LoadDiscipline(void) {
@@ -80,15 +74,18 @@ static void LoadDiscipline(void) {
     long long lastSync = 0;
     if (sscanf(buf, "%d %lld", &rate, &lastSync) < 1) return;
 
-    // Reject stale (> 30 days) or obviously out-of-range values. A
-    // month-old rate is probably no longer representative of the
-    // current hardware/temperature and anyway we'll re-verify on the
-    // very first sync this run; worst case we just start at 0 ppm.
-    int64_t nowUtc = RawSystemUtcMs();
-    if (lastSync > 0 && nowUtc - lastSync > 30LL * 86400LL * 1000LL) return;
+    // Staleness: we USED to reject rates older than 30 days here via
+    // the Windows system clock. That would reintroduce a system-clock
+    // dependency, so we defer the check: load the rate tentatively,
+    // and re-evaluate staleness against our own disciplined UTC after
+    // the first successful NTP cycle (see Clock_OnSyncedNtpUtc).
+    // Worst-case the value is stale -- in which case the first sync's
+    // residual will be large; the PLL absorbs it into a snap.
+    (void)lastSync;
     if (rate >  RATE_CLAMP_PPM) rate =  RATE_CLAMP_PPM;
     if (rate < -RATE_CLAMP_PPM) rate = -RATE_CLAMP_PPM;
-    g_loadedRatePpm = rate;
+    g_loadedRatePpm   = rate;
+    g_loadedLastSync  = lastSync;
 }
 
 void Clock_Init(void) {
@@ -190,14 +187,6 @@ int Clock_NowUtcMs(int64_t *outMs) {
 int Clock_IsDisciplined(void) { return g_haveSample ? 1 : 0; }
 int32_t Clock_RatePpm(void)   { return g_haveRate ? g_ratePpm : 0; }
 
-int64_t Clock_OffsetMs(void) {
-    if (!g_haveSample) return 0;
-    EnterCriticalSection(&g_cs);
-    int64_t d = ProjectLocked(Clock_Qpc()) - RawSystemUtcMs();
-    LeaveCriticalSection(&g_cs);
-    return d;
-}
-
 // Called by ntp.c after a successful SNTP exchange. ntpUtcMs is the true
 // UTC at the instant identified by localQpc (which is the QPC value
 // recorded at t4, i.e. when we received the reply). We include the
@@ -207,12 +196,20 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
     EnterCriticalSection(&g_cs);
 
     if (!g_haveSample) {
-        // First sync THIS run. Anchor, apply persisted rate as a
-        // bootstrap, but mark rate as "not yet measured" because we
-        // have only one sample so far.
+        // First sync THIS run. Deferred staleness check: if the
+        // persisted rate was saved more than 30 days ago (measured
+        // against the trusted NTP time we just received -- NOT the
+        // Windows system clock), discard it.
+        if (g_loadedLastSync > 0
+            && ntpUtcMs - g_loadedLastSync > 30LL * 86400LL * 1000LL) {
+            g_loadedRatePpm = 0;
+        }
+
+        // Anchor, apply persisted rate as a bootstrap, but mark rate
+        // as "not yet measured" because we have only one sample so far.
         g_anchorQpc     = localQpc;
         g_anchorUtcMs   = ntpUtcMs;
-        g_ratePpm       = g_loadedRatePpm;   // bootstrap
+        g_ratePpm       = g_loadedRatePpm;   // bootstrap (or 0 if stale)
         g_haveSample    = 1;
         // If we had a previously-persisted rate, consider the clock
         // already disciplined: we're using that rate until the next

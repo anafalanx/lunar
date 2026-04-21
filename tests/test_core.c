@@ -448,12 +448,20 @@ static void test_clock_discipline(void) {
 // These tests nail down the contract: binary OK/INOP, 200 ms window,
 // median pick on OK. If a refactor ever loosens any of these rules,
 // these tests must be updated deliberately.
+//
+// Note on the post-system-clock refactor: Ntp_Concur no longer reads
+// a per-source "offsetMs" field. It projects each source's ntpUtcMs
+// onto a common QPC moment using Clock_QpcFreq() and measures spread
+// on the projected values. For the simple tests below we set every
+// source's qpcAtT4 to the same value, so the projection delta is zero
+// and the spread falls out as (max ntpUtcMs) - (min ntpUtcMs). One
+// extra test exercises the projection math with varying qpcAtT4.
 
-static NtpSourceResult MkSrc(int ok, int64_t off, int64_t utc, int64_t qpc,
+static NtpSourceResult MkSrc(int ok, int64_t utc, int64_t qpc,
                              const char *label) {
     NtpSourceResult r = {0};
     r.ok       = ok;
-    r.offsetMs = off;
+    r.offsetMs = 0;       // field repurposed as display-only, irrelevant here
     r.ntpUtcMs = utc;
     r.qpcAtT4  = qpc;
     r.rttMs    = 10;
@@ -462,95 +470,126 @@ static NtpSourceResult MkSrc(int ok, int64_t off, int64_t utc, int64_t qpc,
 }
 
 static void test_ntp_concur(void) {
+    // Clock_Init is required so Clock_QpcFreq() returns a valid
+    // frequency for the projection code path. It is idempotent.
+    Clock_Init();
+
     NtpSourceResult s[NTP_SOURCE_COUNT];
     int64_t best = 0, qpc = 0, spread = 0;
+    const int64_t Q = 1000;  // shared qpcAtT4 -- projection delta = 0
 
-    // 1) Three sources, all ok, identical offsets -> OK, spread 0.
-    s[0] = MkSrc(1, 0, 1000, 100, "A");
-    s[1] = MkSrc(1, 0, 2000, 200, "B");
-    s[2] = MkSrc(1, 0, 3000, 300, "C");
+    // 1) Three sources, all ok, identical UTC -> OK, spread 0.
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1000, Q, "C");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
     CHECK_EQ_INT(spread, 0);
-    // Median offset is 0, tie -> first match is slot 0 (utc=1000, qpc=100).
     CHECK_EQ_INT(best, 1000);
-    CHECK_EQ_INT(qpc, 100);
+    CHECK_EQ_INT(qpc, Q);
 
     // 2) Three ok, spread exactly 199 ms (within threshold) -> OK.
-    s[0] = MkSrc(1, -99, 1000, 100, "A");
-    s[1] = MkSrc(1,   0, 2000, 200, "B");
-    s[2] = MkSrc(1, 100, 3000, 300, "C");
+    s[0] = MkSrc(1, 901,  Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1100, Q, "C");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
     CHECK_EQ_INT(spread, 199);
-    // Median offset is 0 -> slot 1.
-    CHECK_EQ_INT(best, 2000);
-    CHECK_EQ_INT(qpc, 200);
+    CHECK_EQ_INT(best, 1000);     // median utc
+    CHECK_EQ_INT(qpc, Q);
 
     // 3) Three ok, spread exactly 200 ms (boundary, inclusive) -> OK.
-    s[0] = MkSrc(1, -100, 1000, 100, "A");
-    s[1] = MkSrc(1,    0, 2000, 200, "B");
-    s[2] = MkSrc(1,  100, 3000, 300, "C");
+    s[0] = MkSrc(1, 900,  Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1100, Q, "C");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
     CHECK_EQ_INT(spread, 200);
-    CHECK_EQ_INT(best, 2000);
+    CHECK_EQ_INT(best, 1000);
 
     // 4) Three ok, spread 201 ms -> INOP (just over threshold).
-    s[0] = MkSrc(1, -100, 1000, 100, "A");
-    s[1] = MkSrc(1,    0, 2000, 200, "B");
-    s[2] = MkSrc(1,  101, 3000, 300, "C");
+    s[0] = MkSrc(1, 900,  Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1101, Q, "C");
     best = qpc = -1;
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
     CHECK_EQ_INT(spread, 201);
-    // INOP must not leak a sample.
     CHECK_EQ_INT(best, 0);
     CHECK_EQ_INT(qpc, 0);
 
     // 5) Three ok with one far outlier -> INOP.
-    s[0] = MkSrc(1,       0, 1000, 100, "A");
-    s[1] = MkSrc(1,      50, 2000, 200, "B");
-    s[2] = MkSrc(1, 5000000, 3000, 300, "C");
+    s[0] = MkSrc(1, 1000,    Q, "A");
+    s[1] = MkSrc(1, 1050,    Q, "B");
+    s[2] = MkSrc(1, 6001000, Q, "C");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
 
     // 6) Two ok, agreeing perfectly -> still INOP (no degraded state).
-    s[0] = MkSrc(1, 0, 1000, 100, "A");
-    s[1] = MkSrc(1, 0, 2000, 200, "B");
-    s[2] = MkSrc(0, 0,    0,   0, "C");
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(0,    0, 0, "C");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
 
     // 7) Two ok, large disagreement -> INOP. Spread reported for audit.
-    s[0] = MkSrc(1,   0, 1000, 100, "A");
-    s[1] = MkSrc(1, 500, 2000, 200, "B");
-    s[2] = MkSrc(0,   0,    0,   0, "C");
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1500, Q, "B");
+    s[2] = MkSrc(0,    0, 0, "C");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
     CHECK_EQ_INT(spread, 500);
 
     // 8) One ok -> INOP, spread zero (no pair).
-    s[0] = MkSrc(1, 0, 1000, 100, "A");
-    s[1] = MkSrc(0, 0,    0,   0, "B");
-    s[2] = MkSrc(0, 0,    0,   0, "C");
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(0,    0, 0, "B");
+    s[2] = MkSrc(0,    0, 0, "C");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
     CHECK_EQ_INT(spread, 0);
 
     // 9) Zero ok -> INOP.
-    s[0] = MkSrc(0, 0, 0, 0, "A");
-    s[1] = MkSrc(0, 0, 0, 0, "B");
-    s[2] = MkSrc(0, 0, 0, 0, "C");
+    s[0] = MkSrc(0, 0, 0, "A");
+    s[1] = MkSrc(0, 0, 0, "B");
+    s[2] = MkSrc(0, 0, 0, "C");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
     CHECK_EQ_INT(spread, 0);
 
     // 10) Tolerates NULL out-parameters.
-    s[0] = MkSrc(1, 0, 1000, 100, "A");
-    s[1] = MkSrc(1, 0, 2000, 200, "B");
-    s[2] = MkSrc(1, 0, 3000, 300, "C");
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1000, Q, "C");
     CHECK_EQ_INT(Ntp_Concur(s, NULL, NULL, NULL), TRUST_OK);
 
-    // 11) Negative-offset median is still handled correctly.
-    s[0] = MkSrc(1, -150, 1000, 100, "A");
-    s[1] = MkSrc(1, -100, 2000, 200, "B");
-    s[2] = MkSrc(1,  -50, 3000, 300, "C");
+    // 11) Negative UTCs (pre-1970) work correctly.
+    s[0] = MkSrc(1, -150, Q, "A");
+    s[1] = MkSrc(1, -100, Q, "B");
+    s[2] = MkSrc(1,  -50, Q, "C");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
     CHECK_EQ_INT(spread, 100);
-    // Median offset -100 -> slot 1.
-    CHECK_EQ_INT(best, 2000);
+    CHECK_EQ_INT(best, -100);
+
+    // 12) QPC-projection test: three sources captured at different
+    // qpcAtT4 values report identical UTC projected to the median qpc.
+    // We stagger qpcAtT4 by exactly 100 ms in QPC ticks and stagger
+    // ntpUtcMs by the same amount, expecting projected spread = 0.
+    int64_t freq = Clock_QpcFreq();
+    CHECK(freq > 0);
+    int64_t tick100ms = freq / 10;   // 100 ms worth of QPC ticks
+    s[0] = MkSrc(1, 1000 - 100, Q + 0 * tick100ms, "A"); // earlier qpc, earlier utc
+    s[1] = MkSrc(1, 1000 + 0,   Q + 1 * tick100ms, "B"); // reference
+    s[2] = MkSrc(1, 1000 + 100, Q + 2 * tick100ms, "C"); // later qpc, later utc
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
+    CHECK_EQ_INT(spread, 0);
+    // All three sources have the same projected UTC (1000). The
+    // tiebreaker picks the first slot that matches, so we get source
+    // A's raw (utc, qpc) pair -- which is a valid anchor (the UTC
+    // that was true at that QPC tick).
+    CHECK_EQ_INT(best, 900);
+    CHECK_EQ_INT(qpc, Q);
+
+    // 13) QPC-projection test, divergence: hold UTC constant across
+    // three sources whose qpcAtT4 staggers by 200 ms. Projection
+    // inflates the disagreement to 400 ms total (> threshold) -> INOP.
+    int64_t tick200ms = freq / 5;
+    s[0] = MkSrc(1, 1000, Q + 0 * tick200ms, "A");
+    s[1] = MkSrc(1, 1000, Q + 1 * tick200ms, "B");
+    s[2] = MkSrc(1, 1000, Q + 2 * tick200ms, "C");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+    // Expected spread = 2 * 200 ms = 400 ms (earliest-vs-latest projected).
+    CHECK(spread >= 399 && spread <= 401);
 }
 
 // ---------------------------------------------------------------------------

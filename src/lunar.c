@@ -566,7 +566,28 @@ static void UpdateTimezone(void) {
     // Determine whether DST is currently active in the selected zone
     // by converting "now" both via the Ex API (honours DST) and via a
     // fixed-standard-bias TIME_ZONE_INFORMATION; a difference means DST.
-    SYSTEMTIME nowUtc; GetSystemTime(&nowUtc);
+    //
+    // "Now" must come from our disciplined clockwork, NEVER the Windows
+    // system clock. If the clockwork isn't trusted yet, there's no
+    // point evaluating DST -- show the STANDARD-time abbreviation until
+    // we get a real UTC from the NTP trio.
+    int64_t nowUtcMs = 0;
+    int haveNow = Clock_NowUtcMs(&nowUtcMs);
+    SYSTEMTIME nowUtc = { 0 };
+    if (haveNow) {
+        time_t t = (time_t)(nowUtcMs / 1000);
+        struct tm gm = { 0 };
+        if (gmtime_s(&gm, &t) == 0) {
+            nowUtc.wYear   = (WORD)(gm.tm_year + 1900);
+            nowUtc.wMonth  = (WORD)(gm.tm_mon + 1);
+            nowUtc.wDay    = (WORD)gm.tm_mday;
+            nowUtc.wHour   = (WORD)gm.tm_hour;
+            nowUtc.wMinute = (WORD)gm.tm_min;
+            nowUtc.wSecond = (WORD)gm.tm_sec;
+        } else {
+            haveNow = 0;
+        }
+    }
     TIME_ZONE_INFORMATION tzi = { 0 };
     tzi.Bias         = dtzi.Bias;
     tzi.StandardBias = dtzi.StandardBias;
@@ -576,18 +597,21 @@ static void UpdateTimezone(void) {
     wcsncpy(tzi.StandardName, dtzi.StandardName, 32);
     wcsncpy(tzi.DaylightName, dtzi.DaylightName, 32);
 
-    SYSTEMTIME localEx = { 0 }, localStd = { 0 };
-    SystemTimeToTzSpecificLocalTime(&tzi, &nowUtc, &localEx);
-    // Force-standard variant: zero out the daylight rule so the OS
-    // treats it as a no-DST zone.
-    TIME_ZONE_INFORMATION tziStd = tzi;
-    memset(&tziStd.DaylightDate, 0, sizeof(SYSTEMTIME));
-    tziStd.DaylightBias = tziStd.StandardBias;
-    SystemTimeToTzSpecificLocalTime(&tziStd, &nowUtc, &localStd);
+    int isDst = 0;
+    if (haveNow) {
+        SYSTEMTIME localEx = { 0 }, localStd = { 0 };
+        SystemTimeToTzSpecificLocalTime(&tzi, &nowUtc, &localEx);
+        // Force-standard variant: zero out the daylight rule so the OS
+        // treats it as a no-DST zone.
+        TIME_ZONE_INFORMATION tziStd = tzi;
+        memset(&tziStd.DaylightDate, 0, sizeof(SYSTEMTIME));
+        tziStd.DaylightBias = tziStd.StandardBias;
+        SystemTimeToTzSpecificLocalTime(&tziStd, &nowUtc, &localStd);
 
-    int isDst = (localEx.wHour != localStd.wHour
+        isDst = (localEx.wHour != localStd.wHour
               || localEx.wDay  != localStd.wDay
               || localEx.wMinute != localStd.wMinute);
+    }
 
     LONG biasMin = tzi.Bias + (isDst ? tzi.DaylightBias : tzi.StandardBias);
     int utcOffsetH = -(int)biasMin / 60;
@@ -1176,41 +1200,48 @@ static void ShowAbout(void) {
     if (utc == 0) {
         wcscpy_s(sync, 128, L"Last NTP sync: never");
     } else {
-        // Display in local time.
-        time_t t = (time_t)(utc / 1000);
+        // Display in the user's selected time zone (not the Windows
+        // system TZ): UtcMsToLocalTm honours g_tzKey / UTC default.
         struct tm lt = {0};
-        (void)localtime_s(&lt, &t);
+        int msDummy = 0;
+        int okTm = UtcMsToLocalTm(utc, &lt, &msDummy);
+        // "ago" measured against our disciplined clockwork. If no
+        // trusted UTC is available yet, we simply omit the "ago"
+        // portion rather than reach for the Windows system clock.
         int64_t nowUtc = 0;
-        {
-            FILETIME ft; GetSystemTimeAsFileTime(&ft);
-            ULARGE_INTEGER u; u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
-            nowUtc = (int64_t)(u.QuadPart / 10000LL) - 11644473600000LL;
+        int haveNow = Clock_NowUtcMs(&nowUtc);
+        if (!okTm) {
+            wcscpy_s(sync, 128, L"Last NTP sync: (tm conversion failed)");
+        } else if (!haveNow) {
+            swprintf(sync, 128,
+                     L"Last NTP sync: %02d:%02d:%02d",
+                     lt.tm_hour, lt.tm_min, lt.tm_sec);
+        } else {
+            int64_t agoS = (nowUtc - utc) / 1000;
+            if (agoS < 0) agoS = 0;
+            const wchar_t *unit; int64_t n;
+            if      (agoS < 60)    { n = agoS;         unit = (n == 1) ? L"second" : L"seconds"; }
+            else if (agoS < 3600)  { n = agoS / 60;    unit = (n == 1) ? L"minute" : L"minutes"; }
+            else if (agoS < 86400) { n = agoS / 3600;  unit = (n == 1) ? L"hour"   : L"hours"; }
+            else                   { n = agoS / 86400; unit = (n == 1) ? L"day"    : L"days"; }
+            swprintf(sync, 128,
+                     L"Last NTP sync: %02d:%02d:%02d  (%lld %s ago)",
+                     lt.tm_hour, lt.tm_min, lt.tm_sec, (long long)n, unit);
         }
-        int64_t agoS = (nowUtc - utc) / 1000;
-        if (agoS < 0) agoS = 0;
-        const wchar_t *unit; int64_t n;
-        if      (agoS < 60)      { n = agoS;         unit = (n == 1) ? L"second" : L"seconds"; }
-        else if (agoS < 3600)    { n = agoS / 60;    unit = (n == 1) ? L"minute" : L"minutes"; }
-        else if (agoS < 86400)   { n = agoS / 3600;  unit = (n == 1) ? L"hour"   : L"hours"; }
-        else                     { n = agoS / 86400; unit = (n == 1) ? L"day"    : L"days"; }
-        swprintf(sync, 128,
-                 L"Last NTP sync: %02d:%02d:%02d  (%lld %s ago)",
-                 lt.tm_hour, lt.tm_min, lt.tm_sec, (long long)n, unit);
     }
     wchar_t msg[512];
     int32_t ppm = Clock_RatePpm();
-    int64_t off = Clock_OffsetMs();
     wchar_t disciplineLine[160];
     if (!Clock_IsDisciplined()) {
         swprintf(disciplineLine, 160,
-                 L"Clockwork: system time (not yet disciplined)");
-    } else if (ppm == 0 && off == 0) {
+                 L"Clockwork: not yet disciplined (awaiting first sync)");
+    } else if (ppm == 0) {
         swprintf(disciplineLine, 160,
                  L"Clockwork: disciplined (single sample, rate pending)");
     } else {
         swprintf(disciplineLine, 160,
-                 L"Clockwork: %+d ppm, %+lld ms vs system",
-                 (int)ppm, (long long)off);
+                 L"Clockwork: %+d ppm  (QPC-anchored, system clock ignored)",
+                 (int)ppm);
     }
 
     // Per-source snapshot from the most recent cycle.
