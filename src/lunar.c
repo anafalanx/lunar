@@ -52,7 +52,11 @@
 #define DEFAULT_W        600
 #define DEFAULT_H        600
 #define TICK_MS          200           // 5 fps sweep cadence
-#define NTP_INTERVAL_MS  (600 * 1000)  // re-sync every 10 minutes
+// Poll cadence: aggressive 5 s retry while INOP to minimize outage,
+// and a gentle 60 s when all three sources concur. There is no
+// degraded middle ground -- the trust state is binary.
+#define NTP_INTERVAL_OK_MS      60000   // 60 s
+#define NTP_INTERVAL_INOP_MS     5000   //  5 s
 
 // System-menu command IDs. Must be in 1..0xEFFF (>= 0xF000 is reserved).
 #define IDM_ALWAYS_ON_TOP 0x1001
@@ -66,6 +70,7 @@
 #define IDC_CHK_CHIMES        1001
 #define IDC_CHK_UNMIN         1002
 #define IDC_CHK_CONFIRM_CLOSE 1003
+#define IDC_CBO_TZ            1004
 
 #define IDT_REPAINT       1
 
@@ -133,6 +138,10 @@ static int                    g_tzTicker     = 0;
 static int                    g_chimesEnabled      = 1;
 static int                    g_unminimizeOnChime  = 0;
 static int                    g_confirmOnClose     = 0;
+// Selected display time zone as a Windows TimeZoneKeyName (e.g.
+// "Romance Standard Time" for Paris). Empty string means UTC. The
+// clockwork itself is always UTC; this controls the dial only.
+static wchar_t                g_tzKey[128]         = L"";
 
 // ---------------------------------------------------------------------------
 // Persistence (carried over verbatim from the raylib build)
@@ -266,14 +275,41 @@ static void LoadSettings(void) {
     if (!path[0]) return;
     FILE *f = _wfopen(path, L"rb");
     if (!f) return;
-    char buf[128] = { 0 };
-    fread(buf, 1, sizeof(buf) - 1, f);
+    char buf[2048] = { 0 };
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
-    int chimes = 1, unmin = 0, confirm = 0;
-    if (sscanf(buf, "%d %d %d", &chimes, &unmin, &confirm) >= 1) {
-        g_chimesEnabled     = chimes  ? 1 : 0;
-        g_unminimizeOnChime = unmin   ? 1 : 0;
-        g_confirmOnClose    = confirm ? 1 : 0;
+    buf[n] = 0;
+
+    // Legacy v1 format was a single line "%d %d %d" (chimes unmin
+    // confirm) with no timezone field. Detect it by the absence of
+    // '=' and parse accordingly.
+    if (!strchr(buf, '=')) {
+        int chimes = 1, unmin = 0, confirm = 0;
+        if (sscanf(buf, "%d %d %d", &chimes, &unmin, &confirm) >= 1) {
+            g_chimesEnabled     = chimes  ? 1 : 0;
+            g_unminimizeOnChime = unmin   ? 1 : 0;
+            g_confirmOnClose    = confirm ? 1 : 0;
+        }
+        return;
+    }
+
+    // v2 format: one key=value per line.
+    char *save = NULL;
+    char *line = strtok_s(buf, "\r\n", &save);
+    while (line) {
+        int v = 0;
+        if      (sscanf(line, "chimes=%d",  &v) == 1) g_chimesEnabled     = v ? 1 : 0;
+        else if (sscanf(line, "unmin=%d",   &v) == 1) g_unminimizeOnChime = v ? 1 : 0;
+        else if (sscanf(line, "confirm=%d", &v) == 1) g_confirmOnClose    = v ? 1 : 0;
+        else if (strncmp(line, "tz=", 3) == 0) {
+            // tz key names are ASCII registry identifiers; still use
+            // MBCS -> wide conversion so any incidental non-ASCII in
+            // the file doesn't corrupt the key.
+            MultiByteToWideChar(CP_UTF8, 0, line + 3, -1,
+                                g_tzKey, sizeof(g_tzKey)/sizeof(wchar_t));
+            g_tzKey[sizeof(g_tzKey)/sizeof(wchar_t) - 1] = 0;
+        }
+        line = strtok_s(NULL, "\r\n", &save);
     }
 }
 
@@ -282,8 +318,14 @@ static void SaveSettings(void) {
     if (!path[0]) return;
     FILE *f = _wfopen(path, L"wb");
     if (!f) return;
-    fprintf(f, "%d %d %d\n",
-            g_chimesEnabled, g_unminimizeOnChime, g_confirmOnClose);
+    char tz[256] = { 0 };
+    WideCharToMultiByte(CP_UTF8, 0, g_tzKey, -1, tz, sizeof(tz) - 1, NULL, NULL);
+    fprintf(f,
+            "chimes=%d\n"
+            "unmin=%d\n"
+            "confirm=%d\n"
+            "tz=%s\n",
+            g_chimesEnabled, g_unminimizeOnChime, g_confirmOnClose, tz);
     fclose(f);
 }
 
@@ -387,19 +429,50 @@ static int HitTestHour(float mx, float my, float cx, float cy, float S) {
 }
 
 // ---------------------------------------------------------------------------
-// Timezone label -> window title
+// Timezone label + trust indicator -> window title
 // ---------------------------------------------------------------------------
+//
+// Title format (U+2014 em-dashes separate the segments):
+//
+//   CET  -  Lunar 0.2  -  OK 3/3  +-5ms
+//   UTC  -  Lunar 0.2  -  INOP 2/3
+//   UTC  -  Lunar 0.2  -  INOP 3/3 sp=612ms     (three reached, disagreed)
+//
+// Called from Tick() every ~200 ms; SetWindowTextW is only invoked when
+// the composed string actually changes, so the caption does not churn.
 
 static void UpdateTitleBar(void) {
-    WCHAR title[160];
-    if (g_tzLabel[0]) {
-        WCHAR wtz[32];
-        MultiByteToWideChar(CP_UTF8, 0, g_tzLabel, -1, wtz, 32);
-        _snwprintf(title, 160, L"%ls  \x2014  Lunar 0.2", wtz);
+    static WCHAR s_last[192] = { 0 };
+
+    WCHAR tz[32] = L"UTC";
+    if (g_tzLabel[0])
+        MultiByteToWideChar(CP_UTF8, 0, g_tzLabel, -1, tz, 32);
+
+    NtpSourceResult r[NTP_SOURCE_COUNT];
+    int nok = Ntp_GetResults(r);
+    TrustState t = Clock_Trust();
+    int64_t spread = Ntp_LastSpreadMs();
+
+    WCHAR trust[64];
+    if (t == TRUST_OK) {
+        _snwprintf(trust, 64, L"OK %d/%d  +-%lldms",
+                   nok, NTP_SOURCE_COUNT, (long long)spread);
+    } else if (nok == NTP_SOURCE_COUNT) {
+        _snwprintf(trust, 64, L"INOP %d/%d  sp=%lldms",
+                   nok, NTP_SOURCE_COUNT, (long long)spread);
     } else {
-        wcscpy(title, L"Lunar 0.2");
+        _snwprintf(trust, 64, L"INOP %d/%d",
+                   nok, NTP_SOURCE_COUNT);
     }
-    SetWindowTextW(g_hwnd, title);
+
+    WCHAR title[192];
+    _snwprintf(title, 192, L"%ls  \x2014  Lunar 0.2  \x2014  %ls", tz, trust);
+
+    if (wcscmp(title, s_last) != 0) {
+        SetWindowTextW(g_hwnd, title);
+        wcsncpy(s_last, title, 192);
+        s_last[191] = 0;
+    }
 }
 
 // Map Microsoft's internal TZ names (TIME_ZONE_INFORMATION.StandardName,
@@ -465,15 +538,60 @@ static const char *LookupTzAbbr(const char *standardName, int isDst) {
 }
 
 static void UpdateTimezone(void) {
-    TIME_ZONE_INFORMATION tzi;
-    DWORD tzId = GetTimeZoneInformation(&tzi);
-    LONG biasMin = tzi.Bias + ((tzId == TIME_ZONE_ID_DAYLIGHT)
-                                 ? tzi.DaylightBias : tzi.StandardBias);
-    int utcOffsetH = -(int)biasMin / 60;
-    int isDst = (tzId == TIME_ZONE_ID_DAYLIGHT);
+    // Resolve the selected TimeZoneKeyName to a DYNAMIC_TIME_ZONE_INFORMATION
+    // so we can compute the *display* bias + DST state. If no zone is
+    // selected (g_tzKey is empty), we display UTC.
+    if (g_tzKey[0] == 0) {
+        snprintf(g_tzLabel, sizeof(g_tzLabel), "UTC");
+        UpdateTitleBar();
+        return;
+    }
 
-    // The StandardName is the *stable* Windows key (it does not change
-    // between DST/non-DST), so we use it for the lookup.
+    DYNAMIC_TIME_ZONE_INFORMATION dtzi = { 0 };
+    int found = 0;
+    for (DWORD i = 0; ; i++) {
+        DWORD rc = EnumDynamicTimeZoneInformation(i, &dtzi);
+        if (rc == ERROR_NO_MORE_ITEMS) break;
+        if (rc != ERROR_SUCCESS) continue;
+        if (wcscmp(dtzi.TimeZoneKeyName, g_tzKey) == 0) { found = 1; break; }
+    }
+    if (!found) {
+        // Selected key no longer exists on this system -- fall back to UTC.
+        g_tzKey[0] = 0;
+        snprintf(g_tzLabel, sizeof(g_tzLabel), "UTC");
+        UpdateTitleBar();
+        return;
+    }
+
+    // Determine whether DST is currently active in the selected zone
+    // by converting "now" both via the Ex API (honours DST) and via a
+    // fixed-standard-bias TIME_ZONE_INFORMATION; a difference means DST.
+    SYSTEMTIME nowUtc; GetSystemTime(&nowUtc);
+    TIME_ZONE_INFORMATION tzi = { 0 };
+    tzi.Bias         = dtzi.Bias;
+    tzi.StandardBias = dtzi.StandardBias;
+    tzi.DaylightBias = dtzi.DaylightBias;
+    memcpy(&tzi.StandardDate, &dtzi.StandardDate, sizeof(SYSTEMTIME));
+    memcpy(&tzi.DaylightDate, &dtzi.DaylightDate, sizeof(SYSTEMTIME));
+    wcsncpy(tzi.StandardName, dtzi.StandardName, 32);
+    wcsncpy(tzi.DaylightName, dtzi.DaylightName, 32);
+
+    SYSTEMTIME localEx = { 0 }, localStd = { 0 };
+    SystemTimeToTzSpecificLocalTime(&tzi, &nowUtc, &localEx);
+    // Force-standard variant: zero out the daylight rule so the OS
+    // treats it as a no-DST zone.
+    TIME_ZONE_INFORMATION tziStd = tzi;
+    memset(&tziStd.DaylightDate, 0, sizeof(SYSTEMTIME));
+    tziStd.DaylightBias = tziStd.StandardBias;
+    SystemTimeToTzSpecificLocalTime(&tziStd, &nowUtc, &localStd);
+
+    int isDst = (localEx.wHour != localStd.wHour
+              || localEx.wDay  != localStd.wDay
+              || localEx.wMinute != localStd.wMinute);
+
+    LONG biasMin = tzi.Bias + (isDst ? tzi.DaylightBias : tzi.StandardBias);
+    int utcOffsetH = -(int)biasMin / 60;
+
     char stdName[64] = { 0 };
     WideCharToMultiByte(CP_UTF8, 0, tzi.StandardName, -1,
                         stdName, sizeof(stdName) - 1, NULL, NULL);
@@ -486,8 +604,6 @@ static void UpdateTimezone(void) {
         memcpy(abbr, mapped, n);
         abbr[n] = '\0';
     } else {
-        // Fallback: abbreviate the display name for whichever side is
-        // currently active ("Romance Daylight Time" -> "RDT").
         const WCHAR *nameW = isDst ? tzi.DaylightName : tzi.StandardName;
         char name[64] = { 0 };
         WideCharToMultiByte(CP_UTF8, 0, nameW, -1,
@@ -507,6 +623,69 @@ static void UpdateTimezone(void) {
 
     snprintf(g_tzLabel, sizeof(g_tzLabel), "%s (UTC%+d)", abbr, utcOffsetH);
     UpdateTitleBar();
+}
+
+// Convert disciplined UTC milliseconds to a struct tm in the display
+// zone, plus the sub-second ms part. Returns 1 on success, 0 on
+// failure (bad key, OS API failure). When g_tzKey is empty, renders UTC.
+static int UtcMsToLocalTm(int64_t utcMs, struct tm *out, int *outMs) {
+    if (!out) return 0;
+    int ms = (int)(utcMs % 1000);
+    if (ms < 0) { ms += 1000; utcMs -= 1000; }
+    time_t t = (time_t)(utcMs / 1000);
+    if (outMs) *outMs = ms;
+
+    if (g_tzKey[0] == 0) {
+        // UTC: gmtime_s is cheap, deterministic, and never fails for
+        // valid time_t.
+        return gmtime_s(out, &t) == 0 ? 1 : 0;
+    }
+
+    struct tm gm = { 0 };
+    if (gmtime_s(&gm, &t) != 0) return 0;
+    SYSTEMTIME utcSt = {
+        .wYear   = (WORD)(gm.tm_year + 1900),
+        .wMonth  = (WORD)(gm.tm_mon + 1),
+        .wDay    = (WORD)gm.tm_mday,
+        .wHour   = (WORD)gm.tm_hour,
+        .wMinute = (WORD)gm.tm_min,
+        .wSecond = (WORD)gm.tm_sec,
+        .wMilliseconds = 0,
+        .wDayOfWeek    = (WORD)gm.tm_wday,
+    };
+
+    DYNAMIC_TIME_ZONE_INFORMATION dtzi = { 0 };
+    int found = 0;
+    for (DWORD i = 0; ; i++) {
+        DWORD rc = EnumDynamicTimeZoneInformation(i, &dtzi);
+        if (rc == ERROR_NO_MORE_ITEMS) break;
+        if (rc != ERROR_SUCCESS) continue;
+        if (wcscmp(dtzi.TimeZoneKeyName, g_tzKey) == 0) { found = 1; break; }
+    }
+    if (!found) return 0;
+
+    TIME_ZONE_INFORMATION tzi = { 0 };
+    tzi.Bias         = dtzi.Bias;
+    tzi.StandardBias = dtzi.StandardBias;
+    tzi.DaylightBias = dtzi.DaylightBias;
+    memcpy(&tzi.StandardDate, &dtzi.StandardDate, sizeof(SYSTEMTIME));
+    memcpy(&tzi.DaylightDate, &dtzi.DaylightDate, sizeof(SYSTEMTIME));
+    wcsncpy(tzi.StandardName, dtzi.StandardName, 32);
+    wcsncpy(tzi.DaylightName, dtzi.DaylightName, 32);
+
+    SYSTEMTIME localSt = { 0 };
+    if (!SystemTimeToTzSpecificLocalTime(&tzi, &utcSt, &localSt)) return 0;
+
+    out->tm_year = localSt.wYear - 1900;
+    out->tm_mon  = localSt.wMonth - 1;
+    out->tm_mday = localSt.wDay;
+    out->tm_hour = localSt.wHour;
+    out->tm_min  = localSt.wMinute;
+    out->tm_sec  = localSt.wSecond;
+    out->tm_wday = localSt.wDayOfWeek;
+    out->tm_yday = 0;    // not used by the clock face
+    out->tm_isdst = 0;
+    return 1;
 }
 
 // ---------------------------------------------------------------------------
@@ -678,6 +857,44 @@ static void DrawSecondHand(float cx, float cy, float angleDeg, float len,
 }
 
 // ---------------------------------------------------------------------------
+// INOP indicator
+// ---------------------------------------------------------------------------
+//
+// Safety-critical display: whenever the clockwork cannot deliver a
+// time we trust (no successful NTP sync this run, or -- in later
+// steps -- concurrence is lost), we stop rendering the dial entirely
+// and paint a solid background with large red "INOP" letters. No
+// hands, no numerals: an operator glancing at the window must never
+// be able to misread an untrusted state as a normal time display.
+
+static void DrawInop(float dw, float dh, const Palette *pal) {
+    float S = (dw < dh ? dw : dh);
+    // Use the face color as a flat background so INOP stands alone
+    // on the same surface where the dial would normally appear.
+    D2D1_RECT_F full = { 0, 0, dw, dh };
+    SetBrush(pal->face);
+    ID2D1RenderTarget_FillRectangle(g_rt, &full, (ID2D1Brush*)g_brush);
+
+    int fs = (int)(S * 0.28f);
+    if (fs < 24) fs = 24;
+    EnsureTextFormat(fs);
+    if (!g_txtSys) return;
+
+    IDWriteTextFormat_SetTextAlignment(g_txtSys,
+        DWRITE_TEXT_ALIGNMENT_CENTER);
+    IDWriteTextFormat_SetParagraphAlignment(g_txtSys,
+        DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+
+    D2D1_COLOR_F red = { 0.92f, 0.10f, 0.10f, 1.0f };
+    SetBrush(red);
+    ID2D1RenderTarget_DrawText(g_rt, L"INOP", 4,
+        g_txtSys, &full, (ID2D1Brush*)g_brush,
+        D2D1_DRAW_TEXT_OPTIONS_NONE,
+        DWRITE_MEASURING_MODE_NATURAL);
+}
+
+
+// ---------------------------------------------------------------------------
 // Dial
 // ---------------------------------------------------------------------------
 
@@ -749,15 +966,12 @@ static void DrawDial(float cx, float cy, float S, const Palette *pal,
 static void Paint(void) {
     if (FAILED(CreateDeviceResources())) return;
 
-    // Read the disciplined clockwork time. Clock_NowUtcMs() is
-    // QPC-driven, NTP-disciplined, and falls back to the raw system
-    // clock only until we land our first sync this run.
-    int64_t displayMs = Clock_NowUtcMs();
-    time_t  t  = (time_t)(displayMs / 1000);
-    int     ms = (int)   (displayMs % 1000);
-    if (ms < 0) { ms += 1000; t -= 1; }
-    struct tm lt = {0};
-    if (localtime_s(&lt, &t) != 0) return;  // bad time_t, skip this frame
+    // Read the disciplined clockwork time. Clock_NowUtcMs() returns 0
+    // if we have not yet successfully synced THIS run -- the Windows
+    // system clock is never used as a display source. In that case we
+    // paint the INOP indicator and skip dial rendering entirely.
+    int64_t displayMs = 0;
+    int haveTime = Clock_NowUtcMs(&displayMs);
 
     Palette pal = (g_theme == 1) ? palette_light() : palette_dark();
 
@@ -774,10 +988,25 @@ static void Paint(void) {
     ID2D1RenderTarget_Clear(g_rt, &pal.bg);
     ID2D1RenderTarget_SetAntialiasMode(g_rt, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
-    if (S > 40.0f) DrawDial(cx, cy, S, &pal, &lt, ms, g_armed);
+    if (!haveTime) {
+        DrawInop(dw, dh, &pal);
+    } else {
+        struct tm lt = {0};
+        int ms = 0;
+        if (!UtcMsToLocalTm(displayMs, &lt, &ms)) {
+            // A conversion failure from a supposedly disciplined
+            // clock is a fault condition: show INOP rather than
+            // silently skipping the frame.
+            DrawInop(dw, dh, &pal);
+        } else {
+            if (S > 40.0f) DrawDial(cx, cy, S, &pal, &lt, ms, g_armed);
+        }
+    }
 
     // "SYS" indicator (lower-right of the window) when NTP is stale.
-    if (!Ntp_IsSynced()) {
+    // Suppressed while INOP is being shown -- INOP already conveys the
+    // untrusted state and we don't want to overpaint it.
+    if (haveTime && !Ntp_IsSynced()) {
         int fs = (int)(S * 0.035f);
         if (fs < 10) fs = 10;
         EnsureTextFormat(fs);
@@ -864,28 +1093,34 @@ static HBITMAP RenderClockToBitmap(int w, int h) {
     HRESULT hr = ID2D1RenderTarget_CreateSolidColorBrush(
         g_rt, &black, NULL, &g_brush);
     if (SUCCEEDED(hr)) {
-        // Current disciplined UTC (same source as Paint()).
-        int64_t displayMs = Clock_NowUtcMs();
-        time_t  t  = (time_t)(displayMs / 1000);
-        int     ms = (int)   (displayMs % 1000);
-        if (ms < 0) { ms += 1000; t -= 1; }
-        struct tm lt = {0};
-        if (localtime_s(&lt, &t) == 0) {
+        // Current disciplined UTC (same source as Paint()). Returns 0
+        // if not synced this run; in that case render INOP into the
+        // thumbnail too -- the taskbar preview must never show a stale
+        // or system-clock time.
+        int64_t displayMs = 0;
+        int haveTime = Clock_NowUtcMs(&displayMs);
 
         Palette pal = (g_theme == 1) ? palette_light() : palette_dark();
         float dw = (float)w, dh = (float)h;
         float S  = (dw < dh ? dw : dh);
         float cx = dw * 0.5f, cy = dh * 0.5f;
 
-        // EnsureHandCache() inside DrawDial is already keyed on S, so it
-        // rebuilds when the thumbnail size differs from the window size.
-        // No need to explicitly release here.
         ID2D1RenderTarget_BeginDraw(g_rt);
         ID2D1RenderTarget_Clear(g_rt, &pal.bg);
         ID2D1RenderTarget_SetAntialiasMode(g_rt, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-        if (S > 40.0f) DrawDial(cx, cy, S, &pal, &lt, ms, g_armed);
+
+        if (!haveTime) {
+            DrawInop(dw, dh, &pal);
+        } else {
+            struct tm lt = {0};
+            int ms = 0;
+            if (UtcMsToLocalTm(displayMs, &lt, &ms)) {
+                if (S > 40.0f) DrawDial(cx, cy, S, &pal, &lt, ms, g_armed);
+            } else {
+                DrawInop(dw, dh, &pal);
+            }
+        }
         ID2D1RenderTarget_EndDraw(g_rt, NULL, NULL);
-        } // localtime_s ok
 
         ID2D1SolidColorBrush_Release(g_brush);
     }
@@ -977,13 +1212,55 @@ static void ShowAbout(void) {
                  L"Clockwork: %+d ppm, %+lld ms vs system",
                  (int)ppm, (long long)off);
     }
+
+    // Per-source snapshot from the most recent cycle.
+    NtpSourceResult r[NTP_SOURCE_COUNT];
+    int nok = Ntp_GetResults(r);
+    int64_t spread = Ntp_LastSpreadMs();
+    TrustState trust = Clock_Trust();
+
+    wchar_t trustLine[160];
+    swprintf(trustLine, 160,
+             L"Trust: %ls  (%d of %d sources, spread %lld ms)",
+             (trust == TRUST_OK) ? L"OK" : L"INOP",
+             nok, NTP_SOURCE_COUNT, (long long)spread);
+
+    wchar_t sourcesBlock[512] = { 0 };
+    int sbPos = 0;
+    for (int i = 0; i < NTP_SOURCE_COUNT; i++) {
+        wchar_t label[8] = L"?";
+        if (r[i].label) {
+            MultiByteToWideChar(CP_UTF8, 0, r[i].label, -1, label, 8);
+        }
+        wchar_t line[128];
+        if (r[i].ok) {
+            swprintf(line, 128,
+                     L"  %ls  ok   off %+5lld ms   rtt %4u ms\n",
+                     label, (long long)r[i].offsetMs,
+                     (unsigned)r[i].rttMs);
+        } else {
+            swprintf(line, 128,
+                     L"  %ls  --   (no reply)\n",
+                     label);
+        }
+        int len = (int)wcslen(line);
+        if (sbPos + len < 511) {
+            wcscpy(sourcesBlock + sbPos, line);
+            sbPos += len;
+        }
+    }
+
     swprintf(msg, 512,
              L"Lunar 0.2.0\n\n"
              L"A minimalist analog clock.\n"
              L"Native Win32 + Direct2D.\n\n"
              L"%s\n"
+             L"%s\n"
+             L"%s\n"
              L"%s",
              disciplineLine,
+             trustLine,
+             sourcesBlock,
              sync);
     MessageBoxW(g_hwnd, msg, L"About Lunar", MB_ICONINFORMATION | MB_OK);
 }
@@ -991,27 +1268,88 @@ static void ShowAbout(void) {
 static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM lp) {
     (void)lp;
     switch (msg) {
-    case WM_INITDIALOG:
+    case WM_INITDIALOG: {
         CheckDlgButton(hdlg, IDC_CHK_CHIMES,
                        g_chimesEnabled ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hdlg, IDC_CHK_UNMIN,
                        g_unminimizeOnChime ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hdlg, IDC_CHK_CONFIRM_CLOSE,
                        g_confirmOnClose ? BST_CHECKED : BST_UNCHECKED);
+
+        // Populate the timezone combobox. Entry 0 is always "UTC"
+        // (corresponding to g_tzKey == L""). Subsequent entries are
+        // every Windows dynamic time zone on this machine, shown by
+        // their localized DisplayName but keyed on the stable
+        // TimeZoneKeyName stored via SetItemData.
+        HWND cb = GetDlgItem(hdlg, IDC_CBO_TZ);
+        int idxUtc = (int)SendMessageW(cb, CB_ADDSTRING, 0,
+                                        (LPARAM)L"UTC (no offset)");
+        SendMessageW(cb, CB_SETITEMDATA, idxUtc, (LPARAM)0);
+        int selected = idxUtc;
+
+        for (DWORD i = 0; ; i++) {
+            DYNAMIC_TIME_ZONE_INFORMATION dtzi = { 0 };
+            DWORD rc = EnumDynamicTimeZoneInformation(i, &dtzi);
+            if (rc == ERROR_NO_MORE_ITEMS) break;
+            if (rc != ERROR_SUCCESS) continue;
+            // Use the localized display name for the dropdown.
+            int idx = (int)SendMessageW(cb, CB_ADDSTRING, 0,
+                                         (LPARAM)dtzi.StandardName);
+            if (idx == CB_ERR || idx == CB_ERRSPACE) continue;
+            // Allocate a copy of the key name to survive CB_SORT.
+            wchar_t *keyCopy = (wchar_t*)malloc(sizeof(dtzi.TimeZoneKeyName));
+            if (!keyCopy) continue;
+            memcpy(keyCopy, dtzi.TimeZoneKeyName, sizeof(dtzi.TimeZoneKeyName));
+            SendMessageW(cb, CB_SETITEMDATA, idx, (LPARAM)keyCopy);
+            if (g_tzKey[0] && wcscmp(keyCopy, g_tzKey) == 0) selected = idx;
+        }
+        SendMessageW(cb, CB_SETCURSEL, selected, 0);
         return TRUE;
+    }
 
     case WM_COMMAND:
         switch (LOWORD(wp)) {
-        case IDOK:
+        case IDOK: {
             g_chimesEnabled     = IsDlgButtonChecked(hdlg, IDC_CHK_CHIMES)        == BST_CHECKED;
             g_unminimizeOnChime = IsDlgButtonChecked(hdlg, IDC_CHK_UNMIN)         == BST_CHECKED;
             g_confirmOnClose    = IsDlgButtonChecked(hdlg, IDC_CHK_CONFIRM_CLOSE) == BST_CHECKED;
+
+            HWND cb = GetDlgItem(hdlg, IDC_CBO_TZ);
+            int sel = (int)SendMessageW(cb, CB_GETCURSEL, 0, 0);
+            if (sel != CB_ERR) {
+                LPARAM data = SendMessageW(cb, CB_GETITEMDATA, sel, 0);
+                if (data == 0) {
+                    g_tzKey[0] = 0;   // UTC
+                } else {
+                    const wchar_t *key = (const wchar_t*)data;
+                    wcsncpy(g_tzKey, key, sizeof(g_tzKey)/sizeof(wchar_t) - 1);
+                    g_tzKey[sizeof(g_tzKey)/sizeof(wchar_t) - 1] = 0;
+                }
+            }
+
             SaveSettings();
+            UpdateTimezone();
+            InvalidateRect(g_hwnd, NULL, FALSE);
+
+            // Free the per-item key-name copies we stashed in item data.
+            int n = (int)SendMessageW(cb, CB_GETCOUNT, 0, 0);
+            for (int i = 0; i < n; i++) {
+                LPARAM d = SendMessageW(cb, CB_GETITEMDATA, i, 0);
+                if (d) free((void*)d);
+            }
             EndDialog(hdlg, IDOK);
             return TRUE;
-        case IDCANCEL:
+        }
+        case IDCANCEL: {
+            HWND cb = GetDlgItem(hdlg, IDC_CBO_TZ);
+            int n = (int)SendMessageW(cb, CB_GETCOUNT, 0, 0);
+            for (int i = 0; i < n; i++) {
+                LPARAM d = SendMessageW(cb, CB_GETITEMDATA, i, 0);
+                if (d) free((void*)d);
+            }
             EndDialog(hdlg, IDCANCEL);
             return TRUE;
+        }
         }
         break;
     }
@@ -1029,20 +1367,28 @@ static void ShowSettings(void) {
 // ---------------------------------------------------------------------------
 
 static void Tick(void) {
-    // Periodic NTP re-sync.
+    // Periodic NTP re-sync. Binary cadence: 5 s while INOP (to recover
+    // fast), 60 s once all three sources concur.
     DWORD nowMs = GetTickCount();
-    if ((nowMs - g_lastNtpKickMs) >= NTP_INTERVAL_MS) {
+    DWORD interval = (Clock_Trust() == TRUST_OK)
+        ? NTP_INTERVAL_OK_MS
+        : NTP_INTERVAL_INOP_MS;
+    if ((nowMs - g_lastNtpKickMs) >= interval) {
         Ntp_Start();
         g_lastNtpKickMs = nowMs;
     }
 
-    // Minute-crossing beep detection.
-    int64_t displayMs = Clock_NowUtcMs();
-    time_t t  = (time_t)(displayMs / 1000);
-    int    ms = (int)   (displayMs % 1000);
-    if (ms < 0) { ms += 1000; t -= 1; }
+    // Minute-crossing beep detection. Skip entirely if the clockwork
+    // is not synced this run -- chimes must never fire off an
+    // untrusted time.
+    int64_t displayMs = 0;
+    if (!Clock_NowUtcMs(&displayMs)) {
+        g_prevMins = -1.0f;   // reset so we don't cascade beeps on re-sync
+        return;
+    }
     struct tm lt = {0};
-    if (localtime_s(&lt, &t) != 0) return;
+    int ms = 0;
+    if (!UtcMsToLocalTm(displayMs, &lt, &ms)) return;
     float secs = (float)lt.tm_sec + ms / 1000.0f;
     float mins = (float)lt.tm_min + secs / 60.0f;
 
@@ -1083,6 +1429,9 @@ static void Tick(void) {
         UpdateTimezone();
         g_tzTicker = 0;
     }
+
+    // Refresh the title-bar trust indicator (no-op when unchanged).
+    UpdateTitleBar();
 
     // When visible, repaint the window. When minimized, tell DWM that
     // our cached iconic bitmaps are stale; DWM will fire another

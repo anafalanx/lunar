@@ -441,6 +441,119 @@ static void test_clock_discipline(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Ntp_Concur -- the pure trust-verdict evaluator
+// ---------------------------------------------------------------------------
+//
+// The aggregator in ntp.c delegates its verdict entirely to Ntp_Concur.
+// These tests nail down the contract: binary OK/INOP, 200 ms window,
+// median pick on OK. If a refactor ever loosens any of these rules,
+// these tests must be updated deliberately.
+
+static NtpSourceResult MkSrc(int ok, int64_t off, int64_t utc, int64_t qpc,
+                             const char *label) {
+    NtpSourceResult r = {0};
+    r.ok       = ok;
+    r.offsetMs = off;
+    r.ntpUtcMs = utc;
+    r.qpcAtT4  = qpc;
+    r.rttMs    = 10;
+    r.label    = label;
+    return r;
+}
+
+static void test_ntp_concur(void) {
+    NtpSourceResult s[NTP_SOURCE_COUNT];
+    int64_t best = 0, qpc = 0, spread = 0;
+
+    // 1) Three sources, all ok, identical offsets -> OK, spread 0.
+    s[0] = MkSrc(1, 0, 1000, 100, "A");
+    s[1] = MkSrc(1, 0, 2000, 200, "B");
+    s[2] = MkSrc(1, 0, 3000, 300, "C");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
+    CHECK_EQ_INT(spread, 0);
+    // Median offset is 0, tie -> first match is slot 0 (utc=1000, qpc=100).
+    CHECK_EQ_INT(best, 1000);
+    CHECK_EQ_INT(qpc, 100);
+
+    // 2) Three ok, spread exactly 199 ms (within threshold) -> OK.
+    s[0] = MkSrc(1, -99, 1000, 100, "A");
+    s[1] = MkSrc(1,   0, 2000, 200, "B");
+    s[2] = MkSrc(1, 100, 3000, 300, "C");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
+    CHECK_EQ_INT(spread, 199);
+    // Median offset is 0 -> slot 1.
+    CHECK_EQ_INT(best, 2000);
+    CHECK_EQ_INT(qpc, 200);
+
+    // 3) Three ok, spread exactly 200 ms (boundary, inclusive) -> OK.
+    s[0] = MkSrc(1, -100, 1000, 100, "A");
+    s[1] = MkSrc(1,    0, 2000, 200, "B");
+    s[2] = MkSrc(1,  100, 3000, 300, "C");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
+    CHECK_EQ_INT(spread, 200);
+    CHECK_EQ_INT(best, 2000);
+
+    // 4) Three ok, spread 201 ms -> INOP (just over threshold).
+    s[0] = MkSrc(1, -100, 1000, 100, "A");
+    s[1] = MkSrc(1,    0, 2000, 200, "B");
+    s[2] = MkSrc(1,  101, 3000, 300, "C");
+    best = qpc = -1;
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+    CHECK_EQ_INT(spread, 201);
+    // INOP must not leak a sample.
+    CHECK_EQ_INT(best, 0);
+    CHECK_EQ_INT(qpc, 0);
+
+    // 5) Three ok with one far outlier -> INOP.
+    s[0] = MkSrc(1,       0, 1000, 100, "A");
+    s[1] = MkSrc(1,      50, 2000, 200, "B");
+    s[2] = MkSrc(1, 5000000, 3000, 300, "C");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+
+    // 6) Two ok, agreeing perfectly -> still INOP (no degraded state).
+    s[0] = MkSrc(1, 0, 1000, 100, "A");
+    s[1] = MkSrc(1, 0, 2000, 200, "B");
+    s[2] = MkSrc(0, 0,    0,   0, "C");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+
+    // 7) Two ok, large disagreement -> INOP. Spread reported for audit.
+    s[0] = MkSrc(1,   0, 1000, 100, "A");
+    s[1] = MkSrc(1, 500, 2000, 200, "B");
+    s[2] = MkSrc(0,   0,    0,   0, "C");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+    CHECK_EQ_INT(spread, 500);
+
+    // 8) One ok -> INOP, spread zero (no pair).
+    s[0] = MkSrc(1, 0, 1000, 100, "A");
+    s[1] = MkSrc(0, 0,    0,   0, "B");
+    s[2] = MkSrc(0, 0,    0,   0, "C");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+    CHECK_EQ_INT(spread, 0);
+
+    // 9) Zero ok -> INOP.
+    s[0] = MkSrc(0, 0, 0, 0, "A");
+    s[1] = MkSrc(0, 0, 0, 0, "B");
+    s[2] = MkSrc(0, 0, 0, 0, "C");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+    CHECK_EQ_INT(spread, 0);
+
+    // 10) Tolerates NULL out-parameters.
+    s[0] = MkSrc(1, 0, 1000, 100, "A");
+    s[1] = MkSrc(1, 0, 2000, 200, "B");
+    s[2] = MkSrc(1, 0, 3000, 300, "C");
+    CHECK_EQ_INT(Ntp_Concur(s, NULL, NULL, NULL), TRUST_OK);
+
+    // 11) Negative-offset median is still handled correctly.
+    s[0] = MkSrc(1, -150, 1000, 100, "A");
+    s[1] = MkSrc(1, -100, 2000, 200, "B");
+    s[2] = MkSrc(1,  -50, 3000, 300, "C");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
+    CHECK_EQ_INT(spread, 100);
+    // Median offset -100 -> slot 1.
+    CHECK_EQ_INT(best, 2000);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -455,6 +568,7 @@ int main(void) {
     test_minute_guard();
     test_ntp_header_validation();
     test_clock_discipline();
+    test_ntp_concur();
 
     printf("\n%d checks, %d failed\n", g_pass + g_fail, g_fail);
     return g_fail == 0 ? 0 : 1;

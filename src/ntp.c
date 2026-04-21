@@ -1,28 +1,60 @@
-// ntp.c -- Minimal SNTP v4 client over UDP. Isolated from raylib.h because
-// <windows.h>/<winsock2.h> collide with raylib's symbol names.
+﻿// ntp.c -- Parallel SNTP v4 client against three fixed national-metrology
+// sources: NIST (USA), PTB (Germany), NICT (Japan). One UDP socket per
+// source, one worker thread per source, all fired in parallel. Results
+// are collected per-source so higher layers can apply concurrence rules.
+//
+// This translation unit is isolated from raylib.h / D2D headers because
+// <winsock2.h> + <windows.h> collide with their symbol names.
 
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "ntp.h"
 #include "clock.h"
 
-#define NTP_HOST             "pool.ntp.org"
 #define NTP_PORT             "123"
 #define NTP_TIMEOUT_MS       3000
-#define NTP_EPOCH_DELTA_S    2208988800ULL   // seconds between 1900 and 1970
-#define FT_EPOCH_DELTA_MS    11644473600000ULL // 1601 -> 1970 in ms
+#define NTP_EPOCH_DELTA_S    2208988800ULL        // seconds between 1900 and 1970
+#define FT_EPOCH_DELTA_MS    11644473600000ULL    // 1601 -> 1970 in ms
 #define FRESH_WINDOW_MS      (2LL * 60LL * 60LL * 1000LL) // 2 hours
 
-// Atomic-ish shared state. Aligned 64-bit loads/stores are atomic on x86_64.
-static volatile LONG64 g_offsetMs        = 0;
-static volatile LONG64 g_lastSuccessTick = 0; // GetTickCount64() at success
-static volatile LONG64 g_lastSuccessUtc  = 0; // wall-clock UTC ms at success
-static volatile LONG   g_running         = 0;
+// --- Source list ---------------------------------------------------------
+
+// Three independent national metrology institutes on three continents,
+// each running stratum-1 caesium / hydrogen maser references. Diverse
+// operators, geographies, and upstream routing make a coordinated spoof
+// or outage much less likely than a single-pool query.
+typedef struct {
+    const char *host;
+    const char *label;   // short display / log label
+} NtpSource;
+
+static const NtpSource kSources[NTP_SOURCE_COUNT] = {
+    { "time.nist.gov",    "NIST" },    // USA      (Boulder / Gaithersburg)
+    { "ptbtime1.ptb.de",  "PTB"  },    // Germany  (Braunschweig)
+    { "ntp.nict.jp",      "NICT" },    // Japan    (Tokyo)
+};
+
+// --- Shared state --------------------------------------------------------
+
+static CRITICAL_SECTION g_cs;
+static int              g_csInit = 0;
+
+// Results from the most recent polling cycle. Written by the aggregator
+// thread under g_cs; read by Ntp_GetResults().
+static NtpSourceResult  g_results[NTP_SOURCE_COUNT];
+static volatile LONG64  g_offsetMs        = 0;   // legacy accessor
+static volatile LONG64  g_lastSuccessTick = 0;   // GetTickCount64() at any-ok
+static volatile LONG64  g_lastSuccessUtc  = 0;   // UTC ms at any-ok
+static volatile LONG64  g_lastSpreadMs    = 0;   // last cycle's spread
+static volatile LONG    g_running         = 0;
 
 static int64_t FtToMs(FILETIME ft) {
     ULARGE_INTEGER u;
@@ -31,8 +63,16 @@ static int64_t FtToMs(FILETIME ft) {
     return (int64_t)(u.QuadPart / 10000LL) - (int64_t)FT_EPOCH_DELTA_MS;
 }
 
-static int NtpQueryOnce(int64_t *outOffsetMs, int64_t *outNtpUtcMs,
-                        int64_t *outQpcAtT4) {
+// --- Single-source query -------------------------------------------------
+
+// Run one SNTP exchange against a specific host. Writes the result fields
+// on success; returns 1 on success, 0 on any error (DNS, socket, timeout,
+// invalid header, zero timestamps).
+static int NtpQueryHost(const char *host,
+                        int64_t *outOffsetMs,
+                        int64_t *outNtpUtcMs,
+                        int64_t *outQpcAtT4,
+                        uint32_t *outRttMs) {
     unsigned char pkt[48];
     memset(pkt, 0, sizeof(pkt));
     pkt[0] = 0x23;  // LI=0, VN=4, Mode=3 (client)
@@ -42,7 +82,7 @@ static int NtpQueryOnce(int64_t *outOffsetMs, int64_t *outNtpUtcMs,
     hints.ai_family   = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_protocol = IPPROTO_UDP;
-    if (getaddrinfo(NTP_HOST, NTP_PORT, &hints, &res) != 0 || !res) return 0;
+    if (getaddrinfo(host, NTP_PORT, &hints, &res) != 0 || !res) return 0;
 
     SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (s == INVALID_SOCKET) { freeaddrinfo(res); return 0; }
@@ -64,11 +104,11 @@ static int NtpQueryOnce(int64_t *outOffsetMs, int64_t *outNtpUtcMs,
     if (recvd != (int)sizeof(pkt)) return 0;
 
     // Validate the response header before trusting any timestamps:
-    //   LI  (bits 7..6 of byte 0) must be 0, 1 or 2   (3 = alarm, unsynced)
+    //   LI  (bits 7..6 of byte 0) must be 0, 1 or 2 (3 = alarm, unsynced)
     //   VN  (bits 5..3) must be 3 or 4
-    //   Mode(bits 2..0) must be 4                     (server)
-    //   Stratum (byte 1) must be 1..15                (0 = kiss-o'-death,
-    //                                                  16 = unsynchronized)
+    //   Mode(bits 2..0) must be 4                   (server)
+    //   Stratum (byte 1) must be 1..15              (0 = kiss-o'-death,
+    //                                                16 = unsynchronized)
     uint8_t li      = (pkt[0] >> 6) & 0x3;
     uint8_t vn      = (pkt[0] >> 3) & 0x7;
     uint8_t mode    =  pkt[0]       & 0x7;
@@ -78,7 +118,6 @@ static int NtpQueryOnce(int64_t *outOffsetMs, int64_t *outNtpUtcMs,
     if (mode != 4)                       return 0;
     if (stratum == 0 || stratum >= 16)   return 0;
 
-    // Server receive timestamp at bytes 32..39, transmit at 40..47.
     uint32_t secBE, fracBE;
     memcpy(&secBE, pkt + 32, 4); memcpy(&fracBE, pkt + 36, 4);
     uint32_t t2_s    = ntohl(secBE);
@@ -86,7 +125,7 @@ static int NtpQueryOnce(int64_t *outOffsetMs, int64_t *outNtpUtcMs,
     memcpy(&secBE, pkt + 40, 4); memcpy(&fracBE, pkt + 44, 4);
     uint32_t t3_s    = ntohl(secBE);
     uint32_t t3_frac = ntohl(fracBE);
-    if (t2_s == 0 || t3_s == 0) return 0;  // missing required timestamps
+    if (t2_s == 0 || t3_s == 0) return 0;
 
     int64_t t2_ms = ((int64_t)t2_s - (int64_t)NTP_EPOCH_DELTA_S) * 1000
                     + (int64_t)(((uint64_t)t2_frac * 1000ULL) >> 32);
@@ -95,36 +134,373 @@ static int NtpQueryOnce(int64_t *outOffsetMs, int64_t *outNtpUtcMs,
     int64_t t1_ms = FtToMs(ft1);
     int64_t t4_ms = FtToMs(ft4);
 
-    // offset = ((t2 - t1) + (t3 - t4)) / 2
     int64_t offset = ((t2_ms - t1_ms) + (t3_ms - t4_ms)) / 2;
+    int64_t rtt    = (t4_ms - t1_ms) - (t3_ms - t2_ms);
+    if (rtt < 0) rtt = 0;
+
     *outOffsetMs = offset;
-    // True UTC as of the instant we captured t4 / qpcT4: our system
-    // clock at t4 plus the measured offset.
     *outNtpUtcMs = t4_ms + offset;
     *outQpcAtT4  = qpcT4;
+    *outRttMs    = (uint32_t)(rtt > 0x7fffffff ? 0x7fffffff : rtt);
     return 1;
 }
 
-static DWORD WINAPI SyncThreadProc(LPVOID param) {
-    (void)param;
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) == 0) {
-        int64_t off = 0, ntpUtc = 0, qpcT4 = 0;
-        if (NtpQueryOnce(&off, &ntpUtc, &qpcT4)) {
-            Clock_OnSyncedNtpUtc(ntpUtc, qpcT4);
-            InterlockedExchange64(&g_offsetMs, off);
-            InterlockedExchange64(&g_lastSuccessTick, (LONG64)GetTickCount64());
-            InterlockedExchange64(&g_lastSuccessUtc, (LONG64)ntpUtc);
-        }
-        WSACleanup();
+// --- Per-source worker thread --------------------------------------------
+
+typedef struct {
+    int              index;    // 0..NTP_SOURCE_COUNT-1
+    NtpSourceResult  out;      // written by worker, read by aggregator
+} WorkerCtx;
+
+static DWORD WINAPI WorkerProc(LPVOID param) {
+    WorkerCtx *ctx = (WorkerCtx *)param;
+    const NtpSource *src = &kSources[ctx->index];
+
+    NtpSourceResult *r = &ctx->out;
+    memset(r, 0, sizeof(*r));
+    r->label = src->label;
+
+    int64_t off = 0, utc = 0, qpc = 0;
+    uint32_t rtt = 0;
+    if (NtpQueryHost(src->host, &off, &utc, &qpc, &rtt)) {
+        r->ok        = 1;
+        r->offsetMs  = off;
+        r->ntpUtcMs  = utc;
+        r->qpcAtT4   = qpc;
+        r->rttMs     = rtt;
+    } else {
+        r->ok = 0;
     }
+    return 0;
+}
+
+// --- Aggregator thread ---------------------------------------------------
+//
+// Spawns three worker threads in parallel, waits for all of them to
+// complete (or to time out at the socket level inside NtpQueryHost),
+// publishes per-source results, and picks the median of the successful
+// samples to feed into the disciplined clockwork.
+//
+// The concurrence / INOP gating that decides whether the clockwork is
+// allowed to update will be layered on top of this in the next step.
+// For now the clock is fed the median of any successful samples; the
+// legacy Ntp_IsSynced() / Ntp_OffsetMs() accessors continue to work the
+// same way as before.
+
+static int CmpI64(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a;
+    int64_t y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+// ---------------------------------------------------------------------------
+// Audit log
+// ---------------------------------------------------------------------------
+//
+// Every polling cycle appends one plain-text line to
+// %APPDATA%\Lunar\audit.log. The file rotates to audit.log.1 at
+// AUDIT_MAX_BYTES so the log can't grow unbounded. The format is line-
+// oriented and greppable:
+//
+//   2026-04-21T12:34:56.789Z  OK    spread=  42ms  NIST:ok off= -12ms rtt= 85ms  PTB:ok off=  30ms rtt= 42ms  NICT:ok off=  10ms rtt=110ms
+//   2026-04-21T12:35:01.000Z~ INOP  spread=   0ms  NIST:-- off=    - rtt=   -  PTB:ok off=  30ms rtt= 42ms  NICT:-- off=    - rtt=   -
+//
+// A trailing '~' on the timestamp marks a fallback stamp taken from
+// the Windows system clock (used only when our own trusted clockwork
+// cannot supply a time -- i.e. on an INOP cycle before the first ever
+// concurrence). Stamps without '~' are from the disciplined clockwork.
+//
+// The logger never blocks the aggregator on I/O errors: a failed write
+// is silently ignored. Losing a log line is preferable to stalling a
+// polling cycle in a safety context.
+
+#define AUDIT_MAX_BYTES (1 * 1024 * 1024)   // 1 MiB
+
+static void AuditDir(wchar_t *out, size_t n) {
+    wchar_t appdata[MAX_PATH] = { 0 };
+    DWORD got = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
+    if (got == 0 || got >= MAX_PATH) { out[0] = 0; return; }
+    _snwprintf(out, n, L"%ls\\Lunar", appdata);
+}
+
+static void AuditPath(wchar_t *out, size_t n) {
+    wchar_t dir[MAX_PATH] = { 0 };
+    AuditDir(dir, MAX_PATH);
+    if (dir[0] == 0) { out[0] = 0; return; }
+    _snwprintf(out, n, L"%ls\\audit.log", dir);
+}
+
+static void AuditRotateIfNeeded(void) {
+    wchar_t path[MAX_PATH];
+    AuditPath(path, MAX_PATH);
+    if (path[0] == 0) return;
+
+    WIN32_FILE_ATTRIBUTE_DATA fad = { 0 };
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) return;
+
+    uint64_t sz = ((uint64_t)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+    if (sz < AUDIT_MAX_BYTES) return;
+
+    wchar_t rotated[MAX_PATH];
+    _snwprintf(rotated, MAX_PATH, L"%ls.1", path);
+    DeleteFileW(rotated);       // ignore failure (may not exist)
+    MoveFileW(path, rotated);   // ignore failure (next write will create fresh)
+}
+
+// Produce "YYYY-MM-DDTHH:MM:SS.mmmZ" from UTC ms since epoch.
+// Buffer must be at least 25 bytes.
+static void FormatIsoUtc(int64_t utcMs, char *out, size_t n) {
+    time_t secs = (time_t)(utcMs / 1000);
+    int    msec = (int)(utcMs % 1000);
+    if (msec < 0) { msec += 1000; secs -= 1; }
+    struct tm tm = { 0 };
+#ifdef _WIN32
+    gmtime_s(&tm, &secs);
+#else
+    tm = *gmtime(&secs);
+#endif
+    _snprintf(out, n, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
+              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+              tm.tm_hour, tm.tm_min, tm.tm_sec, msec);
+}
+
+// Grab the best timestamp we have: disciplined clock if OK, otherwise
+// system clock with a '~' marker. Returns 1 if the stamp is trusted.
+static int BestLogStamp(char *out, size_t n) {
+    int64_t utcMs = 0;
+    if (Clock_NowUtcMs(&utcMs)) {
+        FormatIsoUtc(utcMs, out, n);
+        return 1;
+    }
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    int64_t sysMs = (int64_t)(t / 10000ULL) - (int64_t)FT_EPOCH_DELTA_MS;
+    FormatIsoUtc(sysMs, out, n);
+    return 0;
+}
+
+static void AuditWrite(TrustState trust,
+                       int64_t maxSpreadMs,
+                       const NtpSourceResult results[NTP_SOURCE_COUNT]) {
+    wchar_t dir[MAX_PATH];
+    AuditDir(dir, MAX_PATH);
+    if (dir[0] == 0) return;
+    CreateDirectoryW(dir, NULL);  // no-op if exists
+
+    AuditRotateIfNeeded();
+
+    wchar_t path[MAX_PATH];
+    AuditPath(path, MAX_PATH);
+    if (path[0] == 0) return;
+
+    HANDLE h = CreateFileW(path,
+                           FILE_APPEND_DATA,
+                           FILE_SHARE_READ,
+                           NULL,
+                           OPEN_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL,
+                           NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    char stamp[32];
+    int trusted = BestLogStamp(stamp, sizeof stamp);
+
+    char line[512];
+    int  pos = 0;
+    pos += _snprintf(line + pos, sizeof(line) - (size_t)pos,
+                     "%s%c %-4s  spread=%5lldms",
+                     stamp,
+                     trusted ? ' ' : '~',
+                     (trust == TRUST_OK) ? "OK" : "INOP",
+                     (long long)maxSpreadMs);
+
+    for (int i = 0; i < NTP_SOURCE_COUNT && pos < (int)sizeof(line) - 64; i++) {
+        const NtpSourceResult *r = &results[i];
+        const char *label = r->label ? r->label : "?";
+        if (r->ok) {
+            pos += _snprintf(line + pos, sizeof(line) - (size_t)pos,
+                             "  %s:ok off=%5lldms rtt=%4ums",
+                             label,
+                             (long long)r->offsetMs,
+                             (unsigned)r->rttMs);
+        } else {
+            pos += _snprintf(line + pos, sizeof(line) - (size_t)pos,
+                             "  %s:-- off=    - rtt=   -",
+                             label);
+        }
+    }
+    if (pos < (int)sizeof(line) - 1) {
+        line[pos++] = '\r';
+        line[pos++] = '\n';
+    } else {
+        line[sizeof(line) - 2] = '\r';
+        line[sizeof(line) - 1] = '\n';
+        pos = sizeof(line);
+    }
+
+    DWORD written = 0;
+    WriteFile(h, line, (DWORD)pos, &written, NULL);
+    CloseHandle(h);
+}
+
+static DWORD WINAPI AggregatorProc(LPVOID param) {
+    (void)param;
+
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        InterlockedExchange(&g_running, 0);
+        return 0;
+    }
+
+    WorkerCtx ctx[NTP_SOURCE_COUNT];
+    HANDLE    threads[NTP_SOURCE_COUNT] = { 0 };
+    int       spawned = 0;
+
+    for (int i = 0; i < NTP_SOURCE_COUNT; i++) {
+        ctx[i].index = i;
+        memset(&ctx[i].out, 0, sizeof(ctx[i].out));
+        ctx[i].out.label = kSources[i].label;
+        threads[i] = CreateThread(NULL, 0, WorkerProc, &ctx[i], 0, NULL);
+        if (threads[i]) spawned++;
+    }
+
+    // Cap total wall time at 2x the socket timeout so a stuck DNS
+    // lookup or a dead server cannot keep us from publishing results.
+    if (spawned > 0) {
+        // WaitForMultipleObjects can't take NULL handles, so compact.
+        HANDLE hs[NTP_SOURCE_COUNT];
+        int    nh = 0;
+        for (int i = 0; i < NTP_SOURCE_COUNT; i++)
+            if (threads[i]) hs[nh++] = threads[i];
+        WaitForMultipleObjects((DWORD)nh, hs, TRUE, NTP_TIMEOUT_MS * 2);
+        for (int i = 0; i < NTP_SOURCE_COUNT; i++)
+            if (threads[i]) CloseHandle(threads[i]);
+    }
+
+    // Collect successful results and compute the concurrence verdict.
+    //
+    //   3 ok + max pairwise spread <= 200 ms   -> TRUST_OK     (median)
+    //   anything else                          -> TRUST_INOP
+    //
+    // There is no degraded middle ground: safety-critical operation
+    // requires unanimous agreement among all three national-metrology
+    // sources. 2-of-3 is not good enough; 0/1 reached is not good
+    // enough; 3 reached but any pair disagrees > 200 ms is not good
+    // enough. In all those cases we refuse to provide a reading and
+    // the UI shows INOP.
+    //
+    // An extra cross-check against the running clockwork projection
+    // lives in clock.c -- a trusted-looking sample that disagrees with
+    // our own projection by > 200 ms trips INOP there too.
+
+    NtpSourceResult snapshot[NTP_SOURCE_COUNT];
+    for (int i = 0; i < NTP_SOURCE_COUNT; i++) snapshot[i] = ctx[i].out;
+
+    int64_t    bestUtcMs = 0;
+    int64_t    bestQpc   = 0;
+    int64_t    maxSpread = 0;
+    TrustState trust = Ntp_Concur(snapshot, &bestUtcMs, &bestQpc, &maxSpread);
+
+    // Publish shared state.
+    if (g_csInit) EnterCriticalSection(&g_cs);
+    for (int i = 0; i < NTP_SOURCE_COUNT; i++) g_results[i] = snapshot[i];
+    if (g_csInit) LeaveCriticalSection(&g_cs);
+
+    // Inform the clockwork. If state is INOP the anchor is not updated
+    // and Clock_NowUtcMs() will refuse to return a time (callers render
+    // the big red INOP).
+    Clock_OnPollCycle(trust, bestUtcMs, bestQpc, maxSpread);
+    InterlockedExchange64(&g_lastSpreadMs, (LONG64)maxSpread);
+
+    // One line to the audit log per cycle. Done after Clock_OnPollCycle
+    // so the timestamp reflects the clockwork's *post-cycle* state
+    // (disciplined if this cycle was OK, untrusted-fallback otherwise).
+    AuditWrite(trust, maxSpread, snapshot);
+
+    // Legacy accessors (About dialog etc.) only record on OK cycles.
+    if (trust == TRUST_OK) {
+        // Median offset of the three: recompute to match the fed sample.
+        int64_t offs[3] = {
+            snapshot[0].offsetMs, snapshot[1].offsetMs, snapshot[2].offsetMs
+        };
+        qsort(offs, 3, sizeof(int64_t), CmpI64);
+        InterlockedExchange64(&g_offsetMs,        offs[1]);
+        InterlockedExchange64(&g_lastSuccessTick, (LONG64)GetTickCount64());
+        InterlockedExchange64(&g_lastSuccessUtc,  (LONG64)bestUtcMs);
+    }
+
+    WSACleanup();
     InterlockedExchange(&g_running, 0);
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Pure concurrence evaluator (exported; unit-tested in tests/test_core.c)
+// ---------------------------------------------------------------------------
+//
+// Given per-source results, compute the trust verdict. See ntp.h for
+// contract. No globals, no I/O -- safe to call from anywhere.
+TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
+                      int64_t *outBestUtcMs,
+                      int64_t *outBestQpc,
+                      int64_t *outMaxSpreadMs) {
+    #define CONCUR_THRESHOLD_MS 200
+
+    if (outBestUtcMs)   *outBestUtcMs   = 0;
+    if (outBestQpc)     *outBestQpc     = 0;
+    if (outMaxSpreadMs) *outMaxSpreadMs = 0;
+
+    int     nok = 0;
+    int64_t offs[NTP_SOURCE_COUNT];
+    int64_t utcs[NTP_SOURCE_COUNT];
+    int64_t qpcs[NTP_SOURCE_COUNT];
+    for (int i = 0; i < NTP_SOURCE_COUNT; i++) {
+        if (results[i].ok) {
+            offs[nok] = results[i].offsetMs;
+            utcs[nok] = results[i].ntpUtcMs;
+            qpcs[nok] = results[i].qpcAtT4;
+            nok++;
+        }
+    }
+
+    if (nok != NTP_SOURCE_COUNT) {
+        // Compute spread among whatever succeeded, for the audit log,
+        // but the verdict is already INOP.
+        if (nok >= 2) {
+            int64_t s[NTP_SOURCE_COUNT];
+            for (int i = 0; i < nok; i++) s[i] = offs[i];
+            qsort(s, (size_t)nok, sizeof(int64_t), CmpI64);
+            if (outMaxSpreadMs) *outMaxSpreadMs = s[nok - 1] - s[0];
+        }
+        return TRUST_INOP;
+    }
+
+    int64_t sorted[3] = { offs[0], offs[1], offs[2] };
+    qsort(sorted, 3, sizeof(int64_t), CmpI64);
+    int64_t spread = sorted[2] - sorted[0];
+    if (outMaxSpreadMs) *outMaxSpreadMs = spread;
+
+    if (spread > CONCUR_THRESHOLD_MS) return TRUST_INOP;
+
+    // Feed the median source.
+    int64_t medianOff = sorted[1];
+    for (int k = 0; k < nok; k++) {
+        if (offs[k] == medianOff) {
+            if (outBestUtcMs) *outBestUtcMs = utcs[k];
+            if (outBestQpc)   *outBestQpc   = qpcs[k];
+            break;
+        }
+    }
+    return TRUST_OK;
+}
+
+// --- Public API ----------------------------------------------------------
+
 void Ntp_Start(void) {
+    if (!g_csInit) { InitializeCriticalSection(&g_cs); g_csInit = 1; }
     if (InterlockedCompareExchange(&g_running, 1, 0) != 0) return;
-    HANDLE th = CreateThread(NULL, 0, SyncThreadProc, NULL, 0, NULL);
+    HANDLE th = CreateThread(NULL, 0, AggregatorProc, NULL, 0, NULL);
     if (th) {
         CloseHandle(th);
     } else {
@@ -145,4 +521,22 @@ int64_t Ntp_OffsetMs(void) {
 
 int64_t Ntp_LastSyncUtcMs(void) {
     return (int64_t)g_lastSuccessUtc;
+}
+
+int64_t Ntp_LastSpreadMs(void) {
+    return (int64_t)g_lastSpreadMs;
+}
+
+int Ntp_GetResults(NtpSourceResult out[NTP_SOURCE_COUNT]) {
+    if (!out) return 0;
+    if (!g_csInit) {
+        memset(out, 0, sizeof(NtpSourceResult) * NTP_SOURCE_COUNT);
+        return 0;
+    }
+    EnterCriticalSection(&g_cs);
+    for (int i = 0; i < NTP_SOURCE_COUNT; i++) out[i] = g_results[i];
+    LeaveCriticalSection(&g_cs);
+    int nok = 0;
+    for (int i = 0; i < NTP_SOURCE_COUNT; i++) if (out[i].ok) nok++;
+    return nok;
 }

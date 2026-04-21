@@ -40,6 +40,10 @@ static int64_t    g_slewStartQpc  = 0;   // while slewing, start of window
 static int64_t    g_slewTotalMs   = 0;   // residual to absorb
 static int64_t    g_slewDurationMs = 0;  // over how long (currently 60000)
 
+// Trust state published by ntp.c after each polling cycle. Starts at
+// TRUST_INOP and stays there until the first cycle achieves concurrence.
+static TrustState g_trust         = TRUST_INOP;
+
 #define RATE_CLAMP_PPM       500    // reject/clamp absurd rate updates
 #define RATE_EMA_NUM         1      // new rate weight = 1/4 (EMA alpha 0.25)
 #define RATE_EMA_DEN         4
@@ -157,17 +161,30 @@ static int64_t ProjectLocked(int64_t qpc) {
     return utcMs;
 }
 
-int64_t Clock_NowUtcMs(void) {
-    if (!g_csInit) return RawSystemUtcMs();
+int64_t Clock_NowUtcMs_Internal(void) {
+    // Internal read used only for audit/diagnostic purposes. Never
+    // used for display. Returns 0 if not disciplined this run.
+    if (!g_csInit) return 0;
     EnterCriticalSection(&g_cs);
-    int64_t r;
-    if (!g_haveSample) {
-        r = RawSystemUtcMs();
-    } else {
-        r = ProjectLocked(Clock_Qpc());
-    }
+    int64_t r = g_haveSample ? ProjectLocked(Clock_Qpc()) : 0;
     LeaveCriticalSection(&g_cs);
     return r;
+}
+
+int Clock_NowUtcMs(int64_t *outMs) {
+    if (!g_csInit) return 0;
+    EnterCriticalSection(&g_cs);
+    int ok = 0;
+    // Clock must be anchored AND the last polling cycle must have
+    // concurred (OK or DEGRADED). TRUST_INOP -- even with a stale
+    // anchor -- must not return a time: we have no trusted reading
+    // right now, and the UI must render INOP.
+    if (g_haveSample && g_trust != TRUST_INOP) {
+        if (outMs) *outMs = ProjectLocked(Clock_Qpc());
+        ok = 1;
+    }
+    LeaveCriticalSection(&g_cs);
+    return ok;
 }
 
 int Clock_IsDisciplined(void) { return g_haveSample ? 1 : 0; }
@@ -256,4 +273,62 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
     }
 
     LeaveCriticalSection(&g_cs);
+}
+
+// Called by ntp.c at the end of every polling cycle. The concurrence
+// verdict has already been computed by the caller; this function just
+// either updates the anchor (OK / DEGRADED) or trips INOP and leaves
+// the anchor alone. One extra safety check: even when the caller
+// believes it has a valid sample, we cross-check against our own
+// running projection. If we already have an anchor and the agreed
+// time disagrees with our projection by > 200 ms, that is a local
+// oscillator fault: trip INOP rather than accept the sample.
+void Clock_OnPollCycle(TrustState state,
+                       int64_t bestUtcMs,
+                       int64_t bestQpc,
+                       int64_t maxPairSpreadMs) {
+    (void)maxPairSpreadMs;   // reserved for future audit-log use
+    if (!g_csInit) Clock_Init();
+
+    if (state == TRUST_INOP) {
+        EnterCriticalSection(&g_cs);
+        g_trust = TRUST_INOP;
+        LeaveCriticalSection(&g_cs);
+        return;
+    }
+
+    // Additional guard: cross-check agreed time against projection.
+    // Only meaningful once we already have an anchor from a previous
+    // cycle; the first concurrence-valid cycle is accepted as-is.
+    int localFault = 0;
+    EnterCriticalSection(&g_cs);
+    if (g_haveSample) {
+        int64_t predicted = ProjectLocked(bestQpc);
+        int64_t diff = bestUtcMs - predicted;
+        if (diff < 0) diff = -diff;
+        if (diff > 200) localFault = 1;
+    }
+    LeaveCriticalSection(&g_cs);
+
+    if (localFault) {
+        EnterCriticalSection(&g_cs);
+        g_trust = TRUST_INOP;
+        LeaveCriticalSection(&g_cs);
+        return;
+    }
+
+    // Accept the sample: run the normal PLL/slew update.
+    Clock_OnSyncedNtpUtc(bestUtcMs, bestQpc);
+
+    EnterCriticalSection(&g_cs);
+    g_trust = state;
+    LeaveCriticalSection(&g_cs);
+}
+
+TrustState Clock_Trust(void) {
+    if (!g_csInit) return TRUST_INOP;
+    EnterCriticalSection(&g_cs);
+    TrustState t = g_trust;
+    LeaveCriticalSection(&g_cs);
+    return t;
 }
