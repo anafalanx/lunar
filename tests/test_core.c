@@ -1168,38 +1168,44 @@ static void test_nts_ef_tamper(void) {
 }
 
 // ---------------------------------------------------------------------------
-// NTS provider pool -- without populated pins, PickProvider must refuse
+// NTS provider pool -- pins populated, PickProvider returns an entry
 // ---------------------------------------------------------------------------
 
 #include "../src/nts.h"
 
-static void test_nts_pool_all_pins_zero(void) {
-    // Sanity: the pool exists and every entry is currently pin-less
-    // (shipped default). Nts_PickProvider MUST NOT return a provider
-    // whose pin is all-zero, because that would mean handing trust
-    // to an unauthenticated TLS endpoint.
+static void test_nts_pool_pins(void) {
+    // Pool must exist and contain at least one entry with a populated
+    // SPKI pin. A build with every pin zeroed is a safety regression:
+    // Nts_PickProvider would return NULL, the NTS slot would always
+    // miss, and the concurrence gate would force INOP forever. Tests
+    // catch that situation here.
     size_t n = 0;
     const NtsProvider *p = Nts_Pool(&n);
     CHECK(p != NULL);
     CHECK(n > 0);
 
+    int n_enabled = 0;
     for (size_t i = 0; i < n; i++) {
-        uint8_t acc = 0;
-        for (int j = 0; j < 32; j++) acc |= p[i].spki_pin[j];
-        // When this repo lands in production, operators will populate
-        // pins via scripts/fetch_nts_spki_pins.py. Until then we
-        // deliberately ship with empty pins so a misconfigured build
-        // fails closed on trust, rather than open.
-        CHECK_EQ_INT(acc, 0);
         CHECK(p[i].host != NULL && p[i].host[0] != 0);
         CHECK(p[i].label != NULL);
+        uint8_t acc = 0;
+        for (int j = 0; j < 32; j++) acc |= p[i].spki_pin[j];
+        if (acc != 0) n_enabled++;
     }
+    CHECK(n_enabled > 0);
 
-    // With no pins populated, PickProvider returns NULL: no provider
-    // can be trusted, so the NTS slot will always miss and the
-    // concurrence gate (updated in a later step) will drive INOP.
+    // PickProvider must return a pinned (non-zero) entry from the pool.
     const NtsProvider *picked = Nts_PickProvider();
-    CHECK(picked == NULL);
+    CHECK(picked != NULL);
+    if (picked) {
+        uint8_t acc = 0;
+        for (int j = 0; j < 32; j++) acc |= picked->spki_pin[j];
+        CHECK(acc != 0);
+        // And it must be one of ours -- sanity-check by pointer identity.
+        int found = 0;
+        for (size_t i = 0; i < n; i++) if (&p[i] == picked) found = 1;
+        CHECK(found);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,7 +1232,7 @@ int main(void) {
     test_ntske_parse_errors();
     test_nts_ef_roundtrip();
     test_nts_ef_tamper();
-    test_nts_pool_all_pins_zero();
+    test_nts_pool_pins();
 
     printf("\n%d checks, %d failed\n", g_pass + g_fail, g_fail);
     return g_fail == 0 ? 0 : 1;
