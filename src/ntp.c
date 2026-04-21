@@ -61,6 +61,12 @@ static const NtpSource kSources[NTP_CORE_COUNT] = {
 // (e.g. the shipped build has no SPKI pins populated yet).
 static const char kNtsNoPinLabel[] = "NTS--";
 
+// Published label buffer for the NTS slot. Pointed to by
+// g_results[NTP_NTS_SLOT].label, so it MUST outlive the aggregator
+// thread that filled it -- which is exactly what file-scope storage
+// gives us. Guarded by g_cs on write and read.
+static char g_ntsLabelPublished[32] = { 0 };
+
 // --- Shared state --------------------------------------------------------
 
 static CRITICAL_SECTION g_cs;
@@ -523,8 +529,20 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
         }
     }
 
-    // Publish shared state.
+    // Publish shared state. The NTS slot's label points into
+    // `nts_ctx.labelBuf`, which is an AggregatorProc local and will
+    // cease to exist when this function returns; copy it into the
+    // file-scope g_ntsLabelPublished buffer and rewrite the pointer
+    // so About-dialog / audit-log readers don't chase a dangling
+    // pointer.
     if (g_csInit) EnterCriticalSection(&g_cs);
+    {
+        const char *lbl = snapshot[NTP_NTS_SLOT].label
+                          ? snapshot[NTP_NTS_SLOT].label : kNtsNoPinLabel;
+        _snprintf(g_ntsLabelPublished, sizeof g_ntsLabelPublished, "%s", lbl);
+        g_ntsLabelPublished[sizeof g_ntsLabelPublished - 1] = 0;
+        snapshot[NTP_NTS_SLOT].label = g_ntsLabelPublished;
+    }
     for (int i = 0; i < NTP_SOURCE_COUNT; i++) g_results[i] = snapshot[i];
     if (g_csInit) LeaveCriticalSection(&g_cs);
 

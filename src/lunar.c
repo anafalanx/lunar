@@ -1259,19 +1259,20 @@ static void ShowAbout(void) {
     wchar_t sourcesBlock[512] = { 0 };
     int sbPos = 0;
     for (int i = 0; i < NTP_SOURCE_COUNT; i++) {
-        wchar_t label[8] = L"?";
+        wchar_t label[32] = L"?";
         if (r[i].label) {
-            MultiByteToWideChar(CP_UTF8, 0, r[i].label, -1, label, 8);
+            MultiByteToWideChar(CP_UTF8, 0, r[i].label, -1, label, 32);
+            label[31] = 0;
         }
         wchar_t line[128];
         if (r[i].ok) {
             swprintf(line, 128,
-                     L"  %ls  ok   off %+5lld ms   rtt %4u ms\n",
+                     L"  %-18ls ok   off %+5lld ms   rtt %4u ms\n",
                      label, (long long)r[i].offsetMs,
                      (unsigned)r[i].rttMs);
         } else {
             swprintf(line, 128,
-                     L"  %ls  --   (no reply)\n",
+                     L"  %-18ls --   (no reply)\n",
                      label);
         }
         int len = (int)wcslen(line);
