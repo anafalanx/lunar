@@ -64,7 +64,7 @@
 #define IDM_TEST_BEEP     0x1002
 #define IDM_SETTINGS      0x1003
 #define IDM_ABOUT         0x1004
-#define IDM_SYNC_NOW      0x1005
+#define IDM_SYNC_NOW      0x1005   // deprecated, kept to preserve following IDs
 #define IDM_LOG           0x1006
 
 // Settings dialog + controls.
@@ -450,25 +450,8 @@ static void UpdateTitleBar(void) {
     if (g_tzLabel[0])
         MultiByteToWideChar(CP_UTF8, 0, g_tzLabel, -1, tz, 32);
 
-    NtpSourceResult r[NTP_SOURCE_COUNT];
-    int nok = Ntp_GetResults(r);
-    TrustState t = Clock_Trust();
-    int64_t spread = Ntp_LastSpreadMs();
-
-    WCHAR trust[64];
-    if (t == TRUST_OK) {
-        _snwprintf(trust, 64, L"OK %d/%d  +-%lldms",
-                   nok, NTP_SOURCE_COUNT, (long long)spread);
-    } else if (nok == NTP_SOURCE_COUNT) {
-        _snwprintf(trust, 64, L"INOP %d/%d  sp=%lldms",
-                   nok, NTP_SOURCE_COUNT, (long long)spread);
-    } else {
-        _snwprintf(trust, 64, L"INOP %d/%d",
-                   nok, NTP_SOURCE_COUNT);
-    }
-
     WCHAR title[192];
-    _snwprintf(title, 192, L"%ls  \x2014  Lunar 0.2  \x2014  %ls", tz, trust);
+    _snwprintf(title, 192, L"%ls  \x2014  Lunar 0.2", tz);
 
     if (wcscmp(title, s_last) != 0) {
         SetWindowTextW(g_hwnd, title);
@@ -1185,7 +1168,6 @@ static void InstallSystemMenuItems(void) {
     InsertMenuW(sys, 0, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
     InsertMenuW(sys, 0, MF_BYPOSITION | MF_STRING, IDM_ABOUT,         L"&About Lunar");
     InsertMenuW(sys, 0, MF_BYPOSITION | MF_STRING, IDM_SETTINGS,      L"&Settings\x2026");
-    InsertMenuW(sys, 0, MF_BYPOSITION | MF_STRING, IDM_SYNC_NOW,      L"Sync clock &now");
     InsertMenuW(sys, 0, MF_BYPOSITION | MF_STRING, IDM_LOG,           L"&Log\x2026");
     InsertMenuW(sys, 0, MF_BYPOSITION | MF_STRING, IDM_TEST_BEEP,     L"&Test beep");
     InsertMenuW(sys, 0, MF_BYPOSITION | MF_STRING, IDM_ALWAYS_ON_TOP, L"Always on &top");
@@ -1804,7 +1786,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case IDM_TEST_BEEP: Log_Append("user: test beep"); PlayBeep(); return 0;
         case IDM_SETTINGS:  Log_Append("user: opened Settings"); ShowSettings();   return 0;
-        case IDM_SYNC_NOW:  Log_Append("user: manual Sync Now"); Ntp_Start();      return 0;
         case IDM_LOG:       ShowLogViewer(); return 0;
         case IDM_ABOUT:     Log_Append("user: opened About"); ShowAbout();      return 0;
         }
