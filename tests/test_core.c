@@ -91,7 +91,9 @@ static void test_wav_header(void) {
     int16_t s0    = (int16_t)rd16(w + 44);
     int16_t sLast = (int16_t)rd16(w + 44 + (BEEP_FRAMES - 1) * 2);
     CHECK_EQ_INT(s0, 0);
-    CHECK(abs(sLast) < 1000);
+    // Release envelope lands on zero at the last frame, allowing for
+    // one-LSB float-to-int16 rounding.
+    CHECK(abs(sLast) <= 1);
 
     int peak = 0;
     for (int i = 0; i < BEEP_FRAMES; i++) {

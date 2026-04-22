@@ -149,7 +149,7 @@ static char                   g_tzIana[64]         = "";
 static TzId                   g_tzId               = TZ_ID_UTC;
 
 // ---------------------------------------------------------------------------
-// Persistence (carried over verbatim from the raylib build)
+// Persistence
 // ---------------------------------------------------------------------------
 
 // Wide-char path so users with non-ASCII profile names (ü, 漢, etc.)
@@ -158,9 +158,9 @@ static TzId                   g_tzId               = TZ_ID_UTC;
 static void ArmedPathW(wchar_t *out, size_t n) {
     const wchar_t *appdata = _wgetenv(L"APPDATA");
     if (!appdata || !*appdata) { out[0] = 0; return; }
-    _snwprintf(out, n, L"%ls\\Lunar", appdata);
+    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar", appdata);
     _wmkdir(out);
-    _snwprintf(out, n, L"%ls\\Lunar\\armed.dat", appdata);
+    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar\\armed.dat", appdata);
 }
 
 static void LoadArmed(int armed[12]) {
@@ -206,9 +206,9 @@ typedef struct {
 static void WindowStatePathW(wchar_t *out, size_t n) {
     const wchar_t *appdata = _wgetenv(L"APPDATA");
     if (!appdata || !*appdata) { out[0] = 0; return; }
-    _snwprintf(out, n, L"%ls\\Lunar", appdata);
+    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar", appdata);
     _wmkdir(out);
-    _snwprintf(out, n, L"%ls\\Lunar\\window.dat", appdata);
+    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar\\window.dat", appdata);
 }
 
 static void LoadWindowState(WindowState *ws) {
@@ -270,9 +270,9 @@ static void SaveWindowState(HWND hwnd, int alwaysOnTop) {
 static void SettingsPathW(wchar_t *out, size_t n) {
     const wchar_t *appdata = _wgetenv(L"APPDATA");
     if (!appdata || !*appdata) { out[0] = 0; return; }
-    _snwprintf(out, n, L"%ls\\Lunar", appdata);
+    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar", appdata);
     _wmkdir(out);
-    _snwprintf(out, n, L"%ls\\Lunar\\settings.dat", appdata);
+    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar\\settings.dat", appdata);
 }
 
 static void LoadSettings(void) {
@@ -394,7 +394,7 @@ static void BuildWav(float freqHz, float amplitude) {
 }
 
 // Play a single 880 Hz / 0.35 s chime. Applies the same volume-
-// compensation as the raylib build: WASAPI scales our output linearly
+// compensation: WASAPI scales our output linearly
 // by the system master slider, so we pre-boost to keep perceived
 // loudness roughly constant.
 static void PlayBeep(void) {
@@ -452,7 +452,7 @@ static void UpdateTitleBar(void) {
         MultiByteToWideChar(CP_UTF8, 0, g_tzLabel, -1, tz, 32);
 
     WCHAR title[192];
-    _snwprintf(title, 192, L"%ls  \x2014  Lunar 0.2", tz);
+    _snwprintf_s(title, 192, _TRUNCATE, L"%ls  \x2014  Lunar 0.2", tz);
 
     if (wcscmp(title, s_last) != 0) {
         SetWindowTextW(g_hwnd, title);
@@ -1146,8 +1146,9 @@ static void ShowAbout(void) {
 #define IDC_LOG_COPY      2003
 #define IDC_LOG_CLOSE     2004
 
-static HWND g_logWnd     = NULL;
-static HWND g_logEdit    = NULL;
+static HWND  g_logWnd     = NULL;
+static HWND  g_logEdit    = NULL;
+static HFONT g_logFont    = NULL;
 
 // Load the current log snapshot into the edit control.
 static void LogViewer_RefreshText(void) {
@@ -1230,7 +1231,12 @@ static LRESULT CALLBACK LogWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         lf.lfCharSet = DEFAULT_CHARSET;
         lf.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
         wcscpy_s(lf.lfFaceName, 32, L"Consolas");
+        // Release any font from a previous incarnation of this window
+        // before replacing the handle, so a re-open can't leak GDI
+        // objects.
+        if (g_logFont) { DeleteObject(g_logFont); g_logFont = NULL; }
         HFONT font = CreateFontIndirectW(&lf);
+        g_logFont = font;
 
         g_logEdit = CreateWindowExW(
             WS_EX_CLIENTEDGE, L"EDIT", L"",
@@ -1281,6 +1287,7 @@ static LRESULT CALLBACK LogWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_DESTROY:
         g_logWnd  = NULL;
         g_logEdit = NULL;
+        if (g_logFont) { DeleteObject(g_logFont); g_logFont = NULL; }
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);

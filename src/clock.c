@@ -15,9 +15,9 @@
 static void DisciplinePathW(wchar_t *out, size_t n) {
     const wchar_t *appdata = _wgetenv(L"APPDATA");
     if (!appdata || !*appdata) { out[0] = 0; return; }
-    _snwprintf(out, n, L"%ls\\Lunar", appdata);
+    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar", appdata);
     _wmkdir(out);
-    _snwprintf(out, n, L"%ls\\Lunar\\discipline.dat", appdata);
+    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar\\discipline.dat", appdata);
 }
 
 // --- Shared state ---------------------------------------------------------

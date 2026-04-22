@@ -301,14 +301,14 @@ static void AuditDir(wchar_t *out, size_t n) {
     wchar_t appdata[MAX_PATH] = { 0 };
     DWORD got = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
     if (got == 0 || got >= MAX_PATH) { out[0] = 0; return; }
-    _snwprintf(out, n, L"%ls\\Lunar", appdata);
+    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar", appdata);
 }
 
 static void AuditPath(wchar_t *out, size_t n) {
     wchar_t dir[MAX_PATH] = { 0 };
     AuditDir(dir, MAX_PATH);
     if (dir[0] == 0) { out[0] = 0; return; }
-    _snwprintf(out, n, L"%ls\\audit.log", dir);
+    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\audit.log", dir);
 }
 
 static void AuditRotateIfNeeded(void) {
@@ -323,7 +323,7 @@ static void AuditRotateIfNeeded(void) {
     if (sz < AUDIT_MAX_BYTES) return;
 
     wchar_t rotated[MAX_PATH];
-    _snwprintf(rotated, MAX_PATH, L"%ls.1", path);
+    _snwprintf_s(rotated, MAX_PATH, _TRUNCATE, L"%ls.1", path);
     DeleteFileW(rotated);       // ignore failure (may not exist)
     MoveFileW(path, rotated);   // ignore failure (next write will create fresh)
 }
