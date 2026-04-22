@@ -38,6 +38,8 @@
 #include <stdlib.h>
 #include <direct.h>
 #include <string.h>
+#include <ctype.h>
+#include <commctrl.h>
 
 #include "ntp.h"
 #include "clock.h"
@@ -73,6 +75,14 @@
 #define IDC_CHK_UNMIN         1002
 #define IDC_CHK_CONFIRM_CLOSE 1003
 #define IDC_CBO_TZ            1004
+#define IDC_EDIT_TZ_FILTER    1005
+#define IDC_STATIC_TZ_PREVIEW 1006
+#define IDC_BTN_TEST_CHIME    1007
+#define IDC_BTN_DEFAULTS      1008
+
+// Dialog-scoped timer (dialogs own a separate timer namespace from
+// the main window, so reusing IDT_REPAINT is safe).
+#define IDT_SETTINGS_PREVIEW  2
 
 #define IDT_REPAINT       1
 
@@ -1329,10 +1339,179 @@ static void ShowLogViewer(void) {
     Log_Append("log: viewer opened");
 }
 
+static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM lp);
+
+// Case-insensitive substring search over ASCII.  The tzdata index is
+// pure ASCII ("America/Argentina/Buenos_Aires" etc.) so a byte-wise
+// scan is both correct and fast enough to re-run on every keystroke
+// against the 313-entry table.
+static int ascii_istrstr(const char *haystack, const char *needle) {
+    if (!needle || !*needle) return 1;
+    size_t nlen = strlen(needle);
+    for (const char *h = haystack; *h; h++) {
+        size_t k = 0;
+        while (k < nlen && h[k]) {
+            int a = (unsigned char)h[k];
+            int b = (unsigned char)needle[k];
+            if (a >= 'A' && a <= 'Z') a += 32;
+            if (b >= 'A' && b <= 'Z') b += 32;
+            if (a != b) break;
+            k++;
+        }
+        if (k == nlen) return 1;
+    }
+    return 0;
+}
+
+// Repopulate the zone combo honouring the current filter text.  The
+// previously-selected TzId is preserved when still visible, otherwise
+// falls back to the first entry (UTC is always present unless the
+// filter excludes every row).  Returns the TzId that ended up
+// selected, or TZ_ID_UTC if the list is empty.
+static TzId settings_populate_tz_combo(HWND hdlg, TzId preferredId) {
+    HWND cb = GetDlgItem(hdlg, IDC_CBO_TZ);
+    if (!cb) return TZ_ID_UTC;
+
+    char filter[64] = { 0 };
+    GetDlgItemTextA(hdlg, IDC_EDIT_TZ_FILTER, filter, sizeof filter);
+
+    // Suppress combo redraws while we rebuild the list; otherwise
+    // each CB_ADDSTRING causes a flicker on every keystroke.
+    SendMessageW(cb, WM_SETREDRAW, FALSE, 0);
+    SendMessageW(cb, CB_RESETCONTENT, 0, 0);
+
+    int selIdx   = -1;
+    int firstTz  = -1;
+    int n        = Tz_Count();
+    for (int i = 0; i < n; i++) {
+        const char *name = Tz_AtIndex(i);
+        if (!name) continue;
+        if (!ascii_istrstr(name, filter)) continue;
+
+        wchar_t w[64];
+        MultiByteToWideChar(CP_UTF8, 0, name, -1, w,
+                            sizeof(w) / sizeof(w[0]));
+        int idx = (int)SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)w);
+        if (idx == CB_ERR || idx == CB_ERRSPACE) continue;
+        SendMessageW(cb, CB_SETITEMDATA, idx, (LPARAM)(INT_PTR)i);
+        if (firstTz < 0) firstTz = i;
+        if (i == preferredId) selIdx = idx;
+    }
+
+    if (selIdx < 0 && firstTz >= 0) {
+        // Preferred zone filtered out; pick whatever's on top.
+        int rows = (int)SendMessageW(cb, CB_GETCOUNT, 0, 0);
+        for (int j = 0; j < rows; j++) {
+            LPARAM data = SendMessageW(cb, CB_GETITEMDATA, j, 0);
+            if ((TzId)(INT_PTR)data == firstTz) { selIdx = j; break; }
+        }
+    }
+    SendMessageW(cb, CB_SETCURSEL, selIdx >= 0 ? selIdx : 0, 0);
+    SendMessageW(cb, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(cb, NULL, TRUE);
+
+    if (selIdx < 0) return TZ_ID_UTC;
+    LPARAM data = SendMessageW(cb, CB_GETITEMDATA, selIdx, 0);
+    return (TzId)(INT_PTR)data;
+}
+
+// Read the currently-selected TzId from the combo.  Returns
+// TZ_ID_INVALID when the combo is empty.
+static TzId settings_current_tz(HWND hdlg) {
+    HWND cb = GetDlgItem(hdlg, IDC_CBO_TZ);
+    int sel = (int)SendMessageW(cb, CB_GETCURSEL, 0, 0);
+    if (sel == CB_ERR) return TZ_ID_INVALID;
+    LPARAM data = SendMessageW(cb, CB_GETITEMDATA, sel, 0);
+    return (TzId)(INT_PTR)data;
+}
+
+// Refresh the "Current time:" line under the zone combo.  Runs off
+// Clock_NowUtcMs so before the first trusted sync we show an em-dash
+// rather than a bogus epoch-ish time.
+static void settings_refresh_preview(HWND hdlg) {
+    HWND label = GetDlgItem(hdlg, IDC_STATIC_TZ_PREVIEW);
+    if (!label) return;
+
+    TzId id = settings_current_tz(hdlg);
+    int64_t utcMs = 0;
+    if (id == TZ_ID_INVALID || !Clock_NowUtcMs(&utcMs)) {
+        SetWindowTextW(label, L"\x2014");       // em-dash
+        return;
+    }
+
+    TzifLocal tl;
+    if (!Tz_LocalFromUtcMs(id, utcMs, &tl)) {
+        SetWindowTextW(label, L"\x2014");
+        return;
+    }
+
+    int offMin = tl.utcOffsetSec / 60;
+    int offH   = offMin / 60;
+    int offM   = offMin % 60;
+    if (offM < 0) offM = -offM;
+
+    static const char *const kWday[7] = {
+        "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
+    };
+    const char *wday = (tl.wday >= 0 && tl.wday < 7) ? kWday[tl.wday] : "";
+
+    char buf[128];
+    if (offM == 0) {
+        snprintf(buf, sizeof buf,
+                 "%s %04d-%02d-%02d  %02d:%02d:%02d  %s (UTC%+d)",
+                 wday, tl.year, tl.month, tl.mday,
+                 tl.hour, tl.minute, tl.second,
+                 tl.abbr[0] ? tl.abbr : "",
+                 offH);
+    } else {
+        snprintf(buf, sizeof buf,
+                 "%s %04d-%02d-%02d  %02d:%02d:%02d  %s (UTC%+d:%02d)",
+                 wday, tl.year, tl.month, tl.mday,
+                 tl.hour, tl.minute, tl.second,
+                 tl.abbr[0] ? tl.abbr : "",
+                 offH, offM);
+    }
+    wchar_t wbuf[160];
+    MultiByteToWideChar(CP_UTF8, 0, buf, -1, wbuf,
+                        sizeof(wbuf) / sizeof(wbuf[0]));
+    SetWindowTextW(label, wbuf);
+}
+
+// Attach a tooltip to a child control.  Creates the tooltip window
+// lazily on first call via the caller-supplied HWND* cache.
+static void settings_add_tip(HWND *tipOut, HWND hdlg, int ctlId,
+                             const wchar_t *text) {
+    if (!tipOut) return;
+    if (!*tipOut) {
+        *tipOut = CreateWindowExW(
+            WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL,
+            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+            CW_USEDEFAULT, CW_USEDEFAULT,
+            CW_USEDEFAULT, CW_USEDEFAULT,
+            hdlg, NULL, GetModuleHandleW(NULL), NULL);
+        if (!*tipOut) return;
+        SendMessageW(*tipOut, TTM_SETMAXTIPWIDTH, 0, 320);
+        // Slow down the auto-pop so users have time to read.
+        SendMessageW(*tipOut, TTM_SETDELAYTIME, TTDT_AUTOPOP,
+                     MAKELPARAM(15000, 0));
+    }
+    HWND ctl = GetDlgItem(hdlg, ctlId);
+    if (!ctl) return;
+    TOOLINFOW ti = { 0 };
+    ti.cbSize   = sizeof ti;
+    ti.uFlags   = TTF_IDISHWND | TTF_SUBCLASS;
+    ti.hwnd     = hdlg;
+    ti.uId      = (UINT_PTR)ctl;
+    ti.lpszText = (LPWSTR)text;
+    SendMessageW(*tipOut, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+}
+
 static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM lp) {
-    (void)lp;
+    // Cache the tooltip window across messages via GWLP_USERDATA.
+    // We stash it as a single HWND; free on WM_DESTROY.
     switch (msg) {
     case WM_INITDIALOG: {
+        (void)lp;
         CheckDlgButton(hdlg, IDC_CHK_CHIMES,
                        g_chimesEnabled ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hdlg, IDC_CHK_UNMIN,
@@ -1340,48 +1519,105 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM l
         CheckDlgButton(hdlg, IDC_CHK_CONFIRM_CLOSE,
                        g_confirmOnClose ? BST_CHECKED : BST_UNCHECKED);
 
-        // Populate the timezone combobox from the embedded IANA
-        // zoneinfo index.  Entry 0 is always "UTC" (TZ_ID_UTC); every
-        // other entry carries its Tz_AtIndex(i) integer ID in the item
-        // data.  No OS timezone API is consulted.
-        HWND cb = GetDlgItem(hdlg, IDC_CBO_TZ);
-        int selected = 0;
-        int n = Tz_Count();
-        for (int i = 0; i < n; i++) {
-            const char *name = Tz_AtIndex(i);
-            if (!name) continue;
-            wchar_t w[64];
-            MultiByteToWideChar(CP_UTF8, 0, name, -1, w,
-                                sizeof(w) / sizeof(w[0]));
-            int idx = (int)SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)w);
-            if (idx == CB_ERR || idx == CB_ERRSPACE) continue;
-            SendMessageW(cb, CB_SETITEMDATA, idx, (LPARAM)(INT_PTR)i);
-            if (i == g_tzId) selected = idx;
-        }
-        SendMessageW(cb, CB_SETCURSEL, selected, 0);
+        // Populate zone combo from the embedded IANA index.  No OS
+        // timezone API is consulted.
+        settings_populate_tz_combo(hdlg, g_tzId);
+
+        // Placeholder hint for the filter edit.  EM_SETCUEBANNER is
+        // themed-edit-only but gracefully no-ops on classic style.
+        SendDlgItemMessageW(hdlg, IDC_EDIT_TZ_FILTER,
+                            EM_SETCUEBANNER, TRUE,
+                            (LPARAM)L"Type to filter\x2026");
+
+        // Tooltips.  All strings are static; TTN_GETDISPINFO not needed.
+        HWND tip = NULL;
+        settings_add_tip(&tip, hdlg, IDC_CHK_CHIMES,
+            L"Play a short audible beep at each 5-minute mark that is "
+            L"armed in the system tray menu. Chimes never fire while "
+            L"the clock is out of sync.");
+        settings_add_tip(&tip, hdlg, IDC_CHK_UNMIN,
+            L"Restore the window from the taskbar at each armed mark, "
+            L"even if chimes are off. Useful as a silent pomodoro timer.");
+        settings_add_tip(&tip, hdlg, IDC_BTN_TEST_CHIME,
+            L"Play the chime sound now so you can check volume and tone.");
+        settings_add_tip(&tip, hdlg, IDC_CHK_CONFIRM_CLOSE,
+            L"Ask for confirmation before closing the window. Prevents "
+            L"accidental shutdowns mid-session.");
+        settings_add_tip(&tip, hdlg, IDC_EDIT_TZ_FILTER,
+            L"Type to narrow the list below. Case-insensitive substring "
+            L"match across the full IANA name, e.g. \"paris\" or \"new_york\".");
+        settings_add_tip(&tip, hdlg, IDC_CBO_TZ,
+            L"Display time zone. Drawn from the embedded IANA tzdata; no "
+            L"network or registry lookup is performed.");
+        settings_add_tip(&tip, hdlg, IDC_STATIC_TZ_PREVIEW,
+            L"Live preview of the selected zone's wall-clock time, "
+            L"updated from the disciplined NTP clock.");
+        settings_add_tip(&tip, hdlg, IDC_BTN_DEFAULTS,
+            L"Reset every setting on this page to its factory value. "
+            L"Nothing is written until you press OK.");
+        SetWindowLongPtrW(hdlg, GWLP_USERDATA, (LONG_PTR)tip);
+
+        // Drive the live preview off a 500 ms dialog timer.  Seed an
+        // immediate update so the label is populated before the first
+        // tick.
+        SetTimer(hdlg, IDT_SETTINGS_PREVIEW, 500, NULL);
+        settings_refresh_preview(hdlg);
         return TRUE;
     }
 
-    case WM_COMMAND:
-        switch (LOWORD(wp)) {
+    case WM_TIMER:
+        if (wp == IDT_SETTINGS_PREVIEW) {
+            settings_refresh_preview(hdlg);
+        }
+        return TRUE;
+
+    case WM_COMMAND: {
+        WORD code = HIWORD(wp);
+        WORD id   = LOWORD(wp);
+        switch (id) {
+        case IDC_EDIT_TZ_FILTER:
+            if (code == EN_CHANGE) {
+                TzId keep = settings_current_tz(hdlg);
+                settings_populate_tz_combo(hdlg, keep);
+                settings_refresh_preview(hdlg);
+                return TRUE;
+            }
+            break;
+
+        case IDC_CBO_TZ:
+            if (code == CBN_SELCHANGE) {
+                settings_refresh_preview(hdlg);
+                return TRUE;
+            }
+            break;
+
+        case IDC_BTN_TEST_CHIME:
+            PlayBeep();
+            return TRUE;
+
+        case IDC_BTN_DEFAULTS: {
+            CheckDlgButton(hdlg, IDC_CHK_CHIMES,        BST_CHECKED);
+            CheckDlgButton(hdlg, IDC_CHK_UNMIN,         BST_UNCHECKED);
+            CheckDlgButton(hdlg, IDC_CHK_CONFIRM_CLOSE, BST_UNCHECKED);
+            SetDlgItemTextW(hdlg, IDC_EDIT_TZ_FILTER, L"");
+            settings_populate_tz_combo(hdlg, TZ_ID_UTC);
+            settings_refresh_preview(hdlg);
+            return TRUE;
+        }
+
         case IDOK: {
             g_chimesEnabled     = IsDlgButtonChecked(hdlg, IDC_CHK_CHIMES)        == BST_CHECKED;
             g_unminimizeOnChime = IsDlgButtonChecked(hdlg, IDC_CHK_UNMIN)         == BST_CHECKED;
             g_confirmOnClose    = IsDlgButtonChecked(hdlg, IDC_CHK_CONFIRM_CLOSE) == BST_CHECKED;
 
-            HWND cb = GetDlgItem(hdlg, IDC_CBO_TZ);
-            int sel = (int)SendMessageW(cb, CB_GETCURSEL, 0, 0);
-            if (sel != CB_ERR) {
-                LPARAM data = SendMessageW(cb, CB_GETITEMDATA, sel, 0);
-                TzId id = (TzId)(INT_PTR)data;
-                const char *nm = Tz_Name(id);
-                if (!nm || id == TZ_ID_UTC) {
-                    g_tzIana[0] = 0;
-                    g_tzId = TZ_ID_UTC;
-                } else {
-                    snprintf(g_tzIana, sizeof(g_tzIana), "%s", nm);
-                    g_tzId = id;
-                }
+            TzId id = settings_current_tz(hdlg);
+            const char *nm = (id == TZ_ID_INVALID) ? NULL : Tz_Name(id);
+            if (!nm || id == TZ_ID_UTC) {
+                g_tzIana[0] = 0;
+                g_tzId = TZ_ID_UTC;
+            } else {
+                snprintf(g_tzIana, sizeof(g_tzIana), "%s", nm);
+                g_tzId = id;
             }
 
             SaveSettings();
@@ -1391,12 +1627,21 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM l
             EndDialog(hdlg, IDOK);
             return TRUE;
         }
-        case IDCANCEL: {
+
+        case IDCANCEL:
             EndDialog(hdlg, IDCANCEL);
             return TRUE;
         }
-        }
         break;
+    }
+
+    case WM_DESTROY: {
+        KillTimer(hdlg, IDT_SETTINGS_PREVIEW);
+        HWND tip = (HWND)GetWindowLongPtrW(hdlg, GWLP_USERDATA);
+        if (tip) DestroyWindow(tip);
+        SetWindowLongPtrW(hdlg, GWLP_USERDATA, 0);
+        return TRUE;
+    }
     }
     return FALSE;
 }
@@ -1686,6 +1931,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
                              &IID_IDWriteFactory, (IUnknown**)&g_dw);
     if (FAILED(hr)) return 1;
+
+    // Register standard + tooltip common control classes.  Requires
+    // the v6 comctl32 dependency declared in lunar.manifest.
+    {
+        INITCOMMONCONTROLSEX icc = { sizeof icc,
+            ICC_STANDARD_CLASSES | ICC_BAR_CLASSES };
+        InitCommonControlsEx(&icc);
+    }
 
     LoadArmed(g_armed);
 
