@@ -7,6 +7,7 @@
 
 #define LUNAR_NO_MAIN
 #include "../src/lunar.c"
+#include "../src/tzif.h"
 
 #include <stdio.h>
 
@@ -1721,6 +1722,112 @@ static void test_settings_invalid_tz(void) {
     CHECK_EQ_INT(g_tzId, TZ_ID_UTC);
     CHECK_EQ_INT(g_tzIana[0], 0);
     CHECK_EQ_STR(g_tzLabel, "UTC");
+
+    // Fallback must also surface in the log buffer so users/operators
+    // can see why the setting was ignored.
+    char snap[4096];
+    Log_Snapshot(snap, sizeof snap);
+    CHECK(strstr(snap, "tz: IANA name Atlantis/Capital") != NULL);
+    CHECK(strstr(snap, "falling back to UTC")           != NULL);
+}
+
+// ---------------------------------------------------------------------------
+// POSIX TZ footer hardening: hostile or malformed strings must neither
+// overflow nor hang.  Exercised through tzif_resolve on synthetic TZif
+// blobs so we cover the same code path as the real resolver.
+// ---------------------------------------------------------------------------
+
+// Build a minimal valid v2/v3 TZif blob with zero explicit transitions
+// and one typec entry, ending in a newline-delimited POSIX footer.
+// Returns the byte count written into `out`; 0 on cap overflow.
+static size_t build_empty_tzif_with_footer(uint8_t *out, size_t cap,
+                                           const char *posix) {
+    size_t flen = strlen(posix);
+    // Layout:
+    //   0..19  v1 header ("TZif3\0*15")  — v1 empty block: 6 counts all 0
+    //   20..43 v1 counts (6 * u32be zeros), counts followed by no data
+    //  44..63  v2 header "TZif3\0*15"
+    //  64..87  v2 counts (tti_ut=tti_st=0, leap=0, tcnt=0, typec=1, charc=2)
+    //  88..93  typec ttinfo (gmtoff=0, isdst=0, abbridx=0)
+    //  94..95  abbrs "Z\0"
+    //  96      '\n'
+    //  97..    posix footer
+    size_t need = 44 + 44 + 6 + 2 + 1 + flen + 1;   // final '\n'
+    if (need > cap) return 0;
+    memset(out, 0, need);
+    memcpy(out + 0,  "TZif", 4); out[4]  = '3';
+    memcpy(out + 44, "TZif", 4); out[48] = '3';
+    // v2 counts: only typec=1 and charc=2 nonzero.
+    out[44 + 20 + 16 + 3] = 0x01;   // typec = 1
+    out[44 + 20 + 20 + 3] = 0x02;   // charc = 2
+    // ttinfo (6 bytes): gmtoff(4)=0, isdst(1)=0, abbridx(1)=0
+    // -> already zero from memset.
+    // abbrs: "Z\0"
+    out[88 + 6 + 0] = 'Z';
+    out[88 + 6 + 1] = 0;
+    out[44 + 44 + 6 + 2] = '\n';
+    memcpy(out + 44 + 44 + 6 + 2 + 1, posix, flen);
+    out[need - 1] = '\n';
+    return need;
+}
+
+static void test_posix_footer_hardening(void) {
+    uint8_t buf[1024];
+    TzifLocal tl;
+
+    // 1) Unbounded digit run in DST rule: "M99999999...9.1.0".  With
+    //    take_digits capping at 2 hour digits / etc., this must neither
+    //    overflow nor hang -- it clamps to an in-range rule and still
+    //    produces a valid resolution.
+    char footer1[256];
+    char longdigits[128];
+    for (int i = 0; i < 100; i++) longdigits[i] = '9';
+    longdigits[100] = 0;
+    snprintf(footer1, sizeof footer1,
+             "EST5EDT,M%s.1.0,M11.1.0", longdigits);
+    size_t n = build_empty_tzif_with_footer(buf, sizeof buf, footer1);
+    CHECK(n > 0);
+    // Resolve an instant in June; must succeed, must land on DST or
+    // standard -- correctness of the synthetic zone matters less than
+    // the absence of crash/hang.
+    int64_t jun = make_utc_ms(2026, 6, 15, 12, 0, 0) / 1000;
+    CHECK_EQ_INT(tzif_resolve(buf, n, jun, &tl), 1);
+
+    // 2) Long offset digit run in the hour field: "EST<999999...9>EDT,..."
+    char footer2[256];
+    snprintf(footer2, sizeof footer2,
+             "EST%s:30EDT4,M3.2.0,M11.1.0", longdigits);
+    n = build_empty_tzif_with_footer(buf, sizeof buf, footer2);
+    CHECK(n > 0);
+    // Must resolve without overflow.  Clamped offset may be unusual
+    // but must stay within our sanity envelope.
+    CHECK_EQ_INT(tzif_resolve(buf, n, jun, &tl), 1);
+    CHECK(tl.utcOffsetSec >= -15 * 3600 && tl.utcOffsetSec <= 15 * 3600);
+
+    // 3) Out-of-range Mm.w.d components (M99.99.99).  Clamping inside
+    //    parse_rule pulls them back into the legal domain; the rule
+    //    still evaluates to *some* in-range instant.
+    const char *footer3 = "XYZ3ABC,M99.99.99,M99.99.99";
+    n = build_empty_tzif_with_footer(buf, sizeof buf, footer3);
+    CHECK(n > 0);
+    CHECK_EQ_INT(tzif_resolve(buf, n, jun, &tl), 1);
+
+    // 4) Malformed rule (missing comma between start and end rules)
+    //    -> parse_posix returns 0; hasFooter=0; resolver falls back
+    //    to the single ttinfo entry ("Z" / gmtoff=0 / isdst=0).
+    const char *footer4 = "XYZ3ABC,M3.2.0";   // no end rule
+    n = build_empty_tzif_with_footer(buf, sizeof buf, footer4);
+    CHECK(n > 0);
+    CHECK_EQ_INT(tzif_resolve(buf, n, jun, &tl), 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, 0);
+    CHECK_EQ_INT(tl.isDst, 0);
+
+    // 5) Empty footer -- parser must not trip on it.
+    const char *footer5 = "";
+    n = build_empty_tzif_with_footer(buf, sizeof buf, footer5);
+    CHECK(n > 0);
+    CHECK_EQ_INT(tzif_resolve(buf, n, jun, &tl), 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1761,6 +1868,7 @@ int main(void) {
     test_settings_roundtrip();
     test_settings_legacy_v1();
     test_settings_invalid_tz();
+    test_posix_footer_hardening();
 
     printf("\n%d checks, %d failed\n", g_pass + g_fail, g_fail);
     return g_fail == 0 ? 0 : 1;

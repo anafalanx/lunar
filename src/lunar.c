@@ -134,7 +134,6 @@ static int                    g_armed[12]    = { 0 };
 static float                  g_prevMins     = -1.0f;
 static char                   g_tzLabel[96]  = "";
 static DWORD                  g_lastNtpKickMs = 0;
-static int                    g_tzTicker     = 0;
 
 // User-configurable settings (persisted in %APPDATA%\Lunar\settings.dat).
 static int                    g_chimesEnabled      = 1;
@@ -481,6 +480,8 @@ static void UpdateTimezone(void) {
         // build).  Fall back to UTC; do not clobber the saved file
         // here -- SaveSettings() will flush the empty string next
         // time the user touches Settings.
+        Log_Append("tz: IANA name %.48s not in embedded index; falling back to UTC",
+                   g_tzIana);
         g_tzIana[0] = 0;
         g_tzId = TZ_ID_UTC;
         snprintf(g_tzLabel, sizeof(g_tzLabel), "UTC");
@@ -1448,6 +1449,14 @@ static void Tick(void) {
         int curFloor  = (int)floorf(mins);
         int delta     = curFloor - prevFloor;
         if (delta < 0) delta += 60;         // normal minute-60 rollover
+
+        // Refresh the IANA-derived zone label whenever the local
+        // minute advances.  Catches DST transitions within a minute
+        // of the actual jump; on a steady-state zone the label
+        // recomputes to the same string and UpdateTitleBar's
+        // s_last cache suppresses the SetWindowTextW call.
+        if (delta > 0) UpdateTimezone();
+
         if (delta >= 1 && delta <= 2) {
             for (int k = 1; k <= delta; k++) {
                 int mm = (prevFloor + k) % 60;
@@ -1466,13 +1475,6 @@ static void Tick(void) {
         }
     }
     g_prevMins = mins;
-
-    // Timezone changes rarely; poll once every ~30 minutes of tick time.
-    // At TICK_MS=200 (5 Hz) that is 30*60*5 = 9000 ticks.
-    if (++g_tzTicker >= 30 * 60 * (1000 / TICK_MS)) {
-        UpdateTimezone();
-        g_tzTicker = 0;
-    }
 
     // Refresh the title-bar trust indicator (no-op when unchanged).
     UpdateTitleBar();

@@ -132,6 +132,25 @@ static const char *parse_abbr(const char *s, char abbr[TZIF_ABBR_CAP]) {
     return s;
 }
 
+// Consume up to `maxDigits` ASCII digits, accumulating into *v with
+// saturation at INT_MAX.  Caps runaway inputs like "M99999...9" so a
+// malformed or hostile footer can neither overflow nor burn CPU.
+static const char *take_digits(const char *s, int *v, int maxDigits) {
+    int x = 0;
+    int k = 0;
+    while (is_digit_c((unsigned char)*s) && k < maxDigits) {
+        if (x > 214748364) x = 2147483647;    // saturate near INT_MAX
+        else x = x * 10 + (*s - '0');
+        s++;
+        k++;
+    }
+    // Skip any excess digits without incorporating them so callers
+    // still advance past the full numeric token.
+    while (is_digit_c((unsigned char)*s)) s++;
+    *v = x;
+    return s;
+}
+
 // POSIX offsets are "time to add to local to get UTC" -- the sign is
 // the opposite of gmtoff.  Caller negates to get east-of-UTC.
 static const char *parse_posix_offset(const char *s, int *rawSec) {
@@ -139,15 +158,18 @@ static const char *parse_posix_offset(const char *s, int *rawSec) {
     if (*s == '+') s++;
     else if (*s == '-') { sign = -1; s++; }
     int hh = 0, mm = 0, ss = 0;
-    while (is_digit_c((unsigned char)*s)) { hh = hh * 10 + (*s - '0'); s++; }
+    s = take_digits(s, &hh, 3);     // POSIX: max 3 hour digits
     if (*s == ':') {
         s++;
-        while (is_digit_c((unsigned char)*s)) { mm = mm * 10 + (*s - '0'); s++; }
+        s = take_digits(s, &mm, 2);
     }
     if (*s == ':') {
         s++;
-        while (is_digit_c((unsigned char)*s)) { ss = ss * 10 + (*s - '0'); s++; }
+        s = take_digits(s, &ss, 2);
     }
+    if (hh > 24)  hh = 24;
+    if (mm > 59)  mm = 59;
+    if (ss > 59)  ss = 59;
     *rawSec = sign * (hh * 3600 + mm * 60 + ss);
     return s;
 }
@@ -157,17 +179,24 @@ static const char *parse_rule(const char *s, PosixRule *r) {
     r->timeSec = 2 * 3600;
     if (*s == 'M') {
         s++; r->mode = 0;
-        while (is_digit_c((unsigned char)*s)) { r->m = r->m * 10 + (*s - '0'); s++; }
+        s = take_digits(s, &r->m, 2);
         if (*s == '.') s++;
-        while (is_digit_c((unsigned char)*s)) { r->w = r->w * 10 + (*s - '0'); s++; }
+        s = take_digits(s, &r->w, 1);
         if (*s == '.') s++;
-        while (is_digit_c((unsigned char)*s)) { r->d = r->d * 10 + (*s - '0'); s++; }
+        s = take_digits(s, &r->d, 1);
+        if (r->m < 1 || r->m > 12) r->m = 1;
+        if (r->w < 1 || r->w > 5)  r->w = 1;
+        if (r->d < 0 || r->d > 6)  r->d = 0;
     } else if (*s == 'J') {
         s++; r->mode = 1;
-        while (is_digit_c((unsigned char)*s)) { r->n = r->n * 10 + (*s - '0'); s++; }
+        s = take_digits(s, &r->n, 3);
+        if (r->n < 1)   r->n = 1;
+        if (r->n > 365) r->n = 365;
     } else {
         r->mode = 2;
-        while (is_digit_c((unsigned char)*s)) { r->n = r->n * 10 + (*s - '0'); s++; }
+        s = take_digits(s, &r->n, 3);
+        if (r->n < 0)   r->n = 0;
+        if (r->n > 365) r->n = 365;
     }
     if (*s == '/') {
         s++;
