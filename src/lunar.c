@@ -1394,7 +1394,7 @@ static LRESULT CALLBACK LogWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HINSTANCE hi = (HINSTANCE)GetWindowLongPtrW(hwnd, GWLP_HINSTANCE);
         // Use a monospace font so columns line up.
         LOGFONTW lf = {0};
-        lf.lfHeight = -16;
+        lf.lfHeight = -20;
         lf.lfWeight = FW_NORMAL;
         lf.lfCharSet = DEFAULT_CHARSET;
         lf.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
@@ -1482,7 +1482,7 @@ static void ShowLogViewer(void) {
     }
     g_logWnd = CreateWindowExW(0, kClass, L"Lunar \x2014 Log (last 24h)",
                                WS_OVERLAPPEDWINDOW,
-                               CW_USEDEFAULT, CW_USEDEFAULT, 1100, 720,
+                               CW_USEDEFAULT, CW_USEDEFAULT, 1280, 800,
                                g_hwnd, NULL, hi, NULL);
     if (g_logWnd) {
         ShowWindow(g_logWnd, SW_SHOWNORMAL);

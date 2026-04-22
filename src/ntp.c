@@ -569,21 +569,34 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
             if (snapshot[i].ok) okCount++;
         const char *ntsLabel = snapshot[NTP_NTS_SLOT].label
                                ? snapshot[NTP_NTS_SLOT].label : "NTS--";
-        Log_Append("ntp: cycle %s  ok=%d/%d  spread=%lldms  anchor=%s",
-                   (trust == TRUST_OK) ? "OK" : "INOP",
+        Log_Append("ntp: cycle %s  concurring=%d/%d  spread=%lldms  "
+                   "gate=%s  anchor=%s",
+                   (trust == TRUST_OK) ? "TRUST_OK" : "TRUST_INOP",
                    okCount, NTP_SOURCE_COUNT,
                    (long long)maxSpread,
-                   snapshot[NTP_NTS_SLOT].ok ? ntsLabel : "(NTS failed)");
+                   (trust == TRUST_OK)
+                       ? "NTS+2-of-3 core within \xc2\xb1200ms"
+                       : "need NTS + 2-of-3 core within \xc2\xb1200ms",
+                   snapshot[NTP_NTS_SLOT].ok ? ntsLabel : "(NTS unavailable)");
         for (int i = 0; i < NTP_SOURCE_COUNT; i++) {
-            const char *lbl = snapshot[i].label ? snapshot[i].label : "?";
+            const char *lbl  = snapshot[i].label ? snapshot[i].label : "?";
+            const char *host = (i < NTP_CORE_COUNT) ? kSources[i].host
+                                                    : "(NTS pool)";
             if (snapshot[i].ok) {
-                Log_Append("  [%d] %-18s ok    offset=%+lldms  rtt=%ums  utc=%lld",
-                           i, lbl,
+                char iso[40];
+                FormatIsoUtc(snapshot[i].ntpUtcMs, iso, sizeof iso);
+                Log_Append("  [%d] %-18s  %-22s  ok    offset=%+lldms  "
+                           "rtt=%ums  server_utc=%s",
+                           i, lbl, host,
                            (long long)snapshot[i].offsetMs,
                            (unsigned)snapshot[i].rttMs,
-                           (long long)snapshot[i].ntpUtcMs);
+                           iso);
             } else {
-                Log_Append("  [%d] %-18s FAIL", i, lbl);
+                Log_Append("  [%d] %-18s  %-22s  FAIL  (no valid reply within "
+                           "%dms \x2014 DNS/timeout/blackhole/rate-limit)",
+                           i, lbl, host,
+                           (i == NTP_NTS_SLOT) ? NTS_SLOT_TIMEOUT_MS
+                                               : NTP_TIMEOUT_MS);
             }
         }
     }
@@ -683,7 +696,11 @@ void Ntp_Start(void) {
         Log_Append("ntp: sync requested but a cycle is already in flight");
         return;
     }
-    Log_Append("ntp: cycle start (4 slots: NIST, PTB, NICT, NTS)");
+    Log_Append("ntp: cycle start \x2014 querying 4 sources in parallel "
+               "(core timeout %dms, NTS timeout %dms)",
+               NTP_TIMEOUT_MS, NTS_SLOT_TIMEOUT_MS);
+    Log_Append("  core: NIST=%s  PTB=%s  NICT=%s  (UDP/123, SNTPv4)",
+               kSources[0].host, kSources[1].host, kSources[2].host);
     HANDLE th = CreateThread(NULL, 0, AggregatorProc, NULL, 0, NULL);
     if (th) {
         CloseHandle(th);
