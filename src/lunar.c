@@ -1048,32 +1048,46 @@ static INT_PTR CALLBACK AboutDlgProc(HWND hdlg, UINT msg,
                                      WPARAM wp, LPARAM lp) {
     (void)lp;
     static HFONT s_titleFont = NULL;
+    static HBRUSH s_bgBrush = NULL;
     switch (msg) {
     case WM_INITDIALOG: {
         HINSTANCE hi = GetModuleHandleW(NULL);
 
-        // Caption icon (small) and the shown 32x32 ICON control.
+        // Caption icon (small).
         HICON hSmall = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(1),
                                          IMAGE_ICON,
                                          GetSystemMetrics(SM_CXSMICON),
                                          GetSystemMetrics(SM_CYSMICON),
                                          LR_DEFAULTCOLOR);
         HICON hBig   = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(1),
-                                         IMAGE_ICON, 32, 32,
+                                         IMAGE_ICON,
+                                         GetSystemMetrics(SM_CXICON),
+                                         GetSystemMetrics(SM_CYICON),
                                          LR_DEFAULTCOLOR);
         if (hSmall) SendMessageW(hdlg, WM_SETICON, ICON_SMALL, (LPARAM)hSmall);
-        if (hBig) {
-            SendMessageW(hdlg, WM_SETICON, ICON_BIG, (LPARAM)hBig);
-            SendDlgItemMessageW(hdlg, 2001, STM_SETICON,
-                                (WPARAM)hBig, 0);
+        if (hBig)   SendMessageW(hdlg, WM_SETICON, ICON_BIG,   (LPARAM)hBig);
+
+        // The ICON control in the body: load at the DPI-scaled size
+        // the dialog reserves (30 DLU ~= 48 px @ 96 dpi) so the alpha
+        // channel stays crisp.
+        HWND icoCtl = GetDlgItem(hdlg, 2001);
+        if (icoCtl) {
+            RECT r; GetClientRect(icoCtl, &r);
+            int w = r.right - r.left, h = r.bottom - r.top;
+            int sz = (w < h ? w : h);
+            HICON hDisp = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(1),
+                                            IMAGE_ICON, sz, sz,
+                                            LR_DEFAULTCOLOR);
+            if (hDisp) {
+                SendMessageW(icoCtl, STM_SETICON, (WPARAM)hDisp, 0);
+            }
         }
 
-        // Bolder, larger "Lunar" title.  Derive from the dialog's own
-        // font so it matches whatever the shell substituted.
+        // Larger, semibold title derived from the dialog's own font.
         HFONT base = (HFONT)SendMessageW(hdlg, WM_GETFONT, 0, 0);
         LOGFONTW lf = { 0 };
         if (base && GetObjectW(base, sizeof(lf), &lf)) {
-            lf.lfHeight = (LONG)(lf.lfHeight * 1.45);
+            lf.lfHeight = (LONG)(lf.lfHeight * 1.7);
             lf.lfWeight = FW_SEMIBOLD;
             s_titleFont = CreateFontIndirectW(&lf);
             if (s_titleFont) {
@@ -1081,6 +1095,10 @@ static INT_PTR CALLBACK AboutDlgProc(HWND hdlg, UINT msg,
                                     (WPARAM)s_titleFont, TRUE);
             }
         }
+
+        // Cache a white brush for the static backgrounds so the dim
+        // version / tz labels paint onto the dialog's own colour.
+        s_bgBrush = GetSysColorBrush(COLOR_BTNFACE);
 
         // Time zone data line.
         const char *tzv = Tz_Version();
@@ -1093,6 +1111,20 @@ static INT_PTR CALLBACK AboutDlgProc(HWND hdlg, UINT msg,
         }
         SetDlgItemTextW(hdlg, 2006, tzLine);
         return TRUE;
+    }
+    case WM_CTLCOLORSTATIC: {
+        // Subdued gray for the "Version 0.2.0" and tz lines; default
+        // for everything else.  Dialog background is COLOR_BTNFACE.
+        HDC hdc = (HDC)wp;
+        int ctlId = GetDlgCtrlID((HWND)lp);
+        SetBkMode(hdc, TRANSPARENT);
+        if (ctlId == 2003 || ctlId == 2006) {
+            SetTextColor(hdc, RGB(120, 120, 120));
+        } else {
+            SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
+        }
+        return (INT_PTR)(s_bgBrush ? s_bgBrush
+                                   : GetSysColorBrush(COLOR_BTNFACE));
     }
     case WM_COMMAND:
         if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) {
