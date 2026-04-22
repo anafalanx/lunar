@@ -1044,24 +1044,73 @@ static void ApplyAlwaysOnTop(int on) {
                  0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
-static void ShowAbout(void) {
-    wchar_t tzLine[96] = L"Time zone database: unknown";
-    const char *tzv = Tz_Version();
-    if (tzv && *tzv) {
-        wchar_t ver[32] = L"";
-        MultiByteToWideChar(CP_UTF8, 0, tzv, -1, ver, 32);
-        ver[31] = 0;
-        swprintf(tzLine, 96, L"Time zone database: IANA %ls", ver);
-    }
+static INT_PTR CALLBACK AboutDlgProc(HWND hdlg, UINT msg,
+                                     WPARAM wp, LPARAM lp) {
+    (void)lp;
+    static HFONT s_titleFont = NULL;
+    switch (msg) {
+    case WM_INITDIALOG: {
+        HINSTANCE hi = GetModuleHandleW(NULL);
 
-    wchar_t msg[256];
-    swprintf(msg, 256,
-             L"Lunar 0.2.0\n\n"
-             L"A minimalist analog clock.\n"
-             L"Native Win32 + Direct2D.\n\n"
-             L"%ls",
-             tzLine);
-    MessageBoxW(g_hwnd, msg, L"About Lunar", MB_ICONINFORMATION | MB_OK);
+        // Caption icon (small) and the shown 32x32 ICON control.
+        HICON hSmall = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(1),
+                                         IMAGE_ICON,
+                                         GetSystemMetrics(SM_CXSMICON),
+                                         GetSystemMetrics(SM_CYSMICON),
+                                         LR_DEFAULTCOLOR);
+        HICON hBig   = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(1),
+                                         IMAGE_ICON, 32, 32,
+                                         LR_DEFAULTCOLOR);
+        if (hSmall) SendMessageW(hdlg, WM_SETICON, ICON_SMALL, (LPARAM)hSmall);
+        if (hBig) {
+            SendMessageW(hdlg, WM_SETICON, ICON_BIG, (LPARAM)hBig);
+            SendDlgItemMessageW(hdlg, 2001, STM_SETICON,
+                                (WPARAM)hBig, 0);
+        }
+
+        // Bolder, larger "Lunar" title.  Derive from the dialog's own
+        // font so it matches whatever the shell substituted.
+        HFONT base = (HFONT)SendMessageW(hdlg, WM_GETFONT, 0, 0);
+        LOGFONTW lf = { 0 };
+        if (base && GetObjectW(base, sizeof(lf), &lf)) {
+            lf.lfHeight = (LONG)(lf.lfHeight * 1.45);
+            lf.lfWeight = FW_SEMIBOLD;
+            s_titleFont = CreateFontIndirectW(&lf);
+            if (s_titleFont) {
+                SendDlgItemMessageW(hdlg, 2002, WM_SETFONT,
+                                    (WPARAM)s_titleFont, TRUE);
+            }
+        }
+
+        // Time zone data line.
+        const char *tzv = Tz_Version();
+        wchar_t tzLine[96] = L"Time zone data: unknown";
+        if (tzv && *tzv) {
+            wchar_t ver[32] = L"";
+            MultiByteToWideChar(CP_UTF8, 0, tzv, -1, ver, 32);
+            ver[31] = 0;
+            swprintf(tzLine, 96, L"Time zone data: IANA %ls", ver);
+        }
+        SetDlgItemTextW(hdlg, 2006, tzLine);
+        return TRUE;
+    }
+    case WM_COMMAND:
+        if (LOWORD(wp) == IDOK || LOWORD(wp) == IDCANCEL) {
+            EndDialog(hdlg, LOWORD(wp));
+            return TRUE;
+        }
+        break;
+    case WM_DESTROY:
+        if (s_titleFont) { DeleteObject(s_titleFont); s_titleFont = NULL; }
+        break;
+    }
+    return FALSE;
+}
+
+static void ShowAbout(void) {
+    DialogBoxParamW(GetModuleHandleW(NULL),
+                    MAKEINTRESOURCEW(101),
+                    g_hwnd, AboutDlgProc, 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -49,6 +49,28 @@ BEGIN
     PUSHBUTTON      "Cancel",                         IDCANCEL,217, 173,  52,  14
 END
 
+// -------------------------------------------------------------------
+// About dialog (IDD_ABOUT = 101)
+//
+// Minimal modal: app icon on the left, a small stack of labels on the
+// right, and a single OK button.  No runtime diagnostics -- the Log
+// viewer is where the sync / clockwork details live.
+// -------------------------------------------------------------------
+
+101 DIALOGEX 0, 0, 210, 115
+STYLE DS_SETFONT | DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "About Lunar"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    ICON            "",                               2001,    12,  12,  20,  20
+    LTEXT           "Lunar",                          2002,    46,  10, 150,  14
+    LTEXT           "Version 0.2.0",                  2003,    46,  26, 150,  10
+    LTEXT           "A minimalist analog clock.",     2004,    12,  50, 186,  10
+    LTEXT           "Native Win32 + Direct2D.",       2005,    12,  62, 186,  10
+    LTEXT           "",                               2006,    12,  76, 186,  10
+    DEFPUSHBUTTON   "OK",                             IDOK,   150,  94,  50,  14
+END
+
 1 VERSIONINFO
  FILEVERSION 0,2,0,0
  PRODUCTVERSION 0,2,0,0
