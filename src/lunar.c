@@ -1045,105 +1045,22 @@ static void ApplyAlwaysOnTop(int on) {
 }
 
 static void ShowAbout(void) {
-    wchar_t sync[128];
-    int64_t utc = Ntp_LastSyncUtcMs();
-    if (utc == 0) {
-        wcscpy_s(sync, 128, L"Last NTP sync: never");
-    } else {
-        // Display in the user's selected time zone (not the Windows
-        // system TZ): UtcMsToLocalTm honours g_tzId / UTC default.
-        struct tm lt = {0};
-        int msDummy = 0;
-        int okTm = UtcMsToLocalTm(utc, &lt, &msDummy);
-        // "ago" measured against our disciplined clockwork. If no
-        // trusted UTC is available yet, we simply omit the "ago"
-        // portion rather than reach for the Windows system clock.
-        int64_t nowUtc = 0;
-        int haveNow = Clock_NowUtcMs(&nowUtc);
-        if (!okTm) {
-            wcscpy_s(sync, 128, L"Last NTP sync: (tm conversion failed)");
-        } else if (!haveNow) {
-            swprintf(sync, 128,
-                     L"Last NTP sync: %02d:%02d:%02d",
-                     lt.tm_hour, lt.tm_min, lt.tm_sec);
-        } else {
-            int64_t agoS = (nowUtc - utc) / 1000;
-            if (agoS < 0) agoS = 0;
-            const wchar_t *unit; int64_t n;
-            if      (agoS < 60)    { n = agoS;         unit = (n == 1) ? L"second" : L"seconds"; }
-            else if (agoS < 3600)  { n = agoS / 60;    unit = (n == 1) ? L"minute" : L"minutes"; }
-            else if (agoS < 86400) { n = agoS / 3600;  unit = (n == 1) ? L"hour"   : L"hours"; }
-            else                   { n = agoS / 86400; unit = (n == 1) ? L"day"    : L"days"; }
-            swprintf(sync, 128,
-                     L"Last NTP sync: %02d:%02d:%02d  (%lld %s ago)",
-                     lt.tm_hour, lt.tm_min, lt.tm_sec, (long long)n, unit);
-        }
-    }
-    wchar_t msg[512];
-    int32_t ppm = Clock_RatePpm();
-    wchar_t disciplineLine[160];
-    if (!Clock_IsDisciplined()) {
-        swprintf(disciplineLine, 160,
-                 L"Clockwork: not yet disciplined (awaiting first sync)");
-    } else if (ppm == 0) {
-        swprintf(disciplineLine, 160,
-                 L"Clockwork: disciplined (single sample, rate pending)");
-    } else {
-        swprintf(disciplineLine, 160,
-                 L"Clockwork: %+d ppm  (QPC-anchored, system clock ignored)",
-                 (int)ppm);
+    wchar_t tzLine[96] = L"IANA tzdata: unknown";
+    const char *tzv = Tz_Version();
+    if (tzv && *tzv) {
+        wchar_t ver[32] = L"";
+        MultiByteToWideChar(CP_UTF8, 0, tzv, -1, ver, 32);
+        ver[31] = 0;
+        swprintf(tzLine, 96, L"IANA tzdata: %ls", ver);
     }
 
-    // Per-source snapshot from the most recent cycle.
-    NtpSourceResult r[NTP_SOURCE_COUNT];
-    int nok = Ntp_GetResults(r);
-    int64_t spread = Ntp_LastSpreadMs();
-    TrustState trust = Clock_Trust();
-
-    wchar_t trustLine[160];
-    swprintf(trustLine, 160,
-             L"Trust: %ls  (%d of %d sources, spread %lld ms)",
-             (trust == TRUST_OK) ? L"OK" : L"INOP",
-             nok, NTP_SOURCE_COUNT, (long long)spread);
-
-    wchar_t sourcesBlock[512] = { 0 };
-    int sbPos = 0;
-    for (int i = 0; i < NTP_SOURCE_COUNT; i++) {
-        wchar_t label[32] = L"?";
-        if (r[i].label) {
-            MultiByteToWideChar(CP_UTF8, 0, r[i].label, -1, label, 32);
-            label[31] = 0;
-        }
-        wchar_t line[128];
-        if (r[i].ok) {
-            swprintf(line, 128,
-                     L"  %-18ls ok   off %+5lld ms   rtt %4u ms\n",
-                     label, (long long)r[i].offsetMs,
-                     (unsigned)r[i].rttMs);
-        } else {
-            swprintf(line, 128,
-                     L"  %-18ls --   (no reply)\n",
-                     label);
-        }
-        int len = (int)wcslen(line);
-        if (sbPos + len < 511) {
-            wcscpy(sourcesBlock + sbPos, line);
-            sbPos += len;
-        }
-    }
-
-    swprintf(msg, 512,
+    wchar_t msg[256];
+    swprintf(msg, 256,
              L"Lunar 0.2.0\n\n"
              L"A minimalist analog clock.\n"
              L"Native Win32 + Direct2D.\n\n"
-             L"%s\n"
-             L"%s\n"
-             L"%s\n"
-             L"%s",
-             disciplineLine,
-             trustLine,
-             sourcesBlock,
-             sync);
+             L"%ls",
+             tzLine);
     MessageBoxW(g_hwnd, msg, L"About Lunar", MB_ICONINFORMATION | MB_OK);
 }
 
