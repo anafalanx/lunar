@@ -179,7 +179,7 @@ def main() -> int:
 
         print("\n4) System menu contents")
         items = collect_sys_menu(hwnd)
-        required = ["About Lunar", "Settings", "Sync clock", "Test beep", "Always on"]
+        required = ["About Lunar", "Settings", "Test beep", "Always on"]
         for needle in required:
             hit = any(needle in it for it in items)
             check(hit, f"menu item matching {needle!r} present")

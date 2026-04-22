@@ -108,34 +108,89 @@ static void test_wav_header(void) {
 // Timezone abbreviation table
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// IANA time-zone resolver (tz.c + tzif.c + embedded tzdata)
+// ---------------------------------------------------------------------------
+
+#include "../src/tz.h"
+
+static int64_t make_utc_ms(int y, int mo, int d, int h, int mi, int s) {
+    // Build a UTC millisecond value without any OS calls.  Walk
+    // through years; within the year use the zone-neutral
+    // days-per-month table.
+    static const int md[] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+    int64_t days = 0;
+    for (int yr = 1970; yr < y; yr++) {
+        int leap = ((yr % 4 == 0 && yr % 100 != 0) || (yr % 400 == 0));
+        days += leap ? 366 : 365;
+    }
+    int leap = ((y % 4 == 0 && y % 100 != 0) || (y % 400 == 0));
+    for (int i = 1; i < mo; i++) {
+        days += md[i - 1];
+        if (i == 2 && leap) days += 1;
+    }
+    days += (d - 1);
+    int64_t secs = days * 86400 + (int64_t)h * 3600
+                 + (int64_t)mi * 60 + s;
+    return secs * 1000;
+}
+
 static void test_tz_lookup(void) {
-    CHECK_EQ_STR(LookupTzAbbr("Pacific Standard Time",    0), "PST");
-    CHECK_EQ_STR(LookupTzAbbr("Pacific Standard Time",    1), "PDT");
-    CHECK_EQ_STR(LookupTzAbbr("Eastern Standard Time",    0), "EST");
-    CHECK_EQ_STR(LookupTzAbbr("Eastern Standard Time",    1), "EDT");
-    CHECK_EQ_STR(LookupTzAbbr("Central Standard Time",    0), "CST");
-    CHECK_EQ_STR(LookupTzAbbr("Central Standard Time",    1), "CDT");
-    CHECK_EQ_STR(LookupTzAbbr("Mountain Standard Time",   0), "MST");
-    CHECK_EQ_STR(LookupTzAbbr("Mountain Standard Time",   1), "MDT");
-    CHECK_EQ_STR(LookupTzAbbr("US Mountain Standard Time",0), "MST");
-    CHECK_EQ_STR(LookupTzAbbr("US Mountain Standard Time",1), "MST");
-    CHECK_EQ_STR(LookupTzAbbr("W. Europe Standard Time",  0), "CET");
-    CHECK_EQ_STR(LookupTzAbbr("W. Europe Standard Time",  1), "CEST");
-    CHECK_EQ_STR(LookupTzAbbr("Romance Standard Time",    0), "CET");
-    CHECK_EQ_STR(LookupTzAbbr("Romance Standard Time",    1), "CEST");
-    CHECK_EQ_STR(LookupTzAbbr("GMT Standard Time",        0), "GMT");
-    CHECK_EQ_STR(LookupTzAbbr("GMT Standard Time",        1), "BST");
-    CHECK_EQ_STR(LookupTzAbbr("Tokyo Standard Time",      0), "JST");
-    CHECK_EQ_STR(LookupTzAbbr("Tokyo Standard Time",      1), "JST");
-    CHECK_EQ_STR(LookupTzAbbr("India Standard Time",      0), "IST");
-    CHECK_EQ_STR(LookupTzAbbr("India Standard Time",      1), "IST");
-    CHECK_EQ_STR(LookupTzAbbr("AUS Eastern Standard Time",0), "AEST");
-    CHECK_EQ_STR(LookupTzAbbr("AUS Eastern Standard Time",1), "AEDT");
-    CHECK_EQ_STR(LookupTzAbbr("New Zealand Standard Time",0), "NZST");
-    CHECK_EQ_STR(LookupTzAbbr("New Zealand Standard Time",1), "NZDT");
-    // Unknown names must return NULL (falling through to initials logic).
-    CHECK(LookupTzAbbr("Bogus Fictional Time", 0) == NULL);
-    CHECK(LookupTzAbbr("",                     0) == NULL);
+    // UTC is always present, always index 0, offset 0, abbr "UTC".
+    CHECK_EQ_INT(Tz_FindByName("UTC"), TZ_ID_UTC);
+    CHECK(Tz_Count() > 1);
+    CHECK_EQ_STR(Tz_Name(TZ_ID_UTC), "UTC");
+
+    TzifLocal tl;
+    int64_t t = make_utc_ms(2026, 7, 1, 12, 0, 0);   // 2026-07-01 12:00:00Z
+    CHECK(Tz_LocalFromUtcMs(TZ_ID_UTC, t, &tl) == 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, 0);
+    CHECK_EQ_STR(tl.abbr, "UTC");
+    CHECK_EQ_INT(tl.hour, 12);
+
+    // Europe/Berlin in summer: CEST +02:00.
+    TzId berlin = Tz_FindByName("Europe/Berlin");
+    CHECK(berlin != TZ_ID_INVALID);
+    CHECK(Tz_LocalFromUtcMs(berlin, t, &tl) == 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, 7200);
+    CHECK_EQ_STR(tl.abbr, "CEST");
+    CHECK_EQ_INT(tl.isDst, 1);
+    CHECK_EQ_INT(tl.hour, 14);  // 12Z + 2h
+
+    // Europe/Berlin in winter: CET +01:00.
+    int64_t tw = make_utc_ms(2026, 1, 15, 12, 0, 0);
+    CHECK(Tz_LocalFromUtcMs(berlin, tw, &tl) == 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, 3600);
+    CHECK_EQ_STR(tl.abbr, "CET");
+    CHECK_EQ_INT(tl.isDst, 0);
+    CHECK_EQ_INT(tl.hour, 13);
+
+    // America/New_York in winter: EST -05:00.
+    TzId ny = Tz_FindByName("America/New_York");
+    CHECK(ny != TZ_ID_INVALID);
+    CHECK(Tz_LocalFromUtcMs(ny, tw, &tl) == 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, -5 * 3600);
+    CHECK_EQ_STR(tl.abbr, "EST");
+    CHECK_EQ_INT(tl.hour, 7);
+    CHECK_EQ_INT(tl.mday, 15);
+
+    // America/New_York in summer: EDT -04:00.
+    CHECK(Tz_LocalFromUtcMs(ny, t, &tl) == 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, -4 * 3600);
+    CHECK_EQ_STR(tl.abbr, "EDT");
+    CHECK_EQ_INT(tl.isDst, 1);
+
+    // Asia/Tokyo has no DST: JST +09:00 year round.
+    TzId tok = Tz_FindByName("Asia/Tokyo");
+    CHECK(tok != TZ_ID_INVALID);
+    CHECK(Tz_LocalFromUtcMs(tok, t, &tl) == 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, 9 * 3600);
+    CHECK_EQ_STR(tl.abbr, "JST");
+    CHECK_EQ_INT(tl.isDst, 0);
+
+    // Unknown names return invalid.
+    CHECK_EQ_INT(Tz_FindByName("Bogus/Fictional"), TZ_ID_INVALID);
+    CHECK_EQ_INT(Tz_FindByName(""),                TZ_ID_INVALID);
 }
 
 // ---------------------------------------------------------------------------

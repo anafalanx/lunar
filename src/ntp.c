@@ -575,8 +575,8 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
                    okCount, NTP_SOURCE_COUNT,
                    (long long)maxSpread,
                    (trust == TRUST_OK)
-                       ? "NTS+2-of-3 core within \xc2\xb1200ms"
-                       : "need NTS + 2-of-3 core within \xc2\xb1200ms",
+                       ? "NTS+2-of-3 core within \xc2\xb1" "200ms"
+                       : "need NTS + 2-of-3 core within \xc2\xb1" "200ms",
                    snapshot[NTP_NTS_SLOT].ok ? ntsLabel : "(NTS unavailable)");
         for (int i = 0; i < NTP_SOURCE_COUNT; i++) {
             const char *lbl  = snapshot[i].label ? snapshot[i].label : "?";
@@ -593,7 +593,7 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
                            iso);
             } else {
                 Log_Append("  [%d] %-18s  %-22s  FAIL  (no valid reply within "
-                           "%dms \x2014 DNS/timeout/blackhole/rate-limit)",
+                           "%dms \xe2\x80\x94" " DNS/timeout/blackhole/rate-limit)",
                            i, lbl, host,
                            (i == NTP_NTS_SLOT) ? NTS_SLOT_TIMEOUT_MS
                                                : NTP_TIMEOUT_MS);
@@ -696,7 +696,7 @@ void Ntp_Start(void) {
         Log_Append("ntp: sync requested but a cycle is already in flight");
         return;
     }
-    Log_Append("ntp: cycle start \x2014 querying 4 sources in parallel "
+    Log_Append("ntp: cycle start \xe2\x80\x94" " querying 4 sources in parallel "
                "(core timeout %dms, NTS timeout %dms)",
                NTP_TIMEOUT_MS, NTS_SLOT_TIMEOUT_MS);
     Log_Append("  core: NIST=%s  PTB=%s  NICT=%s  (UDP/123, SNTPv4)",

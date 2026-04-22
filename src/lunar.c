@@ -43,6 +43,7 @@
 #include "ntp.h"
 #include "clock.h"
 #include "logbuf.h"
+#include "tz.h"
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -132,7 +133,7 @@ static int                    g_alwaysOnTop  = 0;
 static int                    g_theme        = 0; // 0 dark, 1 light
 static int                    g_armed[12]    = { 0 };
 static float                  g_prevMins     = -1.0f;
-static char                   g_tzLabel[32]  = "";
+static char                   g_tzLabel[96]  = "";
 static DWORD                  g_lastNtpKickMs = 0;
 static int                    g_tzTicker     = 0;
 
@@ -140,10 +141,12 @@ static int                    g_tzTicker     = 0;
 static int                    g_chimesEnabled      = 1;
 static int                    g_unminimizeOnChime  = 0;
 static int                    g_confirmOnClose     = 0;
-// Selected display time zone as a Windows TimeZoneKeyName (e.g.
-// "Romance Standard Time" for Paris). Empty string means UTC. The
-// clockwork itself is always UTC; this controls the dial only.
-static wchar_t                g_tzKey[128]         = L"";
+// Selected display time zone as an IANA name (e.g. "Europe/Paris").
+// Empty string means UTC.  The clockwork itself is always UTC; this
+// controls only how local wall-clock components are rendered.  Zones
+// are resolved against tz_embed.c without any OS timezone call.
+static char                   g_tzIana[64]         = "";
+static TzId                   g_tzId               = TZ_ID_UTC;
 
 // ---------------------------------------------------------------------------
 // Persistence (carried over verbatim from the raylib build)
@@ -304,12 +307,11 @@ static void LoadSettings(void) {
         else if (sscanf(line, "unmin=%d",   &v) == 1) g_unminimizeOnChime = v ? 1 : 0;
         else if (sscanf(line, "confirm=%d", &v) == 1) g_confirmOnClose    = v ? 1 : 0;
         else if (strncmp(line, "tz=", 3) == 0) {
-            // tz key names are ASCII registry identifiers; still use
-            // MBCS -> wide conversion so any incidental non-ASCII in
-            // the file doesn't corrupt the key.
-            MultiByteToWideChar(CP_UTF8, 0, line + 3, -1,
-                                g_tzKey, sizeof(g_tzKey)/sizeof(wchar_t));
-            g_tzKey[sizeof(g_tzKey)/sizeof(wchar_t) - 1] = 0;
+            // IANA name (ASCII).  We copy it in raw; the resolver will
+            // silently reject unknown values (including obsolete
+            // Windows keys from pre-IANA builds).
+            const char *v = line + 3;
+            snprintf(g_tzIana, sizeof(g_tzIana), "%s", v);
         }
         line = strtok_s(NULL, "\r\n", &save);
     }
@@ -320,14 +322,13 @@ static void SaveSettings(void) {
     if (!path[0]) return;
     FILE *f = _wfopen(path, L"wb");
     if (!f) return;
-    char tz[256] = { 0 };
-    WideCharToMultiByte(CP_UTF8, 0, g_tzKey, -1, tz, sizeof(tz) - 1, NULL, NULL);
     fprintf(f,
             "chimes=%d\n"
             "unmin=%d\n"
             "confirm=%d\n"
             "tz=%s\n",
-            g_chimesEnabled, g_unminimizeOnChime, g_confirmOnClose, tz);
+            g_chimesEnabled, g_unminimizeOnChime, g_confirmOnClose,
+            g_tzIana);
     fclose(f);
 }
 
@@ -460,240 +461,88 @@ static void UpdateTitleBar(void) {
     }
 }
 
-// Map Microsoft's internal TZ names (TIME_ZONE_INFORMATION.StandardName,
-// always the *standard*-time form) to the commonly recognized standard
-// and daylight abbreviations. Windows' display names are historical and
-// not mnemonic (e.g. "Romance" = Paris, "FLE" = Helsinki/Kyiv), so the
-// first-letter-of-each-word fallback produces junk like "RDT" where the
-// user expects "CEST". Anything not listed falls back to that rule.
-typedef struct { const char *winName, *std, *dst; } TzMap;
-static const TzMap kTzMap[] = {
-    // Europe
-    { "GMT Standard Time",                     "GMT",  "BST"  }, // UK/Ireland
-    { "Greenwich Standard Time",               "GMT",  "GMT"  }, // Iceland, W. Africa
-    { "W. Europe Standard Time",               "CET",  "CEST" }, // Amsterdam/Berlin/Rome/Vienna
-    { "Romance Standard Time",                 "CET",  "CEST" }, // Paris/Brussels/Madrid/Copenhagen
-    { "Central European Standard Time",        "CET",  "CEST" }, // Warsaw/Budapest
-    { "Central Europe Standard Time",          "CET",  "CEST" }, // Prague/Belgrade
-    { "E. Europe Standard Time",               "EET",  "EEST" }, // Chisinau
-    { "FLE Standard Time",                     "EET",  "EEST" }, // Helsinki/Kyiv/Riga
-    { "GTB Standard Time",                     "EET",  "EEST" }, // Athens/Bucharest
-    { "Russian Standard Time",                 "MSK",  "MSK"  },
-    { "Turkey Standard Time",                  "TRT",  "TRT"  },
-    // Americas
-    { "Eastern Standard Time",                 "EST",  "EDT"  },
-    { "Central Standard Time",                 "CST",  "CDT"  },
-    { "Mountain Standard Time",                "MST",  "MDT"  },
-    { "US Mountain Standard Time",             "MST",  "MST"  }, // Arizona
-    { "Pacific Standard Time",                 "PST",  "PDT"  },
-    { "Alaskan Standard Time",                 "AKST", "AKDT" },
-    { "Hawaiian Standard Time",                "HST",  "HST"  },
-    { "Atlantic Standard Time",                "AST",  "ADT"  },
-    { "Newfoundland Standard Time",            "NST",  "NDT"  },
-    { "SA Pacific Standard Time",              "COT",  "COT"  },
-    { "E. South America Standard Time",        "BRT",  "BRT"  },
-    { "Argentina Standard Time",               "ART",  "ART"  },
-    // Asia / Pacific
-    { "India Standard Time",                   "IST",  "IST"  },
-    { "China Standard Time",                   "CST",  "CST"  },
-    { "Tokyo Standard Time",                   "JST",  "JST"  },
-    { "Korea Standard Time",                   "KST",  "KST"  },
-    { "Singapore Standard Time",               "SGT",  "SGT"  },
-    { "Taipei Standard Time",                  "CST",  "CST"  },
-    { "AUS Eastern Standard Time",             "AEST", "AEDT" }, // Sydney
-    { "Cen. Australia Standard Time",          "ACST", "ACDT" }, // Adelaide
-    { "AUS Central Standard Time",             "ACST", "ACST" }, // Darwin
-    { "W. Australia Standard Time",            "AWST", "AWST" }, // Perth
-    { "New Zealand Standard Time",             "NZST", "NZDT" },
-    // Middle East / Africa
-    { "Israel Standard Time",                  "IST",  "IDT"  },
-    { "Arab Standard Time",                    "AST",  "AST"  },
-    { "Arabian Standard Time",                 "GST",  "GST"  },
-    { "South Africa Standard Time",            "SAST", "SAST" },
-    { "Egypt Standard Time",                   "EET",  "EEST" },
-};
-
-static const char *LookupTzAbbr(const char *standardName, int isDst) {
-    for (size_t i = 0; i < sizeof(kTzMap)/sizeof(kTzMap[0]); i++) {
-        if (strcmp(standardName, kTzMap[i].winName) == 0) {
-            return isDst ? kTzMap[i].dst : kTzMap[i].std;
-        }
-    }
-    return NULL;
-}
-
+// Resolve g_tzIana to an embedded-tzdata ID and refresh the short
+// label used by the title bar ("CEST (UTC+2)" etc.).  Called once at
+// startup and again whenever the user changes the zone in Settings.
+// If g_tzIana is empty, or names a zone not present in the embedded
+// index, we fall back to UTC and clear the stored name so the bad
+// value never gets re-saved.
 static void UpdateTimezone(void) {
-    // Resolve the selected TimeZoneKeyName to a DYNAMIC_TIME_ZONE_INFORMATION
-    // so we can compute the *display* bias + DST state. If no zone is
-    // selected (g_tzKey is empty), we display UTC.
-    if (g_tzKey[0] == 0) {
+    if (g_tzIana[0] == 0) {
+        g_tzId = TZ_ID_UTC;
         snprintf(g_tzLabel, sizeof(g_tzLabel), "UTC");
         UpdateTitleBar();
         return;
     }
 
-    DYNAMIC_TIME_ZONE_INFORMATION dtzi = { 0 };
-    int found = 0;
-    for (DWORD i = 0; ; i++) {
-        DWORD rc = EnumDynamicTimeZoneInformation(i, &dtzi);
-        if (rc == ERROR_NO_MORE_ITEMS) break;
-        if (rc != ERROR_SUCCESS) continue;
-        if (wcscmp(dtzi.TimeZoneKeyName, g_tzKey) == 0) { found = 1; break; }
-    }
-    if (!found) {
-        // Selected key no longer exists on this system -- fall back to UTC.
-        g_tzKey[0] = 0;
+    TzId id = Tz_FindByName(g_tzIana);
+    if (id == TZ_ID_INVALID) {
+        // Selected IANA zone not present in the embedded index
+        // (obsolete name, or leftover Windows key from a pre-IANA
+        // build).  Fall back to UTC; do not clobber the saved file
+        // here -- SaveSettings() will flush the empty string next
+        // time the user touches Settings.
+        g_tzIana[0] = 0;
+        g_tzId = TZ_ID_UTC;
         snprintf(g_tzLabel, sizeof(g_tzLabel), "UTC");
         UpdateTitleBar();
         return;
     }
+    g_tzId = id;
 
-    // Determine whether DST is currently active in the selected zone
-    // by converting "now" both via the Ex API (honours DST) and via a
-    // fixed-standard-bias TIME_ZONE_INFORMATION; a difference means DST.
-    //
-    // "Now" must come from our disciplined clockwork, NEVER the Windows
-    // system clock. If the clockwork isn't trusted yet, there's no
-    // point evaluating DST -- show the STANDARD-time abbreviation until
-    // we get a real UTC from the NTP trio.
+    // Compute the offset + abbreviation that apply RIGHT NOW.  We only
+    // trust our disciplined clock for this; before the first good NTP
+    // cycle there is no sensible "now" to ask about.  While we wait we
+    // render just the IANA name.
     int64_t nowUtcMs = 0;
-    int haveNow = Clock_NowUtcMs(&nowUtcMs);
-    SYSTEMTIME nowUtc = { 0 };
-    if (haveNow) {
-        time_t t = (time_t)(nowUtcMs / 1000);
-        struct tm gm = { 0 };
-        if (gmtime_s(&gm, &t) == 0) {
-            nowUtc.wYear   = (WORD)(gm.tm_year + 1900);
-            nowUtc.wMonth  = (WORD)(gm.tm_mon + 1);
-            nowUtc.wDay    = (WORD)gm.tm_mday;
-            nowUtc.wHour   = (WORD)gm.tm_hour;
-            nowUtc.wMinute = (WORD)gm.tm_min;
-            nowUtc.wSecond = (WORD)gm.tm_sec;
-        } else {
-            haveNow = 0;
-        }
-    }
-    TIME_ZONE_INFORMATION tzi = { 0 };
-    tzi.Bias         = dtzi.Bias;
-    tzi.StandardBias = dtzi.StandardBias;
-    tzi.DaylightBias = dtzi.DaylightBias;
-    memcpy(&tzi.StandardDate, &dtzi.StandardDate, sizeof(SYSTEMTIME));
-    memcpy(&tzi.DaylightDate, &dtzi.DaylightDate, sizeof(SYSTEMTIME));
-    wcsncpy(tzi.StandardName, dtzi.StandardName, 32);
-    wcsncpy(tzi.DaylightName, dtzi.DaylightName, 32);
-
-    int isDst = 0;
-    if (haveNow) {
-        SYSTEMTIME localEx = { 0 }, localStd = { 0 };
-        SystemTimeToTzSpecificLocalTime(&tzi, &nowUtc, &localEx);
-        // Force-standard variant: zero out the daylight rule so the OS
-        // treats it as a no-DST zone.
-        TIME_ZONE_INFORMATION tziStd = tzi;
-        memset(&tziStd.DaylightDate, 0, sizeof(SYSTEMTIME));
-        tziStd.DaylightBias = tziStd.StandardBias;
-        SystemTimeToTzSpecificLocalTime(&tziStd, &nowUtc, &localStd);
-
-        isDst = (localEx.wHour != localStd.wHour
-              || localEx.wDay  != localStd.wDay
-              || localEx.wMinute != localStd.wMinute);
+    if (!Clock_NowUtcMs(&nowUtcMs)) {
+        snprintf(g_tzLabel, sizeof(g_tzLabel), "%s", g_tzIana);
+        UpdateTitleBar();
+        return;
     }
 
-    LONG biasMin = tzi.Bias + (isDst ? tzi.DaylightBias : tzi.StandardBias);
-    int utcOffsetH = -(int)biasMin / 60;
+    TzifLocal tl;
+    if (!Tz_LocalFromUtcMs(id, nowUtcMs, &tl)) {
+        snprintf(g_tzLabel, sizeof(g_tzLabel), "%s", g_tzIana);
+        UpdateTitleBar();
+        return;
+    }
 
-    char stdName[64] = { 0 };
-    WideCharToMultiByte(CP_UTF8, 0, tzi.StandardName, -1,
-                        stdName, sizeof(stdName) - 1, NULL, NULL);
-
-    char abbr[16] = { 0 };
-    const char *mapped = LookupTzAbbr(stdName, isDst);
-    if (mapped) {
-        size_t n = strlen(mapped);
-        if (n >= sizeof(abbr)) n = sizeof(abbr) - 1;
-        memcpy(abbr, mapped, n);
-        abbr[n] = '\0';
+    int offMin = tl.utcOffsetSec / 60;
+    int offH   = offMin / 60;
+    int offM   = offMin % 60;
+    if (offM < 0) offM = -offM;
+    if (offM == 0) {
+        snprintf(g_tzLabel, sizeof(g_tzLabel), "%s (UTC%+d)",
+                 tl.abbr[0] ? tl.abbr : g_tzIana, offH);
     } else {
-        const WCHAR *nameW = isDst ? tzi.DaylightName : tzi.StandardName;
-        char name[64] = { 0 };
-        WideCharToMultiByte(CP_UTF8, 0, nameW, -1,
-                            name, sizeof(name) - 1, NULL, NULL);
-        int ai = 0, atStart = 1;
-        for (int i = 0; name[i] && ai < (int)sizeof(abbr) - 1; i++) {
-            if (name[i] == ' ' || name[i] == '\t') { atStart = 1; continue; }
-            if (atStart) { abbr[ai++] = name[i]; atStart = 0; }
-        }
-        if (ai < 2) {
-            size_t n = strlen(name);
-            if (n >= sizeof(abbr)) n = sizeof(abbr) - 1;
-            memcpy(abbr, name, n);
-            abbr[n] = '\0';
-        }
+        snprintf(g_tzLabel, sizeof(g_tzLabel), "%s (UTC%+d:%02d)",
+                 tl.abbr[0] ? tl.abbr : g_tzIana, offH, offM);
     }
-
-    snprintf(g_tzLabel, sizeof(g_tzLabel), "%s (UTC%+d)", abbr, utcOffsetH);
     UpdateTitleBar();
 }
 
 // Convert disciplined UTC milliseconds to a struct tm in the display
 // zone, plus the sub-second ms part. Returns 1 on success, 0 on
-// failure (bad key, OS API failure). When g_tzKey is empty, renders UTC.
+// failure.  Uses ONLY the embedded IANA tzdata; no OS timezone call.
 static int UtcMsToLocalTm(int64_t utcMs, struct tm *out, int *outMs) {
     if (!out) return 0;
     int ms = (int)(utcMs % 1000);
     if (ms < 0) { ms += 1000; utcMs -= 1000; }
-    time_t t = (time_t)(utcMs / 1000);
     if (outMs) *outMs = ms;
 
-    if (g_tzKey[0] == 0) {
-        // UTC: gmtime_s is cheap, deterministic, and never fails for
-        // valid time_t.
-        return gmtime_s(out, &t) == 0 ? 1 : 0;
-    }
+    TzifLocal tl;
+    if (!Tz_LocalFromUtcMs(g_tzId, utcMs, &tl)) return 0;
 
-    struct tm gm = { 0 };
-    if (gmtime_s(&gm, &t) != 0) return 0;
-    SYSTEMTIME utcSt = {
-        .wYear   = (WORD)(gm.tm_year + 1900),
-        .wMonth  = (WORD)(gm.tm_mon + 1),
-        .wDay    = (WORD)gm.tm_mday,
-        .wHour   = (WORD)gm.tm_hour,
-        .wMinute = (WORD)gm.tm_min,
-        .wSecond = (WORD)gm.tm_sec,
-        .wMilliseconds = 0,
-        .wDayOfWeek    = (WORD)gm.tm_wday,
-    };
-
-    DYNAMIC_TIME_ZONE_INFORMATION dtzi = { 0 };
-    int found = 0;
-    for (DWORD i = 0; ; i++) {
-        DWORD rc = EnumDynamicTimeZoneInformation(i, &dtzi);
-        if (rc == ERROR_NO_MORE_ITEMS) break;
-        if (rc != ERROR_SUCCESS) continue;
-        if (wcscmp(dtzi.TimeZoneKeyName, g_tzKey) == 0) { found = 1; break; }
-    }
-    if (!found) return 0;
-
-    TIME_ZONE_INFORMATION tzi = { 0 };
-    tzi.Bias         = dtzi.Bias;
-    tzi.StandardBias = dtzi.StandardBias;
-    tzi.DaylightBias = dtzi.DaylightBias;
-    memcpy(&tzi.StandardDate, &dtzi.StandardDate, sizeof(SYSTEMTIME));
-    memcpy(&tzi.DaylightDate, &dtzi.DaylightDate, sizeof(SYSTEMTIME));
-    wcsncpy(tzi.StandardName, dtzi.StandardName, 32);
-    wcsncpy(tzi.DaylightName, dtzi.DaylightName, 32);
-
-    SYSTEMTIME localSt = { 0 };
-    if (!SystemTimeToTzSpecificLocalTime(&tzi, &utcSt, &localSt)) return 0;
-
-    out->tm_year = localSt.wYear - 1900;
-    out->tm_mon  = localSt.wMonth - 1;
-    out->tm_mday = localSt.wDay;
-    out->tm_hour = localSt.wHour;
-    out->tm_min  = localSt.wMinute;
-    out->tm_sec  = localSt.wSecond;
-    out->tm_wday = localSt.wDayOfWeek;
-    out->tm_yday = 0;    // not used by the clock face
-    out->tm_isdst = 0;
+    out->tm_year = tl.year - 1900;
+    out->tm_mon  = tl.month - 1;
+    out->tm_mday = tl.mday;
+    out->tm_hour = tl.hour;
+    out->tm_min  = tl.minute;
+    out->tm_sec  = tl.second;
+    out->tm_wday = tl.wday;
+    out->tm_yday = tl.yday;
+    out->tm_isdst = tl.isDst;
     return 1;
 }
 
@@ -1186,7 +1035,7 @@ static void ShowAbout(void) {
         wcscpy_s(sync, 128, L"Last NTP sync: never");
     } else {
         // Display in the user's selected time zone (not the Windows
-        // system TZ): UtcMsToLocalTm honours g_tzKey / UTC default.
+        // system TZ): UtcMsToLocalTm honours g_tzId / UTC default.
         struct tm lt = {0};
         int msDummy = 0;
         int okTm = UtcMsToLocalTm(utc, &lt, &msDummy);
@@ -1484,32 +1333,23 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM l
         CheckDlgButton(hdlg, IDC_CHK_CONFIRM_CLOSE,
                        g_confirmOnClose ? BST_CHECKED : BST_UNCHECKED);
 
-        // Populate the timezone combobox. Entry 0 is always "UTC"
-        // (corresponding to g_tzKey == L""). Subsequent entries are
-        // every Windows dynamic time zone on this machine, shown by
-        // their localized DisplayName but keyed on the stable
-        // TimeZoneKeyName stored via SetItemData.
+        // Populate the timezone combobox from the embedded IANA
+        // zoneinfo index.  Entry 0 is always "UTC" (TZ_ID_UTC); every
+        // other entry carries its Tz_AtIndex(i) integer ID in the item
+        // data.  No OS timezone API is consulted.
         HWND cb = GetDlgItem(hdlg, IDC_CBO_TZ);
-        int idxUtc = (int)SendMessageW(cb, CB_ADDSTRING, 0,
-                                        (LPARAM)L"UTC (no offset)");
-        SendMessageW(cb, CB_SETITEMDATA, idxUtc, (LPARAM)0);
-        int selected = idxUtc;
-
-        for (DWORD i = 0; ; i++) {
-            DYNAMIC_TIME_ZONE_INFORMATION dtzi = { 0 };
-            DWORD rc = EnumDynamicTimeZoneInformation(i, &dtzi);
-            if (rc == ERROR_NO_MORE_ITEMS) break;
-            if (rc != ERROR_SUCCESS) continue;
-            // Use the localized display name for the dropdown.
-            int idx = (int)SendMessageW(cb, CB_ADDSTRING, 0,
-                                         (LPARAM)dtzi.StandardName);
+        int selected = 0;
+        int n = Tz_Count();
+        for (int i = 0; i < n; i++) {
+            const char *name = Tz_AtIndex(i);
+            if (!name) continue;
+            wchar_t w[64];
+            MultiByteToWideChar(CP_UTF8, 0, name, -1, w,
+                                sizeof(w) / sizeof(w[0]));
+            int idx = (int)SendMessageW(cb, CB_ADDSTRING, 0, (LPARAM)w);
             if (idx == CB_ERR || idx == CB_ERRSPACE) continue;
-            // Allocate a copy of the key name to survive CB_SORT.
-            wchar_t *keyCopy = (wchar_t*)malloc(sizeof(dtzi.TimeZoneKeyName));
-            if (!keyCopy) continue;
-            memcpy(keyCopy, dtzi.TimeZoneKeyName, sizeof(dtzi.TimeZoneKeyName));
-            SendMessageW(cb, CB_SETITEMDATA, idx, (LPARAM)keyCopy);
-            if (g_tzKey[0] && wcscmp(keyCopy, g_tzKey) == 0) selected = idx;
+            SendMessageW(cb, CB_SETITEMDATA, idx, (LPARAM)(INT_PTR)i);
+            if (i == g_tzId) selected = idx;
         }
         SendMessageW(cb, CB_SETCURSEL, selected, 0);
         return TRUE;
@@ -1526,12 +1366,14 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM l
             int sel = (int)SendMessageW(cb, CB_GETCURSEL, 0, 0);
             if (sel != CB_ERR) {
                 LPARAM data = SendMessageW(cb, CB_GETITEMDATA, sel, 0);
-                if (data == 0) {
-                    g_tzKey[0] = 0;   // UTC
+                TzId id = (TzId)(INT_PTR)data;
+                const char *nm = Tz_Name(id);
+                if (!nm || id == TZ_ID_UTC) {
+                    g_tzIana[0] = 0;
+                    g_tzId = TZ_ID_UTC;
                 } else {
-                    const wchar_t *key = (const wchar_t*)data;
-                    wcsncpy(g_tzKey, key, sizeof(g_tzKey)/sizeof(wchar_t) - 1);
-                    g_tzKey[sizeof(g_tzKey)/sizeof(wchar_t) - 1] = 0;
+                    snprintf(g_tzIana, sizeof(g_tzIana), "%s", nm);
+                    g_tzId = id;
                 }
             }
 
@@ -1539,22 +1381,10 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM l
             UpdateTimezone();
             InvalidateRect(g_hwnd, NULL, FALSE);
 
-            // Free the per-item key-name copies we stashed in item data.
-            int n = (int)SendMessageW(cb, CB_GETCOUNT, 0, 0);
-            for (int i = 0; i < n; i++) {
-                LPARAM d = SendMessageW(cb, CB_GETITEMDATA, i, 0);
-                if (d) free((void*)d);
-            }
             EndDialog(hdlg, IDOK);
             return TRUE;
         }
         case IDCANCEL: {
-            HWND cb = GetDlgItem(hdlg, IDC_CBO_TZ);
-            int n = (int)SendMessageW(cb, CB_GETCOUNT, 0, 0);
-            for (int i = 0; i < n; i++) {
-                LPARAM d = SendMessageW(cb, CB_GETITEMDATA, i, 0);
-                if (d) free((void*)d);
-            }
             EndDialog(hdlg, IDCANCEL);
             return TRUE;
         }
