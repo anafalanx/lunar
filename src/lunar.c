@@ -1068,13 +1068,12 @@ static INT_PTR CALLBACK AboutDlgProc(HWND hdlg, UINT msg,
         if (hBig)   SendMessageW(hdlg, WM_SETICON, ICON_BIG,   (LPARAM)hBig);
 
         // The ICON control in the body: load at the DPI-scaled size
-        // the dialog reserves (30 DLU ~= 48 px @ 96 dpi) so the alpha
-        // channel stays crisp.
+        // the dialog reserves so the alpha channel stays crisp.
         HWND icoCtl = GetDlgItem(hdlg, 2001);
         if (icoCtl) {
-            RECT r; GetClientRect(icoCtl, &r);
-            int w = r.right - r.left, h = r.bottom - r.top;
-            int sz = (w < h ? w : h);
+            UINT dpi = GetDpiForWindow(hdlg);
+            if (!dpi) dpi = 96;
+            int sz = MulDiv(42, dpi, 96);
             HICON hDisp = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(1),
                                             IMAGE_ICON, sz, sz,
                                             LR_DEFAULTCOLOR);
@@ -1936,7 +1935,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 #ifndef LUNAR_NO_MAIN
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
-    (void)hPrev; (void)cmdLine;
+    (void)hPrev;
+    (void)cmdLine;
 
     // Enable Per-Monitor-V2 DPI awareness so the system menu, title bar,
     // and dialogs are rendered at native pixel density instead of being
