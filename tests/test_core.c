@@ -1294,6 +1294,434 @@ static void test_nts_pool_pins(void) {
 }
 
 // ---------------------------------------------------------------------------
+// IANA resolver: edge zones + malformed-input defense
+// ---------------------------------------------------------------------------
+
+static void test_tz_bounds(void) {
+    // Version string is present and non-empty.
+    const char *ver = Tz_Version();
+    CHECK(ver != NULL);
+    CHECK(ver[0] != 0);
+
+    // UTC is always at index 0 and resolves back to its name.
+    CHECK_EQ_STR(Tz_AtIndex(0), "UTC");
+    CHECK_EQ_STR(Tz_Name(TZ_ID_UTC), "UTC");
+
+    // Tz_Count must match the range of valid indices.
+    int n = Tz_Count();
+    CHECK(n >= 100);  // sanity: at least a hundred canonical zones
+    CHECK(Tz_AtIndex(n - 1) != NULL);
+
+    // Out-of-range lookups return NULL without walking off the table.
+    CHECK(Tz_AtIndex(-1) == NULL);
+    CHECK(Tz_AtIndex(n)   == NULL);
+    CHECK(Tz_AtIndex(n + 1000) == NULL);
+    CHECK(Tz_Name(TZ_ID_INVALID) == NULL);
+    CHECK(Tz_Name((TzId)(n + 1))  == NULL);
+
+    // NULL / empty names return invalid.
+    CHECK_EQ_INT(Tz_FindByName(NULL), TZ_ID_INVALID);
+    CHECK_EQ_INT(Tz_FindByName(""),   TZ_ID_INVALID);
+
+    // Resolve with invalid id returns 0 (failure), does not crash.
+    TzifLocal tl;
+    CHECK_EQ_INT(Tz_LocalFromUtcMs(TZ_ID_INVALID, 0, &tl), 0);
+    CHECK_EQ_INT(Tz_LocalFromUtcMs((TzId)(n + 1), 0, &tl), 0);
+    // NULL out also rejected.
+    CHECK_EQ_INT(Tz_LocalFromUtcMs(TZ_ID_UTC, 0, NULL), 0);
+}
+
+static void test_tz_southern_hemisphere(void) {
+    // Southern-hemisphere zones are a stress-test for the POSIX-footer
+    // resolver: DST runs Oct->Apr, so the "end" rule falls in the
+    // *next* calendar year relative to the "start". rule_local_sec
+    // must be evaluated for Y-1/Y/Y+1 and the latest applicable one
+    // picked -- otherwise Jan 15 resolves to "not yet in DST".
+    TzifLocal tl;
+
+    // 2026-01-15 12:00:00Z -> Sydney should be AEDT +11:00 (summer/DST).
+    TzId syd = Tz_FindByName("Australia/Sydney");
+    CHECK(syd != TZ_ID_INVALID);
+    int64_t jan = make_utc_ms(2026, 1, 15, 12, 0, 0);
+    CHECK(Tz_LocalFromUtcMs(syd, jan, &tl) == 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, 11 * 3600);
+    CHECK_EQ_STR(tl.abbr, "AEDT");
+    CHECK_EQ_INT(tl.isDst, 1);
+    CHECK_EQ_INT(tl.hour, 23);         // 12Z + 11h
+    CHECK_EQ_INT(tl.mday, 15);
+
+    // 2026-07-15 12:00:00Z -> Sydney should be AEST +10:00 (winter).
+    int64_t jul = make_utc_ms(2026, 7, 15, 12, 0, 0);
+    CHECK(Tz_LocalFromUtcMs(syd, jul, &tl) == 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, 10 * 3600);
+    CHECK_EQ_STR(tl.abbr, "AEST");
+    CHECK_EQ_INT(tl.isDst, 0);
+
+    // 2026-01-15 -> Auckland NZDT +13:00 (summer/DST).
+    TzId akl = Tz_FindByName("Pacific/Auckland");
+    CHECK(akl != TZ_ID_INVALID);
+    CHECK(Tz_LocalFromUtcMs(akl, jan, &tl) == 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, 13 * 3600);
+    CHECK_EQ_STR(tl.abbr, "NZDT");
+    CHECK_EQ_INT(tl.isDst, 1);
+
+    // 2026-07-15 -> Auckland NZST +12:00 (winter).
+    CHECK(Tz_LocalFromUtcMs(akl, jul, &tl) == 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, 12 * 3600);
+    CHECK_EQ_STR(tl.abbr, "NZST");
+    CHECK_EQ_INT(tl.isDst, 0);
+}
+
+static void test_tz_half_hour_zones(void) {
+    TzifLocal tl;
+    int64_t t = make_utc_ms(2026, 6, 15, 12, 0, 0);
+
+    // India Standard Time: +05:30 year-round, no DST.
+    TzId kol = Tz_FindByName("Asia/Kolkata");
+    CHECK(kol != TZ_ID_INVALID);
+    CHECK(Tz_LocalFromUtcMs(kol, t, &tl) == 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, 5 * 3600 + 30 * 60);
+    CHECK_EQ_STR(tl.abbr, "IST");
+    CHECK_EQ_INT(tl.isDst, 0);
+    CHECK_EQ_INT(tl.hour, 17);
+    CHECK_EQ_INT(tl.minute, 30);
+
+    // Nepal: +05:45, the only 45-minute offset still in use.
+    TzId ktm = Tz_FindByName("Asia/Kathmandu");
+    CHECK(ktm != TZ_ID_INVALID);
+    CHECK(Tz_LocalFromUtcMs(ktm, t, &tl) == 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, 5 * 3600 + 45 * 60);
+    CHECK_EQ_INT(tl.hour, 17);
+    CHECK_EQ_INT(tl.minute, 45);
+
+    // Adelaide (South Australia): ACDT +10:30 in summer, ACST +09:30
+    // in winter.  Pick both sides to exercise the half-hour + DST
+    // combination.
+    TzId adl = Tz_FindByName("Australia/Adelaide");
+    CHECK(adl != TZ_ID_INVALID);
+    int64_t jan = make_utc_ms(2026, 1, 15, 12, 0, 0);
+    CHECK(Tz_LocalFromUtcMs(adl, jan, &tl) == 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, 10 * 3600 + 30 * 60);
+    CHECK_EQ_INT(tl.isDst, 1);
+    CHECK_EQ_STR(tl.abbr, "ACDT");
+
+    int64_t jul = make_utc_ms(2026, 7, 15, 12, 0, 0);
+    CHECK(Tz_LocalFromUtcMs(adl, jul, &tl) == 1);
+    CHECK_EQ_INT(tl.utcOffsetSec, 9 * 3600 + 30 * 60);
+    CHECK_EQ_INT(tl.isDst, 0);
+    CHECK_EQ_STR(tl.abbr, "ACST");
+}
+
+static void test_tz_all_zones_smoke(void) {
+    // Iterate every embedded zone and assert a resolution at a single
+    // arbitrary "now" produces plausible values.  Catches a corrupt
+    // blob table, a bad index, or any zone whose footer our parser
+    // rejects.
+    int64_t t = make_utc_ms(2026, 6, 15, 12, 0, 0);
+    int n = Tz_Count();
+    int failures = 0;
+    for (int i = 0; i < n; i++) {
+        TzifLocal tl;
+        const char *name = Tz_AtIndex(i);
+        if (!name) { failures++; continue; }
+        if (Tz_LocalFromUtcMs((TzId)i, t, &tl) != 1) { failures++; continue; }
+
+        // Offsets on Earth today fall between -12:00 (Baker Island) and
+        // +14:00 (Kiribati). Allow a small margin for LMT historical
+        // outliers just in case.
+        if (tl.utcOffsetSec < -13 * 3600 || tl.utcOffsetSec > 15 * 3600) failures++;
+        if (tl.year  < 2025 || tl.year  > 2027) failures++;
+        if (tl.month < 1    || tl.month > 12)   failures++;
+        if (tl.mday  < 1    || tl.mday  > 31)   failures++;
+        if (tl.hour  < 0    || tl.hour  > 23)   failures++;
+        if (tl.minute < 0   || tl.minute > 59)  failures++;
+        if (tl.wday  < 0    || tl.wday  > 6)    failures++;
+        if (tl.yday  < 0    || tl.yday  > 365)  failures++;
+        if (tl.abbr[TZIF_ABBR_CAP - 1] != 0)    failures++;   // must be NUL
+        if (tl.abbr[0] == 0)                    failures++;   // non-empty
+    }
+    CHECK_EQ_INT(failures, 0);
+}
+
+static void test_tzif_malformed(void) {
+    // Defense in depth: even though we ship the blob ourselves, the
+    // parser must reject a truncated / corrupted input without reading
+    // past bounds or crashing.
+    TzifLocal tl;
+    uint8_t buf[256];
+
+    // NULL blob.
+    CHECK_EQ_INT(tzif_resolve(NULL, 128, 0, &tl), 0);
+
+    // Blob too short for even a header.
+    memset(buf, 0, sizeof buf);
+    CHECK_EQ_INT(tzif_resolve(buf, 10, 0, &tl), 0);
+
+    // Correct length but wrong magic.
+    memset(buf, 0, sizeof buf);
+    memcpy(buf, "NOPE", 4);
+    buf[4] = '2';
+    CHECK_EQ_INT(tzif_resolve(buf, 44, 0, &tl), 0);
+
+    // TZif but version '1' (unsupported -- modern zic always writes 2+).
+    memset(buf, 0, sizeof buf);
+    memcpy(buf, "TZif", 4);
+    buf[4] = '1';
+    CHECK_EQ_INT(tzif_resolve(buf, 44, 0, &tl), 0);
+
+    // TZif version '2' with header claiming nonzero counts but buffer
+    // too small to contain the v1 data block.
+    memset(buf, 0, sizeof buf);
+    memcpy(buf, "TZif", 4);
+    buf[4] = '2';
+    // 6 counts at offset 20..44.  Set tcnt=100, typec=10, charc=100
+    // (needs hundreds of bytes we don't have).
+    buf[20 + 12 + 0] = 0; buf[20 + 12 + 1] = 0;
+    buf[20 + 12 + 2] = 0; buf[20 + 12 + 3] = 100;
+    buf[20 + 16 + 0] = 0; buf[20 + 16 + 1] = 0;
+    buf[20 + 16 + 2] = 0; buf[20 + 16 + 3] = 10;
+    buf[20 + 20 + 0] = 0; buf[20 + 20 + 1] = 0;
+    buf[20 + 20 + 2] = 0; buf[20 + 20 + 3] = 100;
+    CHECK_EQ_INT(tzif_resolve(buf, 44, 0, &tl), 0);
+
+    // Truncated right after v1 magic but before v2.
+    memset(buf, 0, sizeof buf);
+    memcpy(buf, "TZif", 4); buf[4] = '2';
+    // Claim zero counts in v1 so v1 end is at 44.
+    CHECK_EQ_INT(tzif_resolve(buf, 60, 0, &tl), 0);   // v2 header can't fit
+
+    // Legitimate v1 empty + v2 missing magic.
+    memset(buf, 0, sizeof buf);
+    memcpy(buf, "TZif", 4); buf[4] = '2';
+    // v1 empty -> v2 expected at offset 44; leave it zero (wrong magic).
+    CHECK_EQ_INT(tzif_resolve(buf, 256, 0, &tl), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Calendar breakdown: proleptic Gregorian math via Tz_LocalFromUtcMs(UTC)
+// ---------------------------------------------------------------------------
+
+static void test_breakdown_leap_years(void) {
+    TzifLocal tl;
+    // 1970-01-01 00:00:00Z was a Thursday (wday=4).
+    CHECK(Tz_LocalFromUtcMs(TZ_ID_UTC, 0, &tl) == 1);
+    CHECK_EQ_INT(tl.year, 1970);
+    CHECK_EQ_INT(tl.month, 1);
+    CHECK_EQ_INT(tl.mday, 1);
+    CHECK_EQ_INT(tl.wday, 4);
+    CHECK_EQ_INT(tl.yday, 0);
+
+    // 1969-12-31 23:59:59Z -- one second before the epoch.  Must break
+    // down to Dec 31 1969, not wrap.
+    CHECK(Tz_LocalFromUtcMs(TZ_ID_UTC, -1000, &tl) == 1);
+    CHECK_EQ_INT(tl.year, 1969);
+    CHECK_EQ_INT(tl.month, 12);
+    CHECK_EQ_INT(tl.mday, 31);
+    CHECK_EQ_INT(tl.hour, 23);
+    CHECK_EQ_INT(tl.minute, 59);
+    CHECK_EQ_INT(tl.second, 59);
+
+    // 2000-02-29 12:00:00Z -- leap year (divisible by 400).
+    int64_t t = make_utc_ms(2000, 2, 29, 12, 0, 0);
+    CHECK(Tz_LocalFromUtcMs(TZ_ID_UTC, t, &tl) == 1);
+    CHECK_EQ_INT(tl.year, 2000);
+    CHECK_EQ_INT(tl.month, 2);
+    CHECK_EQ_INT(tl.mday, 29);
+    CHECK_EQ_INT(tl.yday, 59);  // Jan(31) + Feb 29 offset = 31 + 28 = 59
+
+    // 2024-02-29 -- ordinary leap year (divisible by 4, not 100).
+    t = make_utc_ms(2024, 2, 29, 0, 0, 0);
+    CHECK(Tz_LocalFromUtcMs(TZ_ID_UTC, t, &tl) == 1);
+    CHECK_EQ_INT(tl.year, 2024);
+    CHECK_EQ_INT(tl.month, 2);
+    CHECK_EQ_INT(tl.mday, 29);
+
+    // 2100-03-01 00:00:00Z -- NOT a leap year (divisible by 100 but
+    // not 400).  Feb 2100 has 28 days, so Mar 1 00:00 lies at the
+    // correct offset.
+    t = make_utc_ms(2100, 3, 1, 0, 0, 0);
+    CHECK(Tz_LocalFromUtcMs(TZ_ID_UTC, t, &tl) == 1);
+    CHECK_EQ_INT(tl.year, 2100);
+    CHECK_EQ_INT(tl.month, 3);
+    CHECK_EQ_INT(tl.mday, 1);
+    CHECK_EQ_INT(tl.yday, 59);  // Jan(31) + Feb(28) = 59
+
+    // 2026-12-31 23:59:59Z -- end of year, yday == 364 (non-leap).
+    t = make_utc_ms(2026, 12, 31, 23, 59, 59);
+    CHECK(Tz_LocalFromUtcMs(TZ_ID_UTC, t, &tl) == 1);
+    CHECK_EQ_INT(tl.yday, 364);
+    CHECK_EQ_INT(tl.wday, 4);   // 2026-12-31 is a Thursday
+
+    // Leap-year-31-Dec: 2024-12-31 has yday == 365.
+    t = make_utc_ms(2024, 12, 31, 0, 0, 0);
+    CHECK(Tz_LocalFromUtcMs(TZ_ID_UTC, t, &tl) == 1);
+    CHECK_EQ_INT(tl.yday, 365);
+}
+
+// ---------------------------------------------------------------------------
+// UpdateTimezone label formatting
+// ---------------------------------------------------------------------------
+//
+// We force a disciplined clock at a known UTC instant, set g_tzIana,
+// call UpdateTimezone(), and check g_tzLabel directly.  Covers the
+// full-hour, half-hour, and negative-offset branches of the format
+// string.
+
+static void force_clock_at(int64_t utcMs) {
+    // Align the disciplined clock so Clock_NowUtcMs() returns utcMs
+    // (approximately).  Reset first so Clock_OnPollCycle's >200 ms
+    // "local oscillator fault" guard doesn't trip when the test
+    // jumps between instants years apart.
+    Clock_Shutdown();
+    Clock_Init();
+    Clock_OnPollCycle(TRUST_OK, utcMs, Clock_Qpc(), 0);
+}
+
+static void test_tz_label_format(void) {
+    // Make sure the clock is disciplined at a known instant so
+    // UpdateTimezone can compute offset/abbr branches.
+    force_clock_at(make_utc_ms(2026, 6, 15, 12, 0, 0));
+    CHECK(Clock_IsDisciplined());
+
+    // UTC -> bare "UTC" (no offset suffix).
+    g_tzIana[0] = 0;
+    UpdateTimezone();
+    CHECK_EQ_STR(g_tzLabel, "UTC");
+    CHECK_EQ_INT(g_tzId, TZ_ID_UTC);
+
+    // Europe/Berlin summer (2026-07-01 12:00Z): CEST +02:00.
+    force_clock_at(make_utc_ms(2026, 7, 1, 12, 0, 0));
+    snprintf(g_tzIana, sizeof g_tzIana, "Europe/Berlin");
+    UpdateTimezone();
+    CHECK_EQ_STR(g_tzLabel, "CEST (UTC+2)");
+
+    // America/New_York winter (2026-01-15 12:00Z): EST -05:00.
+    force_clock_at(make_utc_ms(2026, 1, 15, 12, 0, 0));
+    snprintf(g_tzIana, sizeof g_tzIana, "America/New_York");
+    UpdateTimezone();
+    CHECK_EQ_STR(g_tzLabel, "EST (UTC-5)");
+
+    // Asia/Kolkata: IST +05:30 exercises the half-hour branch.
+    force_clock_at(make_utc_ms(2026, 6, 15, 12, 0, 0));
+    snprintf(g_tzIana, sizeof g_tzIana, "Asia/Kolkata");
+    UpdateTimezone();
+    CHECK_EQ_STR(g_tzLabel, "IST (UTC+5:30)");
+
+    // Asia/Kathmandu: +05:45 (45-minute offset, edge of format).
+    snprintf(g_tzIana, sizeof g_tzIana, "Asia/Kathmandu");
+    UpdateTimezone();
+    // Abbreviation differs across tzdata vintages ("+0545" in slim,
+    // "NPT" in older).  Assert structural shape instead of exact tag.
+    CHECK(strstr(g_tzLabel, "(UTC+5:45)") != NULL);
+
+    // Invalid name -> falls back to UTC and clears g_tzIana.
+    snprintf(g_tzIana, sizeof g_tzIana, "Bogus/Nowhere");
+    UpdateTimezone();
+    CHECK_EQ_STR(g_tzLabel, "UTC");
+    CHECK_EQ_INT(g_tzIana[0], 0);
+    CHECK_EQ_INT(g_tzId, TZ_ID_UTC);
+}
+
+// ---------------------------------------------------------------------------
+// Settings load / save round-trip
+// ---------------------------------------------------------------------------
+
+static void redirect_appdata_to_scratch(void) {
+    wchar_t scratchW[MAX_PATH + 32];
+    wchar_t cwd[MAX_PATH]; GetCurrentDirectoryW(MAX_PATH, cwd);
+    _snwprintf(scratchW, MAX_PATH + 32, L"%ls\\build\\test_scratch", cwd);
+    _wmkdir(scratchW);
+    wchar_t envsetW[MAX_PATH + 48];
+    _snwprintf(envsetW, MAX_PATH + 48, L"APPDATA=%ls", scratchW);
+    _wputenv(envsetW);
+}
+
+static void wipe_settings_file(void) {
+    wchar_t path[MAX_PATH]; SettingsPathW(path, MAX_PATH);
+    if (path[0]) _wremove(path);
+}
+
+static void test_settings_roundtrip(void) {
+    redirect_appdata_to_scratch();
+    wipe_settings_file();
+
+    // Seed known values and save.
+    g_chimesEnabled     = 0;
+    g_unminimizeOnChime = 1;
+    g_confirmOnClose    = 1;
+    snprintf(g_tzIana, sizeof g_tzIana, "Europe/Paris");
+    SaveSettings();
+
+    // Perturb memory state, then reload from disk.
+    g_chimesEnabled     = 1;
+    g_unminimizeOnChime = 0;
+    g_confirmOnClose    = 0;
+    g_tzIana[0] = 0;
+    LoadSettings();
+
+    CHECK_EQ_INT(g_chimesEnabled,     0);
+    CHECK_EQ_INT(g_unminimizeOnChime, 1);
+    CHECK_EQ_INT(g_confirmOnClose,    1);
+    CHECK_EQ_STR(g_tzIana, "Europe/Paris");
+
+    // UTC (empty string) must survive the round-trip too.
+    g_tzIana[0] = 0;
+    SaveSettings();
+    snprintf(g_tzIana, sizeof g_tzIana, "Polluted/Value");
+    LoadSettings();
+    CHECK_EQ_INT(g_tzIana[0], 0);
+}
+
+static void test_settings_legacy_v1(void) {
+    // A pre-v2 settings file has no '=' separators and stored only the
+    // three int flags on a single line.  LoadSettings must accept it
+    // and leave g_tzIana empty (no tz field existed back then).
+    redirect_appdata_to_scratch();
+    wchar_t path[MAX_PATH]; SettingsPathW(path, MAX_PATH);
+    FILE *f = _wfopen(path, L"wb");
+    CHECK(f != NULL);
+    if (!f) return;
+    fputs("0 1 1\n", f);
+    fclose(f);
+
+    g_chimesEnabled     = 1;
+    g_unminimizeOnChime = 0;
+    g_confirmOnClose    = 0;
+    snprintf(g_tzIana, sizeof g_tzIana, "Pre/Existing");
+    LoadSettings();
+
+    CHECK_EQ_INT(g_chimesEnabled,     0);
+    CHECK_EQ_INT(g_unminimizeOnChime, 1);
+    CHECK_EQ_INT(g_confirmOnClose,    1);
+    // The v1 loader never touches tz -- whatever was in memory stays.
+    CHECK_EQ_STR(g_tzIana, "Pre/Existing");
+}
+
+static void test_settings_invalid_tz(void) {
+    // A settings file with an unknown IANA name must load the string
+    // verbatim (users deserve a stable feedback loop) and then have
+    // UpdateTimezone fall back to UTC, clearing the in-memory name.
+    redirect_appdata_to_scratch();
+    wchar_t path[MAX_PATH]; SettingsPathW(path, MAX_PATH);
+    FILE *f = _wfopen(path, L"wb");
+    CHECK(f != NULL);
+    if (!f) return;
+    fputs("chimes=1\nunmin=0\nconfirm=0\ntz=Atlantis/Capital\n", f);
+    fclose(f);
+
+    g_tzIana[0] = 0;
+    LoadSettings();
+    CHECK_EQ_STR(g_tzIana, "Atlantis/Capital");
+
+    // Resolver must reject, fall back to UTC, and wipe the in-memory
+    // name (see UpdateTimezone contract).
+    UpdateTimezone();
+    CHECK_EQ_INT(g_tzId, TZ_ID_UTC);
+    CHECK_EQ_INT(g_tzIana[0], 0);
+    CHECK_EQ_STR(g_tzLabel, "UTC");
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -1320,6 +1748,17 @@ int main(void) {
     test_nts_pool_pins();
     test_logbuf_basic();
     test_logbuf_truncation();
+
+    test_tz_bounds();
+    test_tz_southern_hemisphere();
+    test_tz_half_hour_zones();
+    test_tz_all_zones_smoke();
+    test_tzif_malformed();
+    test_breakdown_leap_years();
+    test_tz_label_format();
+    test_settings_roundtrip();
+    test_settings_legacy_v1();
+    test_settings_invalid_tz();
 
     printf("\n%d checks, %d failed\n", g_pass + g_fail, g_fail);
     return g_fail == 0 ? 0 : 1;
