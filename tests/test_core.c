@@ -1594,19 +1594,20 @@ static void test_tz_label_format(void) {
 
     // Europe/Berlin summer (2026-07-01 12:00Z): CEST +02:00.  Title
     // label uses the IANA name rather than the DST abbreviation so
-    // users see the same string they picked in Settings.
+    // users see the same string they picked in Settings.  Also append
+    // ", DST" when daylight saving is in effect.
     force_clock_at(make_utc_ms(2026, 7, 1, 12, 0, 0));
     snprintf(g_tzIana, sizeof g_tzIana, "Europe/Berlin");
     UpdateTimezone();
-    CHECK_EQ_STR(g_tzLabel, "Europe/Berlin (UTC+2)");
+    CHECK_EQ_STR(g_tzLabel, "Europe/Berlin (UTC+2, DST)");
 
-    // America/New_York winter (2026-01-15 12:00Z): EST -05:00.
+    // America/New_York winter (2026-01-15 12:00Z): EST -05:00, no DST.
     force_clock_at(make_utc_ms(2026, 1, 15, 12, 0, 0));
     snprintf(g_tzIana, sizeof g_tzIana, "America/New_York");
     UpdateTimezone();
     CHECK_EQ_STR(g_tzLabel, "America/New_York (UTC-5)");
 
-    // Asia/Kolkata: +05:30 exercises the half-hour branch.
+    // Asia/Kolkata: +05:30 exercises the half-hour branch; no DST.
     force_clock_at(make_utc_ms(2026, 6, 15, 12, 0, 0));
     snprintf(g_tzIana, sizeof g_tzIana, "Asia/Kolkata");
     UpdateTimezone();

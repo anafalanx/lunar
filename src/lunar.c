@@ -527,12 +527,13 @@ static void UpdateTimezone(void) {
     // (CET/CEST/BST/EDT...) changes twice a year and confuses users
     // who just want to know which zone they picked.
     const char *label = g_tzIana[0] ? g_tzIana : "UTC";
+    const char *dst   = tl.isDst ? ", DST" : "";
     if (offM == 0) {
-        snprintf(g_tzLabel, sizeof(g_tzLabel), "%s (UTC%+d)",
-                 label, offH);
+        snprintf(g_tzLabel, sizeof(g_tzLabel), "%s (UTC%+d%s)",
+                 label, offH, dst);
     } else {
-        snprintf(g_tzLabel, sizeof(g_tzLabel), "%s (UTC%+d:%02d)",
-                 label, offH, offM);
+        snprintf(g_tzLabel, sizeof(g_tzLabel), "%s (UTC%+d:%02d%s)",
+                 label, offH, offM, dst);
     }
     UpdateTitleBar();
 }
@@ -1459,22 +1460,23 @@ static void settings_refresh_preview(HWND hdlg) {
         "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
     };
     const char *wday = (tl.wday >= 0 && tl.wday < 7) ? kWday[tl.wday] : "";
+    const char *dst  = tl.isDst ? ", DST" : "";
 
     char buf[128];
     if (offM == 0) {
         snprintf(buf, sizeof buf,
-                 "%s %04d-%02d-%02d  %02d:%02d:%02d  %s (UTC%+d)",
+                 "%s %04d-%02d-%02d  %02d:%02d:%02d  %s (UTC%+d%s)",
                  wday, tl.year, tl.month, tl.mday,
                  tl.hour, tl.minute, tl.second,
                  tl.abbr[0] ? tl.abbr : "",
-                 offH);
+                 offH, dst);
     } else {
         snprintf(buf, sizeof buf,
-                 "%s %04d-%02d-%02d  %02d:%02d:%02d  %s (UTC%+d:%02d)",
+                 "%s %04d-%02d-%02d  %02d:%02d:%02d  %s (UTC%+d:%02d%s)",
                  wday, tl.year, tl.month, tl.mday,
                  tl.hour, tl.minute, tl.second,
                  tl.abbr[0] ? tl.abbr : "",
-                 offH, offM);
+                 offH, offM, dst);
     }
     wchar_t wbuf[160];
     MultiByteToWideChar(CP_UTF8, 0, buf, -1, wbuf,
