@@ -1045,13 +1045,13 @@ static void ApplyAlwaysOnTop(int on) {
 }
 
 static void ShowAbout(void) {
-    wchar_t tzLine[96] = L"IANA tzdata: unknown";
+    wchar_t tzLine[96] = L"Time zone database: unknown";
     const char *tzv = Tz_Version();
     if (tzv && *tzv) {
         wchar_t ver[32] = L"";
         MultiByteToWideChar(CP_UTF8, 0, tzv, -1, ver, 32);
         ver[31] = 0;
-        swprintf(tzLine, 96, L"IANA tzdata: %ls", ver);
+        swprintf(tzLine, 96, L"Time zone database: IANA %ls", ver);
     }
 
     wchar_t msg[256];
