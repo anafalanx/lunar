@@ -19,38 +19,34 @@
 // dialog font).  Dialog is 280 x 215 DLU ~= 462 x 355 px @ 96 dpi.
 // -------------------------------------------------------------------
 
-100 DIALOGEX 0, 0, 280, 215
+100 DIALOGEX 0, 0, 280, 195
 STYLE DS_SETFONT | DS_MODALFRAME | DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Lunar Settings"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
-    GROUPBOX        "Chimes",                         -1,      7,   4, 266,  62
+    GROUPBOX        "Chimes",                         -1,      7,   4, 266,  46
     AUTOCHECKBOX    "Play a &chime on armed 5-minute marks",
-                                                      1001,   15,  17, 248,  10
+                                                      1001,   15,  17, 180,  10
     AUTOCHECKBOX    "&Un-minimize the window on armed marks",
-                                                      1002,   15,  31, 248,  10
-    LTEXT           "Click an hour numeral to arm its 5-minute mark.",
-                                                      -1,     15,  48, 176,  10
-    PUSHBUTTON      "&Test chime",                    1007,  199,  44,  66,  14
+                                                      1002,   15,  31, 180,  10
+    PUSHBUTTON      "&Test chime",                    1007,  199,  27,  66,  14
 
-    GROUPBOX        "General",                        -1,      7,  72, 266,  26
+    GROUPBOX        "General",                        -1,      7,  56, 266,  26
     AUTOCHECKBOX    "Confirm before &closing the window",
-                                                      1003,   15,  84, 248,  10
+                                                      1003,   15,  68, 248,  10
 
-    GROUPBOX        "Display time zone",              -1,      7, 104, 266,  80
-    LTEXT           "&Filter:",                       -1,     15, 120,  28,  10
-    EDITTEXT                                          1005,   47, 118, 218,  12, ES_AUTOHSCROLL
-    LTEXT           "&Zone:",                         -1,     15, 138,  28,  10
-    COMBOBOX                                          1004,   47, 136, 218, 140,
+    GROUPBOX        "Display time zone",              -1,      7,  88, 266,  68
+    LTEXT           "&Filter:",                       -1,     15, 104,  28,  10
+    EDITTEXT                                          1005,   47, 102, 218,  12, ES_AUTOHSCROLL
+    LTEXT           "&Zone:",                         -1,     15, 122,  28,  10
+    COMBOBOX                                          1004,   47, 120, 218, 140,
                     CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "Current time:",                  -1,     15, 156,  52,  10
-    LTEXT           "",                               1006,   67, 156, 198,  10
-    LTEXT           "Displayed on the clock face and in the title bar.",
-                                                      -1,     15, 170, 248,  10
+    LTEXT           "Current time:",                  -1,     15, 140,  52,  10
+    LTEXT           "",                               1006,   67, 140, 198,  10
 
-    PUSHBUTTON      "&Defaults",                      1008,    7, 193,  60,  14
-    DEFPUSHBUTTON   "OK",                             IDOK,  159, 193,  52,  14
-    PUSHBUTTON      "Cancel",                         IDCANCEL,217, 193,  52,  14
+    PUSHBUTTON      "&Defaults",                      1008,    7, 173,  60,  14
+    DEFPUSHBUTTON   "OK",                             IDOK,  159, 173,  52,  14
+    PUSHBUTTON      "Cancel",                         IDCANCEL,217, 173,  52,  14
 END
 
 1 VERSIONINFO
