@@ -61,14 +61,20 @@ the Windows system DLLs.  Runs on Windows 10 and Windows 11 (x64).
 
 Controls
 --------
-  * Pushpin icon (status bar, bottom-right) ....... toggle always-on-top
-  * Gear icon    (status bar, bottom-right) ....... settings (placeholder)
-  * Drag any edge ................................ resize
-  * Alt+F4 ....................................... quit
+  * Click the window icon (top-left of the title bar) to open the
+    system menu.  It contains:
+      - About Lunar
+      - Settings...       (chimes, time zone, window behavior)
+      - Test beep
+      - Always on top     (toggle)
+      - Sync clock now
+      - View log...
+  * Drag any edge .............................. resize
+  * Alt+F4 ..................................... quit
 
 Files
 -----
-  Lunar.exe   single-file executable (raylib + GLFW statically linked)
+  Lunar.exe   single-file executable (static C runtime + mbedTLS)
   README.txt  this file
 
 SHA-256

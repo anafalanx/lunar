@@ -1,5 +1,6 @@
 // sysvol.c -- Windows Core Audio system master-volume query. Kept in its
-// own TU so <windows.h>/<mmdeviceapi.h> do not collide with raylib.h.
+// own TU so the COM-macro flags below (COBJMACROS/CINTERFACE) don't
+// infect the rest of the build.
 #define COBJMACROS
 #define CINTERFACE
 #include <initguid.h>
