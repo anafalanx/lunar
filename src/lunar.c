@@ -1,4 +1,4 @@
-// Lunar 0.2 -- Direct2D port.
+// Lunar 0.3 -- Direct2D port.
 //
 // A minimalist Braun BN0032-style analog clock drawn with Direct2D and
 // DirectWrite on a plain Win32 HWND. No persistent audio device. The
@@ -50,7 +50,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 
-#define APP_TITLE        L"Lunar 0.2"
+#define APP_TITLE        L"Lunar"
 #define CLASS_NAME       L"LunarWin"
 #define DEFAULT_W        600
 #define DEFAULT_H        600
@@ -449,9 +449,9 @@ static int HitTestHour(float mx, float my, float cx, float cy, float S) {
 //
 // Title format (U+2014 em-dashes separate the segments):
 //
-//   14:37  -  CET  -  Lunar 0.2
-//   2:37 PM  -  Europe/Paris (UTC+1)  -  Lunar 0.2
-//   UTC  -  Lunar 0.2                               (no trusted time yet)
+//   14:37  -  CET  -  Lunar
+//   2:37 PM  -  Europe/Paris (UTC+1)  -  Lunar
+//   UTC  -  Lunar                                   (no trusted time yet)
 //
 // Called from Tick() every ~200 ms; SetWindowTextW is only invoked when
 // the composed string actually changes, so the caption does not churn.
@@ -493,10 +493,10 @@ static void UpdateTitleBar(void) {
     WCHAR title[192];
     if (when[0]) {
         _snwprintf_s(title, 192, _TRUNCATE,
-                     L"%ls  \x2014  %ls  \x2014  Lunar 0.2", when, tz);
+                     L"%ls  \x2014  %ls  \x2014  Lunar", when, tz);
     } else {
         _snwprintf_s(title, 192, _TRUNCATE,
-                     L"%ls  \x2014  Lunar 0.2", tz);
+                     L"%ls  \x2014  Lunar", tz);
     }
 
     if (wcscmp(title, s_last) != 0) {
@@ -1149,7 +1149,7 @@ static INT_PTR CALLBACK AboutDlgProc(HWND hdlg, UINT msg,
         return TRUE;
     }
     case WM_CTLCOLORSTATIC: {
-        // Subdued gray for the "Version 0.2.0" and tz lines; default
+        // Subdued gray for the "Version 0.3.0" and tz lines; default
         // for everything else.  Dialog background is COLOR_BTNFACE.
         HDC hdc = (HDC)wp;
         int ctlId = GetDlgCtrlID((HWND)lp);
@@ -2077,7 +2077,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
 
     // Kick off the first NTP sync as soon as the window exists.
     Clock_Init();
-    Log_Append("app: Lunar 0.2 started; initiating first NTP sync");
+    Log_Append("app: Lunar 0.3 started; initiating first NTP sync");
     Ntp_Start();
     g_lastNtpKickMs = GetTickCount();
 
