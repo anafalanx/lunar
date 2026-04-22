@@ -29,7 +29,7 @@ BEGIN
                                                       1001,   15,  17, 248,  10
     AUTOCHECKBOX    "&Un-minimize the window on armed marks",
                                                       1002,   15,  31, 248,  10
-    LTEXT           "Arm marks from the clock's tray icon.",
+    LTEXT           "Click an hour numeral to arm its 5-minute mark.",
                                                       -1,     15,  48, 176,  10
     PUSHBUTTON      "&Test chime",                    1007,  199,  44,  66,  14
 
@@ -45,7 +45,7 @@ BEGIN
                     CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
     LTEXT           "Current time:",                  -1,     15, 156,  52,  10
     LTEXT           "",                               1006,   67, 156, 198,  10
-    LTEXT           "The time zone affects minute marks and the title-bar label.",
+    LTEXT           "Displayed on the clock face and in the title bar.",
                                                       -1,     15, 170, 248,  10
 
     PUSHBUTTON      "&Defaults",                      1008,    7, 193,  60,  14

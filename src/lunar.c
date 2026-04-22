@@ -1533,8 +1533,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM l
         HWND tip = NULL;
         settings_add_tip(&tip, hdlg, IDC_CHK_CHIMES,
             L"Play a short audible beep at each 5-minute mark that is "
-            L"armed in the system tray menu. Chimes never fire while "
-            L"the clock is out of sync.");
+            L"armed on the clock face. Click an hour numeral to toggle "
+            L"its mark. Chimes never fire while the clock is out of sync.");
         settings_add_tip(&tip, hdlg, IDC_CHK_UNMIN,
             L"Restore the window from the taskbar at each armed mark, "
             L"even if chimes are off. Useful as a silent pomodoro timer.");
