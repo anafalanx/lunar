@@ -1592,29 +1592,29 @@ static void test_tz_label_format(void) {
     CHECK_EQ_STR(g_tzLabel, "UTC");
     CHECK_EQ_INT(g_tzId, TZ_ID_UTC);
 
-    // Europe/Berlin summer (2026-07-01 12:00Z): CEST +02:00.
+    // Europe/Berlin summer (2026-07-01 12:00Z): CEST +02:00.  Title
+    // label uses the IANA name rather than the DST abbreviation so
+    // users see the same string they picked in Settings.
     force_clock_at(make_utc_ms(2026, 7, 1, 12, 0, 0));
     snprintf(g_tzIana, sizeof g_tzIana, "Europe/Berlin");
     UpdateTimezone();
-    CHECK_EQ_STR(g_tzLabel, "CEST (UTC+2)");
+    CHECK_EQ_STR(g_tzLabel, "Europe/Berlin (UTC+2)");
 
     // America/New_York winter (2026-01-15 12:00Z): EST -05:00.
     force_clock_at(make_utc_ms(2026, 1, 15, 12, 0, 0));
     snprintf(g_tzIana, sizeof g_tzIana, "America/New_York");
     UpdateTimezone();
-    CHECK_EQ_STR(g_tzLabel, "EST (UTC-5)");
+    CHECK_EQ_STR(g_tzLabel, "America/New_York (UTC-5)");
 
-    // Asia/Kolkata: IST +05:30 exercises the half-hour branch.
+    // Asia/Kolkata: +05:30 exercises the half-hour branch.
     force_clock_at(make_utc_ms(2026, 6, 15, 12, 0, 0));
     snprintf(g_tzIana, sizeof g_tzIana, "Asia/Kolkata");
     UpdateTimezone();
-    CHECK_EQ_STR(g_tzLabel, "IST (UTC+5:30)");
+    CHECK_EQ_STR(g_tzLabel, "Asia/Kolkata (UTC+5:30)");
 
     // Asia/Kathmandu: +05:45 (45-minute offset, edge of format).
     snprintf(g_tzIana, sizeof g_tzIana, "Asia/Kathmandu");
     UpdateTimezone();
-    // Abbreviation differs across tzdata vintages ("+0545" in slim,
-    // "NPT" in older).  Assert structural shape instead of exact tag.
     CHECK(strstr(g_tzLabel, "(UTC+5:45)") != NULL);
 
     // Invalid name -> falls back to UTC and clears g_tzIana.

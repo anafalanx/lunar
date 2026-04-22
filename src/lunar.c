@@ -522,12 +522,17 @@ static void UpdateTimezone(void) {
     int offH   = offMin / 60;
     int offM   = offMin % 60;
     if (offM < 0) offM = -offM;
+    // Title-bar label: always use the user-chosen IANA zone name so
+    // it matches what they see in Settings.  The DST abbreviation
+    // (CET/CEST/BST/EDT...) changes twice a year and confuses users
+    // who just want to know which zone they picked.
+    const char *label = g_tzIana[0] ? g_tzIana : "UTC";
     if (offM == 0) {
         snprintf(g_tzLabel, sizeof(g_tzLabel), "%s (UTC%+d)",
-                 tl.abbr[0] ? tl.abbr : g_tzIana, offH);
+                 label, offH);
     } else {
         snprintf(g_tzLabel, sizeof(g_tzLabel), "%s (UTC%+d:%02d)",
-                 tl.abbr[0] ? tl.abbr : g_tzIana, offH, offM);
+                 label, offH, offM);
     }
     UpdateTitleBar();
 }
@@ -1512,6 +1517,23 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM l
     switch (msg) {
     case WM_INITDIALOG: {
         (void)lp;
+        // Give the dialog caption the app icon so Windows inserts the
+        // standard icon-to-text gap; otherwise the title string sits
+        // flush against the left window border.
+        HINSTANCE hi = GetModuleHandleW(NULL);
+        HICON hSmall = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(1),
+                                         IMAGE_ICON,
+                                         GetSystemMetrics(SM_CXSMICON),
+                                         GetSystemMetrics(SM_CYSMICON),
+                                         LR_DEFAULTCOLOR);
+        HICON hBig   = (HICON)LoadImageW(hi, MAKEINTRESOURCEW(1),
+                                         IMAGE_ICON,
+                                         GetSystemMetrics(SM_CXICON),
+                                         GetSystemMetrics(SM_CYICON),
+                                         LR_DEFAULTCOLOR);
+        if (hSmall) SendMessageW(hdlg, WM_SETICON, ICON_SMALL, (LPARAM)hSmall);
+        if (hBig)   SendMessageW(hdlg, WM_SETICON, ICON_BIG,   (LPARAM)hBig);
+
         CheckDlgButton(hdlg, IDC_CHK_CHIMES,
                        g_chimesEnabled ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hdlg, IDC_CHK_UNMIN,

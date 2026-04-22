@@ -20,7 +20,7 @@
 // -------------------------------------------------------------------
 
 100 DIALOGEX 0, 0, 280, 195
-STYLE DS_SETFONT | DS_MODALFRAME | DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
+STYLE DS_SETFONT | DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Lunar Settings"
 FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
