@@ -1706,6 +1706,13 @@ static void Tick(void) {
     float secs = (float)lt.tm_sec + ms / 1000.0f;
     float mins = (float)lt.tm_min + secs / 60.0f;
 
+    // First trustworthy minute after (re)sync: recompute the zone
+    // label so the title bar gets its "(UTC+X[, DST])" suffix.  At
+    // startup UpdateTimezone runs before Clock_NowUtcMs succeeds and
+    // can only record the bare IANA name; without this refresh the
+    // title stays bracket-less until the first minute crossing.
+    if (g_prevMins < 0.0f) UpdateTimezone();
+
     //
     // Only honor a crossing when the apparent minute-step is 1 or 2.
     // Anything larger means the wall clock has jumped (DST transition,
