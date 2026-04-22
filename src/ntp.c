@@ -35,8 +35,8 @@
 #include "logbuf.h"
 
 #define NTP_PORT             "123"
-#define NTP_TIMEOUT_MS       3000
-#define NTS_SLOT_TIMEOUT_MS  15000     // KE (~5s connect + handshake) + 3s UDP
+#define NTP_TIMEOUT_MS       6000      // core slot UDP recv timeout
+#define NTS_SLOT_TIMEOUT_MS  20000     // KE (TLS 1.3 + handshake) + authenticated UDP
 #define NTP_EPOCH_DELTA_S    2208988800ULL        // seconds between 1900 and 1970
 #define FRESH_WINDOW_MS      (2LL * 60LL * 60LL * 1000LL) // 2 hours
 #define CONCUR_THRESHOLD_MS  200
