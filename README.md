@@ -47,7 +47,7 @@ fully static (libgcc/libstdc++ linked in, mbedTLS archived in).
 - Single-process C program compiled with `gcc -mwindows`.
 - Top-level window is a plain Win32 `HWND` created by `CreateWindowExW`.
 - All drawing (dial, hands, icons) uses **Direct2D** primitives; text is
-  rendered with **DirectWrite**. No OpenGL, no GLFW, no raylib.
+  rendered with **DirectWrite**.
 - Menus live entirely in the window's system menu (click the icon in
   the title bar, or right-click the title bar).
 - Time is disciplined against NIST/PTB/NICT (SNTPv4) and an NTS anchor

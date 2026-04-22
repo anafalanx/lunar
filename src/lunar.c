@@ -1,10 +1,9 @@
 // Lunar 0.2 -- Direct2D port.
 //
 // A minimalist Braun BN0032-style analog clock drawn with Direct2D and
-// DirectWrite on a plain Win32 HWND. No raylib, no OpenGL, no persistent
-// audio device. The window is event-driven: a 100 ms WM_TIMER invalidates
-// the client area, which triggers WM_PAINT. Between ticks the process is
-// idle.
+// DirectWrite on a plain Win32 HWND. No persistent audio device. The
+// window is event-driven: a 100 ms WM_TIMER invalidates the client
+// area, which triggers WM_PAINT. Between ticks the process is idle.
 //
 // Persistence, NTP sync and system-volume query live in separate TUs
 // (ntp.c, sysvol.c). The rest -- window, menu, paint, beep, layout --
