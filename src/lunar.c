@@ -79,6 +79,7 @@
 #define IDC_STATIC_TZ_PREVIEW 1006
 #define IDC_BTN_TEST_CHIME    1007
 #define IDC_BTN_DEFAULTS      1008
+#define IDC_CHK_24H           1009
 
 // Dialog-scoped timer (dialogs own a separate timer namespace from
 // the main window, so reusing IDT_REPAINT is safe).
@@ -149,6 +150,7 @@ static DWORD                  g_lastNtpKickMs = 0;
 static int                    g_chimesEnabled      = 1;
 static int                    g_unminimizeOnChime  = 0;
 static int                    g_confirmOnClose     = 0;
+static int                    g_use24h             = 1;  // 1 = HH:MM, 0 = h:MM AM/PM
 // Selected display time zone as an IANA name (e.g. "Europe/Paris").
 // Empty string means UTC.  The clockwork itself is always UTC; this
 // controls only how local wall-clock components are rendered.  Zones
@@ -314,6 +316,7 @@ static void LoadSettings(void) {
         if      (sscanf(line, "chimes=%d",  &v) == 1) g_chimesEnabled     = v ? 1 : 0;
         else if (sscanf(line, "unmin=%d",   &v) == 1) g_unminimizeOnChime = v ? 1 : 0;
         else if (sscanf(line, "confirm=%d", &v) == 1) g_confirmOnClose    = v ? 1 : 0;
+        else if (sscanf(line, "fmt24=%d",   &v) == 1) g_use24h            = v ? 1 : 0;
         else if (strncmp(line, "tz=", 3) == 0) {
             // IANA name (ASCII).  We copy it in raw; the resolver will
             // silently reject unknown values (including obsolete
@@ -334,9 +337,10 @@ static void SaveSettings(void) {
             "chimes=%d\n"
             "unmin=%d\n"
             "confirm=%d\n"
+            "fmt24=%d\n"
             "tz=%s\n",
             g_chimesEnabled, g_unminimizeOnChime, g_confirmOnClose,
-            g_tzIana);
+            g_use24h, g_tzIana);
     fclose(f);
 }
 
@@ -445,12 +449,16 @@ static int HitTestHour(float mx, float my, float cx, float cy, float S) {
 //
 // Title format (U+2014 em-dashes separate the segments):
 //
-//   CET  -  Lunar 0.2  -  OK 3/3  +-5ms
-//   UTC  -  Lunar 0.2  -  INOP 2/3
-//   UTC  -  Lunar 0.2  -  INOP 3/3 sp=612ms     (three reached, disagreed)
+//   14:37  -  CET  -  Lunar 0.2
+//   2:37 PM  -  Europe/Paris (UTC+1)  -  Lunar 0.2
+//   UTC  -  Lunar 0.2                               (no trusted time yet)
 //
 // Called from Tick() every ~200 ms; SetWindowTextW is only invoked when
 // the composed string actually changes, so the caption does not churn.
+
+// Forward decl: body defined further down, near the rest of the local-time
+// helpers.  Needed here because UpdateTitleBar prepends the digital time.
+static int UtcMsToLocalTm(int64_t utcMs, struct tm *out, int *outMs);
 
 static void UpdateTitleBar(void) {
     static WCHAR s_last[192] = { 0 };
@@ -459,8 +467,37 @@ static void UpdateTitleBar(void) {
     if (g_tzLabel[0])
         MultiByteToWideChar(CP_UTF8, 0, g_tzLabel, -1, tz, 32);
 
+    // Digital time prefix, but only when the disciplined clockwork
+    // actually has a trustworthy reading this run.  Before the first
+    // good sync we omit the time entirely rather than paint a fake
+    // "00:00" or "--:--".
+    WCHAR when[16] = L"";
+    int64_t utcMs = 0;
+    if (Clock_NowUtcMs(&utcMs)) {
+        struct tm lt = { 0 };
+        int ms = 0;
+        if (UtcMsToLocalTm(utcMs, &lt, &ms)) {
+            if (g_use24h) {
+                _snwprintf_s(when, 16, _TRUNCATE, L"%02d:%02d",
+                             lt.tm_hour, lt.tm_min);
+            } else {
+                int h12 = lt.tm_hour % 12;
+                if (h12 == 0) h12 = 12;
+                const wchar_t *mer = (lt.tm_hour < 12) ? L"AM" : L"PM";
+                _snwprintf_s(when, 16, _TRUNCATE, L"%d:%02d %ls",
+                             h12, lt.tm_min, mer);
+            }
+        }
+    }
+
     WCHAR title[192];
-    _snwprintf_s(title, 192, _TRUNCATE, L"%ls  \x2014  Lunar 0.2", tz);
+    if (when[0]) {
+        _snwprintf_s(title, 192, _TRUNCATE,
+                     L"%ls  \x2014  %ls  \x2014  Lunar 0.2", when, tz);
+    } else {
+        _snwprintf_s(title, 192, _TRUNCATE,
+                     L"%ls  \x2014  Lunar 0.2", tz);
+    }
 
     if (wcscmp(title, s_last) != 0) {
         SetWindowTextW(g_hwnd, title);
@@ -1539,6 +1576,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM l
                        g_unminimizeOnChime ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hdlg, IDC_CHK_CONFIRM_CLOSE,
                        g_confirmOnClose ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hdlg, IDC_CHK_24H,
+                       g_use24h ? BST_CHECKED : BST_UNCHECKED);
 
         // Populate zone combo from the embedded IANA index.  No OS
         // timezone API is consulted.
@@ -1564,6 +1603,9 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM l
         settings_add_tip(&tip, hdlg, IDC_CHK_CONFIRM_CLOSE,
             L"Ask for confirmation before closing the window. Prevents "
             L"accidental shutdowns mid-session.");
+        settings_add_tip(&tip, hdlg, IDC_CHK_24H,
+            L"Show the title-bar time as 24-hour (14:37). Uncheck for "
+            L"12-hour format with an AM/PM suffix (2:37 PM).");
         settings_add_tip(&tip, hdlg, IDC_EDIT_TZ_FILTER,
             L"Type to narrow the list below. Case-insensitive substring "
             L"match across the full IANA name, e.g. \"paris\" or \"new_york\".");
@@ -1620,6 +1662,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM l
             CheckDlgButton(hdlg, IDC_CHK_CHIMES,        BST_CHECKED);
             CheckDlgButton(hdlg, IDC_CHK_UNMIN,         BST_UNCHECKED);
             CheckDlgButton(hdlg, IDC_CHK_CONFIRM_CLOSE, BST_UNCHECKED);
+            CheckDlgButton(hdlg, IDC_CHK_24H,           BST_CHECKED);
             SetDlgItemTextW(hdlg, IDC_EDIT_TZ_FILTER, L"");
             settings_populate_tz_combo(hdlg, TZ_ID_UTC);
             settings_refresh_preview(hdlg);
@@ -1630,6 +1673,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM l
             g_chimesEnabled     = IsDlgButtonChecked(hdlg, IDC_CHK_CHIMES)        == BST_CHECKED;
             g_unminimizeOnChime = IsDlgButtonChecked(hdlg, IDC_CHK_UNMIN)         == BST_CHECKED;
             g_confirmOnClose    = IsDlgButtonChecked(hdlg, IDC_CHK_CONFIRM_CLOSE) == BST_CHECKED;
+            g_use24h            = IsDlgButtonChecked(hdlg, IDC_CHK_24H)           == BST_CHECKED;
 
             TzId id = settings_current_tz(hdlg);
             const char *nm = (id == TZ_ID_INVALID) ? NULL : Tz_Name(id);

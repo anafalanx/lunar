@@ -19,7 +19,7 @@
 // dialog font).  Dialog is 280 x 215 DLU ~= 462 x 355 px @ 96 dpi.
 // -------------------------------------------------------------------
 
-100 DIALOGEX 0, 0, 280, 195
+100 DIALOGEX 0, 0, 280, 209
 STYLE DS_SETFONT | DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Lunar Settings"
 FONT 9, "Segoe UI", 400, 0, 0x1
@@ -31,22 +31,24 @@ BEGIN
                                                       1002,   15,  31, 180,  10
     PUSHBUTTON      "&Test chime",                    1007,  199,  27,  66,  14
 
-    GROUPBOX        "General",                        -1,      7,  56, 266,  26
+    GROUPBOX        "General",                        -1,      7,  56, 266,  40
     AUTOCHECKBOX    "Confirm before &closing the window",
                                                       1003,   15,  68, 248,  10
+    AUTOCHECKBOX    "Use 24-&hour clock in title bar",
+                                                      1009,   15,  82, 248,  10
 
-    GROUPBOX        "Display time zone",              -1,      7,  88, 266,  68
-    LTEXT           "&Filter:",                       -1,     15, 104,  28,  10
-    EDITTEXT                                          1005,   47, 102, 218,  12, ES_AUTOHSCROLL
-    LTEXT           "&Zone:",                         -1,     15, 122,  28,  10
-    COMBOBOX                                          1004,   47, 120, 218, 140,
+    GROUPBOX        "Display time zone",              -1,      7, 102, 266,  68
+    LTEXT           "&Filter:",                       -1,     15, 118,  28,  10
+    EDITTEXT                                          1005,   47, 116, 218,  12, ES_AUTOHSCROLL
+    LTEXT           "&Zone:",                         -1,     15, 136,  28,  10
+    COMBOBOX                                          1004,   47, 134, 218, 140,
                     CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "Current time:",                  -1,     15, 140,  52,  10
-    LTEXT           "",                               1006,   67, 140, 198,  10
+    LTEXT           "Current time:",                  -1,     15, 154,  52,  10
+    LTEXT           "",                               1006,   67, 154, 198,  10
 
-    PUSHBUTTON      "&Defaults",                      1008,    7, 173,  60,  14
-    DEFPUSHBUTTON   "OK",                             IDOK,  159, 173,  52,  14
-    PUSHBUTTON      "Cancel",                         IDCANCEL,217, 173,  52,  14
+    PUSHBUTTON      "&Defaults",                      1008,    7, 187,  60,  14
+    DEFPUSHBUTTON   "OK",                             IDOK,  159, 187,  52,  14
+    PUSHBUTTON      "Cancel",                         IDCANCEL,217, 187,  52,  14
 END
 
 // -------------------------------------------------------------------
