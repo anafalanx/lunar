@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Lunar — Deep Evaluation of the Sync &amp; Adjustment Mechanism</title>
+<style>
+  :root {
+    --bg:        #fbfaf7;
+    --text:      #222;
+    --muted:     #666;
+    --rule:      #d8d3c6;
+    --aside-bg:  #f2efe6;
+    --aside-br:  #bfb69f;
+    --code-bg:   #ece7d8;
+    --accent:    #1a4a7a;
+    --warn:      #8a1f1f;
+    --ok:        #1e6e3e;
+    --amber:     #8a5a00;
+  }
+  html { box-sizing: border-box; }
+  *, *:before, *:after { box-sizing: inherit; }
+  body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.6 "Georgia", "Iowan Old Style", "Times New Roman", serif;
+  }
+  main {
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 2.5rem 3rem 6rem;
+  }
+  h1, h2, h3, h4 {
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    color: var(--accent);
+    line-height: 1.25;
+  }
+  h1 {
+    font-size: 2.2rem;
+    margin: 0 0 .3rem;
+    border-bottom: 3px double var(--rule);
+    padding-bottom: .6rem;
+  }
+  h1 + p.sub {
+    color: var(--muted);
+    font-style: italic;
+    margin-top: 0;
+  }
+  h2 {
+    margin-top: 3rem;
+    font-size: 1.55rem;
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: .3rem;
+  }
+  h3 { margin-top: 2rem; font-size: 1.2rem; }
+  h4 { margin-top: 1.5rem; font-size: 1.02rem; color: var(--text); }
+  p  { margin: .7rem 0; }
+  ul, ol { padding-left: 1.4rem; }
+  li { margin: .25rem 0; }
+  code {
+    font: .92em "SF Mono", "Consolas", "Menlo", monospace;
+    background: var(--code-bg);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  pre code { display: block; padding: .7rem 1rem; overflow-x: auto; }
+
+  /* ----- Primer / explainer box ----- */
+  aside.primer {
+    background: var(--aside-bg);
+    border-left: 4px solid var(--aside-br);
+    border-radius: 2px;
+    padding: .7rem 1.1rem;
+    margin: 1.2rem 0;
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 12.5px;
+    line-height: 1.55;
+    color: #3a3528;
+  }
+  aside.primer > h4 {
+    margin: 0 0 .4rem;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: var(--muted);
+    font-weight: 700;
+  }
+  aside.primer dl { margin: 0; }
+  aside.primer dt {
+    font-weight: 700;
+    color: #2b2618;
+    margin-top: .35rem;
+  }
+  aside.primer dt:first-child { margin-top: 0; }
+  aside.primer dd {
+    margin: 0 0 .35rem;
+    padding-left: 0;
+  }
+  aside.primer code {
+    background: #e2dcc6;
+    font-size: .9em;
+  }
+
+  /* ----- Finding tags ----- */
+  .tag {
+    display: inline-block;
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .04em;
+    padding: 1px 6px;
+    border-radius: 3px;
+    margin-right: .4rem;
+    vertical-align: 1px;
+  }
+  .tag.sec { background: #f8d6d6; color: var(--warn); }
+  .tag.cor { background: #ffe7b2; color: var(--amber); }
+  .tag.avl { background: #d4ead8; color: var(--ok); }
+
+  h4.finding { margin-top: 1.2rem; }
+
+  /* ----- Callouts ----- */
+  .callout {
+    margin: 1.4rem 0;
+    padding: .9rem 1.2rem;
+    border-radius: 4px;
+    border: 1px solid var(--rule);
+    background: #fff;
+  }
+  .callout.tl-dr {
+    border-left: 5px solid var(--accent);
+  }
+  .callout.recommendation {
+    border-left: 5px solid var(--ok);
+    background: #f2f7f3;
+  }
+  .callout h4 {
+    margin: 0 0 .3rem;
+    font-size: .85rem;
+    text-transform: uppercase;
+    letter-spacing: .06em;
+    color: var(--muted);
+  }
+
+  /* ----- Tier boxes ----- */
+  .tier {
+    margin: 1.2rem 0;
+    padding: 1rem 1.3rem;
+    border-radius: 4px;
+    border: 1px solid var(--rule);
+    background: #fff;
+  }
+  .tier.t1 { border-left: 5px solid var(--warn); }
+  .tier.t2 { border-left: 5px solid var(--amber); }
+  .tier.t3 { border-left: 5px solid var(--ok); }
+  .tier h3 { margin-top: 0; }
+  .tier ol { margin: 0; }
+
+  /* ----- TOC ----- */
+  nav.toc {
+    background: #fff;
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: .8rem 1.2rem;
+    margin: 1.4rem 0 2rem;
+    font-family: "Helvetica Neue", Arial, sans-serif;
+    font-size: 14px;
+  }
+  nav.toc h4 {
+    margin: 0 0 .4rem;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: var(--muted);
+    font-weight: 700;
+  }
+  nav.toc ol { margin: 0; padding-left: 1.4rem; }
+  nav.toc a { color: var(--accent); text-decoration: none; }
+  nav.toc a:hover { text-decoration: underline; }
+
+  /* ----- Glossary ----- */
+  .glossary {
+    column-count: 2;
+    column-gap: 2.5rem;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  .glossary dt {
+    font-weight: 700;
+    break-inside: avoid;
+    margin-top: .35rem;
+  }
+  .glossary dd {
+    margin: 0 0 .25rem;
+    color: var(--muted);
+  }
+
+  @media (max-width: 720px) {
+    main { padding: 1.5rem 1.2rem 4rem; }
+    h1 { font-size: 1.7rem; }
+    h2 { font-size: 1.3rem; }
+    .glossary { column-count: 1; }
+  }
+
+  @media print {
+    body { background: #fff; font-size: 10.5pt; }
+    main { max-width: none; padding: 0; }
+    aside.primer { background: #f3f3f3; border-left-color: #888; }
+    nav.toc { display: none; }
+  }
+</style>
+</head>
+<body>
+<main>
+
+<h1>Lunar — Deep Evaluation of the Sync &amp; Adjustment Mechanism</h1>
+<p class="sub">Security · Guaranteed correctness · Availability — proposal, no code changes.</p>
+
+<div class="callout tl-dr">
+  <h4>TL;DR</h4>
+  <p>Lunar's clock refuses to display the Windows system time; it runs its own disciplined UTC from four parallel Internet sources, gated by a cryptographic anchor (NTS) and a concurrence check against three stratum-1 core servers. The design is sound and fail-safe, but has <strong>seven security weaknesses</strong>, <strong>seven correctness gaps</strong>, and <strong>six availability liabilities</strong>. The highest-leverage fixes — tiered trust with graceful degradation, anchor monotonicity, per-cycle rate-change clamp, and an adversarial-input test suite — are ~150–400 LOC each and should land before any availability work.</p>
+</div>
+
+<nav class="toc">
+  <h4>Contents</h4>
+  <ol>
+    <li><a href="#current">Current design (as built)</a></li>
+    <li><a href="#security">Security analysis</a></li>
+    <li><a href="#correctness">Correctness analysis</a></li>
+    <li><a href="#availability">Availability analysis</a></li>
+    <li><a href="#proposal">Proposal (prioritized)</a></li>
+    <li><a href="#recommendation">Recommendation</a></li>
+    <li><a href="#glossary">Glossary</a></li>
+  </ol>
+</nav>
+
+<aside class="primer">
+  <h4>Primer 0 — orientation</h4>
+  <p>Lunar is a desktop analog clock that <em>refuses</em> to trust the Windows system clock. The Windows clock can be wrong for many reasons: user edit, malware, CMOS battery, drift, broken <code>w32time</code>, VM sleep/wake. Lunar reads the true time directly from Internet time servers, keeps its own monotonic running clock locally, and renders a red <strong>INOP</strong> state whenever it cannot verify the time. The pipeline analysed below is the safety-critical core: what lets the clock claim "trusted time" and what lets it refuse to lie.</p>
+</aside>
+
+<h2 id="current">1. Current design (as built)</h2>
+
+<h3>Sources, per cycle (fired in parallel)</h3>
+<ul>
+  <li>Slot 0 — <strong>NIST</strong> (time.nist.gov, USA) — plain SNTPv4 over UDP/123, no authentication</li>
+  <li>Slot 1 — <strong>PTB</strong> (ptbtime1.ptb.de, Germany) — same</li>
+  <li>Slot 2 — <strong>NICT</strong> (ntp.nict.jp, Japan) — same</li>
+  <li>Slot 3 — <strong>NTS</strong> (rotating) — TLS-1.3 + SPKI-pinned key establishment, then authenticated SNTP; provider picked randomly per cycle from a small pool</li>
+</ul>
+
+<aside class="primer">
+  <h4>Primer 1 — NTP · SNTP · NTS · SPKI · KE</h4>
+  <dl>
+    <dt>NTP (RFC 5905)</dt>
+    <dd>Network Time Protocol. Client timestamps its request (T1), server stamps receipt (T2) and reply (T3), client stamps arrival (T4). Round-trip and offset follow from these four numbers.</dd>
+    <dt>SNTP (RFC 4330)</dt>
+    <dd>Simple NTP: stateless one-shot subset. No long-running association, no client-side statistical filtering. Adequate for polling, which is what Lunar does.</dd>
+    <dt>NTS (RFC 8915)</dt>
+    <dd>Network Time Security. A one-time TLS-1.3 <em>key establishment</em> (KE) gives the client cookies/keys; subsequent UDP time packets are authenticated with AEAD so an on-path attacker cannot forge or tamper with them.</dd>
+    <dt>SPKI pinning</dt>
+    <dd>Subject Public Key Info. Instead of trusting the whole web-PKI chain, we hardcode the expected hash of the server's public key. Catches compromised CAs and mis-issuance.</dd>
+    <dt>UDP port 123</dt>
+    <dd>Standard NTP port. Firewalls and captive portals frequently block or rewrite it.</dd>
+  </dl>
+</aside>
+
+<h3>Trust gate</h3>
+<p>NTS must succeed, <strong>AND</strong> ≥ 2 of 3 core sources must project to within ±200 ms of the NTS anchor on a common QPC moment. Otherwise the verdict is <code>TRUST_INOP</code>, <code>Clock_NowUtcMs()</code> refuses to return a time, and the UI renders red INOP.</p>
+
+<h3>Anchor</h3>
+<p>On an <code>OK</code> cycle: <code>(qpcAtT4, ntpUtcMs)</code> taken verbatim from the NTS sample.</p>
+
+<h3>Rate discipline</h3>
+<p>Per-cycle observed ppm over the inter-sync interval, clamped to ±500 ppm (single-cycle target up to ±2000 ppm before clamp), EMA α = 0.25, persisted to <code>%APPDATA%\Lunar\discipline.dat</code> at shutdown, reloaded as bootstrap, rejected at &gt; 30 days against <em>disciplined</em> UTC.</p>
+
+<h3>Residual handling</h3>
+<p>|residual| ≤ 2 s → slew linearly over 60 s. &gt; 2 s → instant snap (anchor rebase).</p>
+
+<h3>Cadence</h3>
+<p>60 s on <code>TRUST_OK</code>; 5 s on <code>TRUST_INOP</code>.</p>
+
+<h3>Safeguards</h3>
+<p>SNTP header validation (LI / VN / mode / stratum 1–15); cross-check that a claimed-OK cycle matches the running projection within 200 ms — else "local-oscillator fault" → INOP.</p>
+
+<aside class="primer">
+  <h4>Primer 2 — QPC · UTC · PLL · EMA · ppm · anchor · slew · snap</h4>
+  <dl>
+    <dt>QPC</dt>
+    <dd><code>QueryPerformanceCounter</code>: Windows' monotonic hardware tick counter. Never moves backwards, immune to wall-clock edits, fixed frequency (typically 10 MHz). Lunar uses QPC for <em>all</em> local timing; it uses server replies only for UTC.</dd>
+    <dt>UTC</dt>
+    <dd>Coordinated Universal Time. Represented in Lunar as milliseconds since the Unix epoch.</dd>
+    <dt>PLL</dt>
+    <dd>Phase-Locked Loop. Feedback that steers a local oscillator to a reference. Phase = instantaneous time; frequency = rate. Lunar's PLL fires once per cycle and adjusts local rate (ppm) so future QPC ticks project onto correct UTC.</dd>
+    <dt>EMA</dt>
+    <dd>Exponential Moving Average. <code>new = old + α·(sample − old)</code>. Lunar uses α = 0.25. Lower α → more damping, slower response; higher α → noisier, faster.</dd>
+    <dt>ppm</dt>
+    <dd>Parts per million. +57 ppm = 57 µs fast per second = 4.9 s/day. Typical quartz drift is ±50 ppm.</dd>
+    <dt>anchor</dt>
+    <dd>A pair <code>(qpc, utc)</code> that pins "this QPC moment corresponded to this UTC". Projection: <code>utc + (qpc_now − qpc_anchor) · (1 + ppm/1e6)</code>.</dd>
+    <dt>slew vs snap</dt>
+    <dd><em>Slew</em> = apply a small correction gradually over a window so the second hand stays smooth. <em>Snap</em> = rebase the anchor instantly, which makes the clock jump but is the only sane option for large errors.</dd>
+    <dt>INOP</dt>
+    <dd>Aviation-inspired: when the instrument cannot guarantee correct data, it says so instead of guessing.</dd>
+  </dl>
+</aside>
+
+<h2 id="security">2. Security analysis</h2>
+
+<h3>Threat model (implicit today)</h3>
+<p>Protected against: passive on-path observer, single-ISP hijack of UDP/123, DNS poisoning of <em>one</em> source, rate-limiting or outage of <em>one</em> source. Relies on NTS as the cryptographic trust anchor.</p>
+
+<aside class="primer">
+  <h4>Primer 3 — trust anchor · threat model · attacker types</h4>
+  <dl>
+    <dt>Trust anchor</dt>
+    <dd>The element whose integrity, if preserved, guarantees the whole verdict. For Lunar: the NTS reply. Even if all three plaintext SNTP sources were hijacked, disagreement with NTS would trip INOP.</dd>
+    <dt>On-path attacker</dt>
+    <dd>Sits between client and server; can read, drop, modify, inject (hostile ISP, malicious Wi-Fi, state filter). <em>Off-path attacker</em> can only inject without seeing — harder; needs to guess response fields. NTS defeats both for the time payload; plain SNTP defeats neither.</dd>
+    <dt>Threat model</dt>
+    <dd>Explicit enumeration of adversaries, capabilities, and attack goals the design intends to defeat. "Implicit today" means Lunar has no written one; it is inferred from the code.</dd>
+  </dl>
+</aside>
+
+<h3>Weaknesses</h3>
+
+<h4 class="finding"><span class="tag sec">S1</span>NTS is a single point of cryptographic trust — silently</h4>
+<p>If the NTS slot fails for any reason (KE timeout, pin mismatch, provider outage), the gate goes INOP. Correct fail-safe, but an adversary who selectively blocks TLS to <em>all</em> NTS providers while letting UDP/123 through keeps the clock indefinitely INOP — a <strong>denial-of-availability attack via the security layer</strong>. There is no "NTS-disabled, degraded-trust fallback" — INOP is permanent until NTS recovers.</p>
+
+<h4 class="finding"><span class="tag sec">S2</span>Core sources use hardcoded hostnames, no DNSSEC</h4>
+<p>A resolver-level attacker can return any IP. They can't forge agreement with NTS (defeated at the concurrence gate) but they <em>can</em> deny a core source (drop/RST) or flood the socket budget with garbage. Combined with mild NTS degradation, this widens the DoS surface.</p>
+
+<aside class="primer">
+  <h4>Primer 4 — DNS · DNSSEC · TCP RST · rate-limiting</h4>
+  <dl>
+    <dt>DNS</dt>
+    <dd>Domain Name System. Resolves hostnames to IPs; normally unauthenticated. A hostile resolver can point any name anywhere.</dd>
+    <dt>DNSSEC</dt>
+    <dd>Cryptographic signing of DNS. Windows' default resolver does not validate end-to-end; most apps (including Lunar) inherit that gap.</dd>
+    <dt>TCP RST</dt>
+    <dd>A reset packet that forcibly closes a connection. Selective RST injection can break TLS handshakes one at a time.</dd>
+    <dt>Rate-limiting</dt>
+    <dd>Public time servers throttle or ban clients that poll too often — relevant to finding A3.</dd>
+  </dl>
+</aside>
+
+<h4 class="finding"><span class="tag sec">S3</span>NTS provider pool rotation is random, not load-shed-aware</h4>
+<p>If one pinned provider serves stale or bad data (compromised or misconfigured), it gets picked ~1/N of cycles. There is no penalty or blacklist for a pin that recently produced an outlier that tripped the local-oscillator fault check. One bad provider keeps cycling back in.</p>
+
+<h4 class="finding"><span class="tag sec">S4</span>The 200 ms local-oscillator-fault check is symmetric with the concurrence threshold</h4>
+<p>Elegant — but it means an attacker who can induce a ~150 ms NTS offset (within gate) that is <em>consistent</em> with two hijacked core sources will succeed. The gate is "≥ 2 core agree with NTS within 200 ms", not "…within a tighter bound". Because NTS is authenticated, the practical threat is provider compromise; but the gate architecture does not distinguish "all four sources agree to 20 ms" (high confidence) from "scraped agreement at 199 ms" (suspicious).</p>
+
+<h4 class="finding"><span class="tag sec">S5</span>Persisted rate file is unauthenticated</h4>
+<p><code>%APPDATA%\Lunar\discipline.dat</code> is plain ASCII <code>"&lt;ppm&gt; &lt;lastSyncUtcMs&gt;\n"</code>. A local attacker (or ransomware) that can write AppData can inject ±500 ppm, applied as bootstrap until the first sync re-verifies it. Window: up to ~6 s of wrong rate on first-anchor acquisition, which then snaps. Low impact, but the "safety clock" invariant argues for at least a MAC or checksum.</p>
+
+<aside class="primer">
+  <h4>Primer 5 — MAC · HMAC · DPAPI</h4>
+  <dl>
+    <dt>MAC</dt>
+    <dd>Message Authentication Code. A short tag computed from message + secret key; detects tampering by anyone without the key.</dd>
+    <dt>HMAC-SHA256</dt>
+    <dd>A well-analysed MAC construction on top of SHA-256.</dd>
+    <dt>DPAPI</dt>
+    <dd>Windows Data Protection API (<code>CryptProtectData</code>). Encrypts a blob under a key derived from the user's logon credentials. Simpler than managing our own keys; right-sized for "protect from other local users and offline attackers".</dd>
+  </dl>
+</aside>
+
+<h4 class="finding"><span class="tag sec">S6</span>No NTS KE replay / freshness discipline beyond TLS 1.3</h4>
+<p>We rely on TLS 1.3 client-hello entropy + NTS cookies for replay protection. Correct by spec, but there is no independent freshness bound: if an attacker can force TLS session resumption with a stale ticket (on a provider that mis-implements ticket rotation), the returned timestamp could predate the attack. Low likelihood — but verifiable by having clock.c reject any <code>ntpUtcMs</code> that decreases by &gt; X s from the previous OK cycle.</p>
+
+<aside class="primer">
+  <h4>Primer 6 — TLS 1.3 replay · session resumption · 0-RTT</h4>
+  <dl>
+    <dt>Replay</dt>
+    <dd>Capture a valid encrypted message and re-send later. TLS 1.3 defends handshakes with fresh randoms and records with AEAD nonces.</dd>
+    <dt>Session resumption / 0-RTT</dt>
+    <dd>For fast reconnects, TLS 1.3 lets a client attach application data to the first flight using a pre-shared key from a prior session. 0-RTT data is <em>not</em> spec-guaranteed non-replayable — the application must cope. NTS handles this with cookies; server-side mis-implementations have been seen.</dd>
+  </dl>
+</aside>
+
+<h4 class="finding"><span class="tag sec">S7</span>No bound on single-cycle rate <em>target</em></h4>
+<p><code>corr</code> is clamped to ±2000 ppm before the EMA, so one malicious-but-gate-passing cycle can pull the EMA by up to (2000 − current)·0.25. Over 2–3 carefully-shaped cycles, an adversary who can defeat the gate once could drive the persisted ppm to ±500 (the hard clamp). The "pulse a cycle, wait, pulse again" variant. Defense: require N consecutive OK cycles before a rate update persists to disk, plus a per-cycle <strong>change</strong> clamp (|Δppm| ≤ 20 per cycle).</p>
+
+<h2 id="correctness">3. Correctness analysis</h2>
+
+<aside class="primer">
+  <h4>Primer 7 — monotonicity · projection · RTT asymmetry</h4>
+  <dl>
+    <dt>Monotonicity</dt>
+    <dd>A clock is monotonic if it never moves backwards. Displayed analog clocks that jump backwards are disconcerting and, in a safety context, dangerous (events get reordered).</dd>
+    <dt>Projection</dt>
+    <dd>Given two samples at different QPC moments, "project" means advance or retard one by elapsed QPC × current rate so the two become comparable.</dd>
+    <dt>RTT asymmetry</dt>
+    <dd>NTP assumes forward and return legs take equal time. On transoceanic or multi-ISP paths this is often false; the error is a constant bias in <code>ntpUtcMs</code> equal to half the asymmetry.</dd>
+  </dl>
+</aside>
+
+<h4 class="finding"><span class="tag cor">C1</span>First-anchor trust escape</h4>
+<p>On the very first OK cycle we accept <code>(ntpUtcMs, qpcAtT4)</code> verbatim — no prior anchor exists to cross-check. Combined with a stale persisted rate (up to +57 ppm seen in the live log), the first ~10 s of displayed time can be off by "rate × interval since anchor" before the cycle-2 slew corrects it. For a safety-critical clock this is a visible defect: the moment the user opens the app is the moment the clock is least trustworthy.</p>
+
+<h4 class="finding"><span class="tag cor">C2</span>RTT asymmetry assumption</h4>
+<p><code>ntpUtcMs = t3 + netRtt/2</code>. Asymmetric routing makes the error up to <code>netRtt/2</code> — for NICT (rtt ≈ 300 ms) that is ±150 ms worst case. The 200 ms gate barely covers this; happy-path spread is 14 ms, but on a bad day NICT alone could push us over the gate, forcing INOP.</p>
+
+<h4 class="finding"><span class="tag cor">C3</span>EMA on ppm, but rate samples are not IID</h4>
+<p>A short interval plus a large residual produces a huge <code>corr</code>. The <code>elapMs &gt; 30000</code> guard prevents the trivial blow-up but does nothing about the much more common "85 s cycle, 9 ms residual" → corr ≈ 106 ppm, pulled by α = 0.25 → +26 ppm jump. The live log shows ±8–34 ppm jumps between consecutive cycles — the PLL <strong>chasing network jitter</strong>, not drift. Proper approach: a <strong>PI controller</strong> or small Kalman filter with an explicit measurement-noise variance. Chronyd and NTPsec have 20 years of tuning we could borrow.</p>
+
+<aside class="primer">
+  <h4>Primer 8 — IID · jitter · PI controller · Kalman filter</h4>
+  <dl>
+    <dt>IID</dt>
+    <dd>Independent and Identically Distributed. A simple EMA implicitly assumes this; NTP samples are <em>not</em> IID (shared route state, server load, …), which makes a naive EMA noisy.</dd>
+    <dt>Jitter</dt>
+    <dd>Short-term variability in RTT or offset. Distinct from <em>drift</em>, which is long-term monotonic deviation of the oscillator.</dd>
+    <dt>PI controller</dt>
+    <dd>Proportional-Integral. <code>u = Kp·error + Ki·∫error dt</code>. Proportional rejects immediate error; integral removes steady-state bias. Standard for clock-discipline loops; tune Kp/Ki for bandwidth and damping.</dd>
+    <dt>Kalman filter</dt>
+    <dd>Optimal (under Gaussian noise) state estimator tracking phase, frequency, and optionally drift, with each measurement's covariance. Strictly more powerful than PI but more parameters to get right.</dd>
+    <dt>chronyd · NTPsec</dt>
+    <dd>Two well-maintained open-source NTP clients; their disciplining loops are documented and battle-tested.</dd>
+  </dl>
+</aside>
+
+<h4 class="finding"><span class="tag cor">C4</span>Slew is linear; clocks run smooth but non-monotonic</h4>
+<p>If a new slew overrides an in-progress slew, the displayed time can briefly go backward. Slew-over-slew should either (a) complete the old slew into the anchor first, then start the new one, or (b) superimpose slews. Today neither happens — the old slew is discarded mid-flight, leaving a small residual that the next sync rediscovers.</p>
+
+<h4 class="finding"><span class="tag cor">C5</span>No sanity bound on anchor jump</h4>
+<p>An NTS provider returning 2020 would be accepted without cross-check against the previous anchor. The 200 ms concurrence gate requires core agreement, so in practice this is caught — but if 2-of-3 core sources also return 2020 (hypothetical coordinated attack or cached resolver result) we snap to 2020 silently. A monotonic bound "new anchor cannot predate the last OK anchor by more than (elapsed_qpc + 60 s slack)" would catch this class deterministically.</p>
+
+<h4 class="finding"><span class="tag cor">C6</span>Rate clamp is rectangular</h4>
+<p>Real crystal oscillators drift ~±50 ppm; ±500 ppm is 10× observed. A target beyond ±100 ppm is almost certainly an error (bad sync pair, sleep-wake with stale QPC, malicious sample). The clamp should be narrower by default and widen only on confirmed sustained drift.</p>
+
+<h4 class="finding"><span class="tag cor">C7</span>No test coverage of the adjustment math under adversarial inputs</h4>
+<p>Tests verify the concurrence gate and projection arithmetic, but nothing feeds <code>Clock_OnSyncedNtpUtc</code> a time series with injected jitter / bias / jumps and asserts stability. For a safety clock this is the single biggest gap.</p>
+
+<h2 id="availability">4. Availability analysis</h2>
+
+<aside class="primer">
+  <h4>Primer 9 — availability · DoS · back-off · dual-stack</h4>
+  <dl>
+    <dt>Availability</dt>
+    <dd>Fraction of time the service performs its intended function. For Lunar: fraction of wall-clock time during which the UI can render a trusted time (green) rather than INOP (red).</dd>
+    <dt>DoS</dt>
+    <dd>Denial of Service. Reduces availability without necessarily compromising integrity. Lunar's fail-safe stance turns many integrity threats into DoS problems — correct, but makes DoS the dominant failure mode.</dd>
+    <dt>Back-off</dt>
+    <dd>Lengthening retry interval when failures persist, to avoid hammering a degraded service. Canonical pattern: exponential with jitter.</dd>
+    <dt>Dual-stack</dt>
+    <dd>Supporting both IPv4 and IPv6 transparently, so hosts reachable only over one still work.</dd>
+  </dl>
+</aside>
+
+<h4 class="finding"><span class="tag avl">A1</span>Hard dependency on NTS availability</h4>
+<p>See S1. Real-world NTS providers (Cloudflare, Netnod, SIDN, PTB, NetTime) have had multi-hour outages; a coincident outage of two providers within our small pool puts us permanently INOP despite three healthy NIST/PTB/NICT sources.</p>
+
+<h4 class="finding"><span class="tag avl">A2</span>Aggregator wait is <code>WaitForMultipleObjects(..., TRUE, 20000)</code></h4>
+<p>If any worker is stuck (e.g. a socket call not honoring its timeout due to a Winsock driver bug), the entire cycle blocks for 20 s before the others are harvested. Core workers that completed in ~300 ms sit idle. Fix: wait with <code>WAIT_ALL=FALSE</code> and poll, or wait per-source with individual deadlines.</p>
+
+<h4 class="finding"><span class="tag avl">A3</span>5 s cadence during INOP can DoS the providers</h4>
+<p>If NIST and NICT are both degraded, we hammer them every 5 s forever. Friendly to us (fast recovery) but hostile to public infrastructure; may earn rate-limiting and prolong INOP. Recommendation: exponential back-off on INOP (5 → 10 → 20 → 60 s cap), reset to 5 s on first OK.</p>
+
+<h4 class="finding"><span class="tag avl">A4</span>No caching of "last known good anchor" for display-only fallback</h4>
+<p>Architecturally deliberate (we promise INOP when untrusted), but a user-facing concession would be: during INOP, render the last-known-good time in amber with "LAST KNOWN: 12 s ago" — still safer than the system clock, still visually distinct from trusted green, and keeps the clock usable during brief network hiccups.</p>
+
+<h4 class="finding"><span class="tag avl">A5</span>Cold-start latency</h4>
+<p>First OK cycle observed at T+6.3 s. That is the user's entire first-impression window rendering INOP. Pre-flighting a fast SNTP-only query against a cached IP (previous cycle's resolved address) while the NTS handshake catches up would shorten this considerably.</p>
+
+<h4 class="finding"><span class="tag avl">A6</span>No IPv6</h4>
+<p><code>hints.ai_family = AF_INET</code>. On IPv6-only networks (increasingly common in mobile and enterprise) the core sources fail hard.</p>
+
+<h2 id="proposal">5. Proposal (prioritized)</h2>
+
+<div class="tier t1">
+  <h3>Tier 1 — security &amp; correctness (ship first)</h3>
+  <ol>
+    <li><strong>Tiered trust with graceful degradation</strong> (addresses S1, A1).
+      <ul>
+        <li><code>TRUST_OK</code> — NTS + ≥ 2 core within 200 ms (today).</li>
+        <li><code>TRUST_DEGRADED</code> — NTS unavailable, but ≥ 3 core sources concur within <strong>100 ms</strong> (tighter) and last NTS-OK is &lt; 2 h old. Clock runs disciplined; UI shows amber "UNAUTHENTICATED"; rate is read-only (no EMA update from degraded cycles).</li>
+        <li><code>TRUST_INOP</code> — nothing else.</li>
+      </ul>
+      Availability rises; security stance is explicit (degradation is user-visible, not silent); PLL is protected from being poisoned by unauthenticated samples.
+    </li>
+    <li><strong>Anchor monotonicity guard</strong> (C5, S6). Reject any new anchor where <code>ntpUtcMs &lt; previousAnchorUtcMs + elapsedQpcMs − slack</code> (slack ≈ 60 s). Hard reject: INOP, log <code>clock: anchor rejected — retrograde time (Δ=…)</code>.</li>
+    <li><strong>Per-cycle rate-change clamp</strong> (S7, C3). Limit <code>|newRate − oldRate| ≤ 20 ppm</code> per cycle regardless of EMA math. Sustained drift still converges in ~ 5 cycles; a single adversarial pulse cannot swing the rate by &gt; 20 ppm.</li>
+    <li><strong>Disk integrity on <code>discipline.dat</code></strong> (S5). Wrap with DPAPI (<code>CryptProtectData</code>). Reject tampered files, fall back to 0-ppm bootstrap, log.</li>
+    <li><strong>Slew superposition</strong> (C4). On new residual during active slew, fold the remaining residual of the old slew into the anchor first, then start the new slew. Guarantees the displayed clock is monotonic within the slew window.</li>
+    <li><strong>Adversarial-input test suite</strong> (C7). Table-driven tests that feed <code>Clock_OnSyncedNtpUtc</code> crafted sequences: steady drift, step change, sleep-wake (QPC gap), alternating-bias attack, slow bias-drift attack. Assert: monotonicity, convergence, bounded rate excursion, no snap-storm.</li>
+  </ol>
+</div>
+
+<div class="tier t2">
+  <h3>Tier 2 — availability</h3>
+  <ol start="7">
+    <li><strong>Exponential INOP back-off</strong> (A3): 5 / 10 / 20 / 40 / 60 s, reset on OK.</li>
+    <li><strong>Parallel-harvest aggregator</strong> (A2): decouple per-source deadlines so core replies are processed the instant they arrive; NTS runs on its own 20 s budget.</li>
+    <li><strong>IPv6 dual-stack</strong> (A6): <code>AF_UNSPEC</code> + try-all.</li>
+    <li><strong>Last-known-good amber mode</strong> (A4): render recent-but-stale time distinctly, not INOP, for outages ≤ 2 min. Guarded by the <code>TRUST_DEGRADED</code> tier above.</li>
+    <li><strong>Warm-start pre-flight SNTP</strong> (A5): one unauthenticated query against the cached IP of the fastest previous source, fired in parallel with <code>Init</code>. Displayed as "SYNCING" (untrusted) until the first gated OK lands.</li>
+  </ol>
+</div>
+
+<div class="tier t3">
+  <h3>Tier 3 — defense-in-depth</h3>
+  <ol start="12">
+    <li><strong>Confidence-weighted concurrence.</strong> Gate still passes at 200 ms, but log <code>confidence = 1 − (spread/200)</code>; display HIGH / MED / LOW in About. Suspicious-but-passing cycles (&lt; 50 % for N consecutive cycles) raise a user-visible warning without forcing INOP.</li>
+    <li><strong>NTS pool health tracking.</strong> Per-provider EWMA of RTT, handshake success rate, outlier rate. Provider weight ∝ health; a recently-faulting provider gets 0 weight for N cycles.</li>
+    <li><strong>Replace ppm-EMA with PI controller</strong> (or small Kalman) (C3). Well-understood literature; chronyd is the reference. Lower steady-state wander, faster convergence, rejects measurement noise better.</li>
+    <li><strong>Kiss-o'-Death handling.</strong> We reject stratum 0 but do not parse the reference-ID kiss code. Respect <code>RATE</code> / <code>DENY</code>; apply per-provider cooldown.</li>
+    <li><strong>Add a 5th slot: Roughtime</strong> (future). Independent protocol (Cloudflare / Google). Converts NTS from single cryptographic anchor to 2-of-2.</li>
+  </ol>
+</div>
+
+<aside class="primer">
+  <h4>Primer 10 — Kiss-o'-Death · Roughtime · EWMA</h4>
+  <dl>
+    <dt>Kiss-o'-Death (KoD)</dt>
+    <dd>An NTP server reply with stratum 0 and a 4-letter reference-ID code (<code>RATE</code>, <code>DENY</code>, …) asking the client to stop or slow down. Respecting these keeps us in good standing with public servers.</dd>
+    <dt>Roughtime</dt>
+    <dd>Independently-designed secure time protocol using Ed25519 signatures with explicit "I will misbehave — here is the proof" auditability. Complements NTS: different crypto stack, different operator ecosystem.</dd>
+    <dt>EWMA</dt>
+    <dd>Exponentially Weighted Moving Average. Same as EMA; the term is common in quality-control and health-monitoring contexts. Used here for per-provider health scores.</dd>
+  </dl>
+</aside>
+
+<h2 id="recommendation">6. Recommendation</h2>
+
+<div class="callout recommendation">
+  <h4>Recommended first sprint</h4>
+  <p>Start with <strong>Tier 1 items 1–3 + 6</strong> (tiered trust, anchor monotonicity, rate-change clamp, adversarial test suite). These address the highest-severity findings (S1, S7, C3, C5, C7), each is ~150–400 LOC, and the test suite is the investment that makes every subsequent change safe.</p>
+  <p>Tier 2 availability work should be gated behind Tier 1: "improving availability" without tighter safety gates would amplify any latent correctness bug.</p>
+  <p>Tier 3 is long-term hygiene — one item per iteration once Tier 1 and Tier 2 have landed.</p>
+</div>
+
+<h2 id="glossary">Glossary</h2>
+<dl class="glossary">
+  <dt>AEAD</dt><dd>Authenticated Encryption with Associated Data.</dd>
+  <dt>API</dt><dd>Application Programming Interface.</dd>
+  <dt>CA</dt><dd>Certificate Authority.</dd>
+  <dt>DNS / DNSSEC</dt><dd>Domain Name System / DNS Security Extensions.</dd>
+  <dt>DoS</dt><dd>Denial of Service.</dd>
+  <dt>DPAPI</dt><dd>Data Protection API (Windows).</dd>
+  <dt>EMA / EWMA</dt><dd>Exponential (Weighted) Moving Average.</dd>
+  <dt>HMAC</dt><dd>Hash-based Message Authentication Code.</dd>
+  <dt>IID</dt><dd>Independent and Identically Distributed.</dd>
+  <dt>INOP</dt><dd>Inoperative.</dd>
+  <dt>KE</dt><dd>Key Establishment (the TLS-1.3 handshake phase of NTS).</dd>
+  <dt>KoD</dt><dd>Kiss-o'-Death (NTP control reply).</dd>
+  <dt>LI / VN / Mode</dt><dd>Leap Indicator / Version Number / Mode (NTP header).</dd>
+  <dt>LOC</dt><dd>Lines Of Code.</dd>
+  <dt>MAC</dt><dd>Message Authentication Code.</dd>
+  <dt>NICT</dt><dd>National Institute of Information and Communications Technology (Japan).</dd>
+  <dt>NIST</dt><dd>National Institute of Standards and Technology (USA).</dd>
+  <dt>NTP / SNTP</dt><dd>Network Time Protocol / Simple NTP.</dd>
+  <dt>NTS</dt><dd>Network Time Security (RFC 8915).</dd>
+  <dt>PI</dt><dd>Proportional-Integral feedback controller.</dd>
+  <dt>PLL</dt><dd>Phase-Locked Loop.</dd>
+  <dt>ppm</dt><dd>Parts per million.</dd>
+  <dt>PTB</dt><dd>Physikalisch-Technische Bundesanstalt (Germany).</dd>
+  <dt>QPC</dt><dd>QueryPerformanceCounter (Windows monotonic timer).</dd>
+  <dt>RFC</dt><dd>Request For Comments (IETF standards document).</dd>
+  <dt>RST</dt><dd>TCP Reset packet.</dd>
+  <dt>RTT</dt><dd>Round-Trip Time.</dd>
+  <dt>SID</dt><dd>Security Identifier (Windows).</dd>
+  <dt>SPKI</dt><dd>Subject Public Key Info.</dd>
+  <dt>TLS</dt><dd>Transport Layer Security.</dd>
+  <dt>UDP</dt><dd>User Datagram Protocol.</dd>
+  <dt>UTC</dt><dd>Coordinated Universal Time.</dd>
+</dl>
+
+</main>
+</body>
+</html>
