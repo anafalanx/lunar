@@ -59,23 +59,48 @@ static void EnsureInit(void) {
 }
 
 // --- Formatting helpers --------------------------------------------------
+//
+// All line stamps are normalised to a fixed 12-character column so
+// that message text aligns cleanly. Trusted UTC stamps are shown as
+// "HH:MM:SS.mmm"; untrusted stamps (taken before the first successful
+// sync this run) are shown as "T+NNNNN.mmms" relative to process
+// start. The date is NOT repeated on every line -- the snapshot
+// writer emits a "-- YYYY-MM-DD UTC --" header at the top and again
+// whenever the UTC date rolls over across adjacent trusted entries.
 
-static void FormatIsoUtcLine(int64_t utcMs, char *out, size_t n) {
+static void FormatUtcTimeOnly(int64_t utcMs, char *out, size_t n) {
     time_t secs = (time_t)(utcMs / 1000);
     int    msec = (int)(utcMs % 1000);
     if (msec < 0) { msec += 1000; secs -= 1; }
     struct tm tm = { 0 };
     gmtime_s(&tm, &secs);
-    _snprintf(out, n, "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ",
-              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
+    _snprintf(out, n, "%02d:%02d:%02d.%03d",
               tm.tm_hour, tm.tm_min, tm.tm_sec, msec);
+}
+
+static void FormatUtcDate(int64_t utcMs, char *out, size_t n) {
+    time_t secs = (time_t)(utcMs / 1000);
+    struct tm tm = { 0 };
+    gmtime_s(&tm, &secs);
+    _snprintf(out, n, "%04d-%02d-%02d",
+              tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+}
+
+// UTC "day number" for rollover detection. floor(utcMs / 86 400 000)
+// with correct handling of negative values.
+static int64_t UtcDayNumber(int64_t utcMs) {
+    int64_t day = utcMs / 86400000LL;
+    if (utcMs < 0 && utcMs % 86400000LL != 0) day -= 1;
+    return day;
 }
 
 static void FormatRelativeLine(uint64_t tickMs, char *out, size_t n) {
     uint64_t dt = (tickMs >= g_procStartTick) ? (tickMs - g_procStartTick) : 0;
     uint64_t s  = dt / 1000;
     uint64_t ms = dt % 1000;
-    _snprintf(out, n, "T+%08llu.%03llus",
+    // "T+NNNNN.mmms" -- 12 chars for any s < 100000 (~27 h, safely
+    // larger than the 24 h retention window).
+    _snprintf(out, n, "T+%05llu.%03llus",
               (unsigned long long)s, (unsigned long long)ms);
 }
 
@@ -149,7 +174,8 @@ void Log_Append(const char *fmt, ...) {
 size_t Log_Snapshot(char *out, size_t out_cap) {
     EnsureInit();
 
-    size_t written = 0;
+    size_t  written = 0;
+    int64_t lastDay = INT64_MIN;   // sentinel: no trusted entry seen yet
 
     EnterCriticalSection(&g_cs);
     EvictOld(GetTickCount64());
@@ -157,20 +183,46 @@ size_t Log_Snapshot(char *out, size_t out_cap) {
     for (int i = 0; i < g_count; i++) {
         const LogEntry *e = &g_ring[(g_head + i) % LOGBUF_CAP];
 
-        char stamp[40];
+        // On the first trusted entry, and on every UTC date rollover
+        // between adjacent trusted entries, emit a standalone header
+        // line "-- YYYY-MM-DD UTC --". Untrusted (T+relative) entries
+        // do not trigger headers and do not advance lastDay.
         if (e->trusted && e->utcMs != 0) {
-            FormatIsoUtcLine(e->utcMs, stamp, sizeof stamp);
+            int64_t day = UtcDayNumber(e->utcMs);
+            if (day != lastDay) {
+                char date[16];
+                FormatUtcDate(e->utcMs, date, sizeof date);
+                char hdr[64];
+                int hl = _snprintf(hdr, sizeof hdr,
+                                   "-- %s UTC --\r\n", date);
+                if (hl > 0) {
+                    size_t need = (size_t)hl;
+                    if (need >= sizeof hdr) need = sizeof hdr - 1;
+                    if (out != NULL && out_cap > 0) {
+                        size_t remain = (out_cap - 1 > written)
+                                            ? (out_cap - 1 - written) : 0;
+                        size_t copy = (need < remain) ? need : remain;
+                        memcpy(out + written, hdr, copy);
+                        written += copy;
+                    } else {
+                        written += need;
+                    }
+                }
+                lastDay = day;
+            }
+        }
+
+        char stamp[16];
+        if (e->trusted && e->utcMs != 0) {
+            FormatUtcTimeOnly(e->utcMs, stamp, sizeof stamp);
         } else {
             FormatRelativeLine(e->tickMs, stamp, sizeof stamp);
         }
 
-        // Line = "<stamp>[~]  <msg>\r\n". '~' marks untrusted stamps.
-        char line[LOGBUF_MSG_MAX + 64];
+        // Line = "<12-char stamp>  <msg>\r\n".
+        char line[LOGBUF_MSG_MAX + 32];
         int  ln = _snprintf(line, sizeof line,
-                            "%s%c  %s\r\n",
-                            stamp,
-                            e->trusted ? ' ' : '~',
-                            e->msg);
+                            "%s  %s\r\n", stamp, e->msg);
         if (ln < 0) continue;
         size_t need = (size_t)ln;
         if (need >= sizeof line) need = sizeof line - 1;

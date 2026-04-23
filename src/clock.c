@@ -9,6 +9,11 @@
 #include <wchar.h>
 
 #include "clock.h"
+#include "logbuf.h"
+
+// NOTE: Log_Append() internally reads Clock_NowUtcMs(), which also
+// takes g_cs. Every Log_Append call site in this file therefore runs
+// AFTER the CS has been released, never while it's held.
 
 // --- Persistence path -----------------------------------------------------
 
@@ -103,16 +108,30 @@ void Clock_Init(void) {
     g_ratePpm    = 0;
     g_haveSample = 0;
     g_haveRate   = 0;
+
+    if (g_loadedRatePpm != 0) {
+        Log_Append("clock: persisted rate %+d ppm loaded from disk "
+                   "(bootstrap; will be re-verified on first sync)",
+                   (int)g_loadedRatePpm);
+    } else {
+        Log_Append("clock: no persisted rate on disk (fresh discipline)");
+    }
 }
 
 void Clock_Shutdown(void) {
-    if (!g_haveRate) return;  // don't overwrite a good rate with a guess
+    if (!g_haveRate) {
+        Log_Append("clock: shutdown \xe2\x80\x94" " rate not persisted "
+                   "(only one sample this run)");
+        return;
+    }
     wchar_t path[MAX_PATH]; DisciplinePathW(path, MAX_PATH);
     if (!path[0]) return;
     FILE *f = _wfopen(path, L"wb");
     if (!f) return;
     fprintf(f, "%d %lld\n", (int)g_ratePpm, (long long)g_lastSyncUtcMs);
     fclose(f);
+    Log_Append("clock: shutdown \xe2\x80\x94" " persisted rate=%+d ppm",
+               (int)g_ratePpm);
 }
 
 // Project a QPC tick onto disciplined UTC ms using current anchor + rate.
@@ -193,6 +212,17 @@ int32_t Clock_RatePpm(void)   { return g_haveRate ? g_ratePpm : 0; }
 // round-trip halving in ntp.c already.
 void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
     if (!g_csInit) Clock_Init();
+
+    // We build a log record INSIDE the CS (cheap local scalars only),
+    // then emit it AFTER LeaveCriticalSection to avoid the re-entrant
+    // Log_Append -> Clock_NowUtcMs -> g_cs deadlock.
+    enum { EV_FIRST, EV_FIRST_STALE, EV_SUBSEQ } ev = EV_SUBSEQ;
+    int32_t oldRate = 0, newRate = 0;
+    int64_t errorMs = 0;
+    int     didSnap = 0;
+    int     rateMeasured = 0;       // did this cycle refresh the rate?
+    int64_t staleAgeDays = 0;       // only meaningful when ev==EV_FIRST_STALE
+
     EnterCriticalSection(&g_cs);
 
     if (!g_haveSample) {
@@ -202,7 +232,11 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
         // Windows system clock), discard it.
         if (g_loadedLastSync > 0
             && ntpUtcMs - g_loadedLastSync > 30LL * 86400LL * 1000LL) {
+            staleAgeDays = (ntpUtcMs - g_loadedLastSync) / 86400000LL;
             g_loadedRatePpm = 0;
+            ev = EV_FIRST_STALE;
+        } else {
+            ev = EV_FIRST;
         }
 
         // Anchor, apply persisted rate as a bootstrap, but mark rate
@@ -219,11 +253,14 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
         g_lastSyncQpc   = localQpc;
         g_slewTotalMs   = 0;
         g_slewDurationMs = 0;
+        newRate = g_ratePpm;
     } else {
         // Subsequent sync. Compare server UTC to what WE thought the
         // time was at localQpc, given our current anchor+rate.
         int64_t predicted = ProjectLocked(localQpc);
         int64_t error     = ntpUtcMs - predicted;   // >0: we're behind
+        errorMs = error;
+        oldRate = g_ratePpm;
 
         // Measure the drift since the previous sync for the PLL update.
         int64_t dqpc   = localQpc - g_lastSyncQpc;
@@ -248,7 +285,9 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
                                        * RATE_EMA_NUM) / RATE_EMA_DEN);
             g_ratePpm = old + delta;
             g_haveRate = 1;
+            rateMeasured = 1;
         }
+        newRate = g_ratePpm;
 
         if (error > SLEW_THRESHOLD_MS || error < -SLEW_THRESHOLD_MS) {
             // Big jump (sleep-wake, user changed clock, first NTP
@@ -257,12 +296,14 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
             g_anchorUtcMs  = ntpUtcMs;
             g_slewTotalMs  = 0;
             g_slewDurationMs = 0;
+            didSnap = 1;
         } else {
             // Small residual: slew gradually so the second hand stays
             // smooth. Any currently-running slew is superseded.
             g_slewStartQpc   = localQpc;
             g_slewTotalMs    = error;
             g_slewDurationMs = SLEW_WINDOW_MS;
+            didSnap = 0;
         }
 
         g_lastSyncUtcMs = ntpUtcMs;
@@ -270,6 +311,43 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
     }
 
     LeaveCriticalSection(&g_cs);
+
+    // --- Emit the log line (outside the CS). ---
+    switch (ev) {
+    case EV_FIRST:
+        if (newRate != 0) {
+            Log_Append("clock: first anchor acquired \xe2\x80\x94"
+                       " applying persisted rate %+d ppm as bootstrap",
+                       (int)newRate);
+        } else {
+            Log_Append("clock: first anchor acquired \xe2\x80\x94"
+                       " no rate yet (needs a second sync to measure drift)");
+        }
+        break;
+    case EV_FIRST_STALE:
+        Log_Append("clock: first anchor acquired \xe2\x80\x94"
+                   " discarding persisted rate (saved %lld days ago, "
+                   "exceeds 30-day staleness window)",
+                   (long long)staleAgeDays);
+        break;
+    case EV_SUBSEQ: {
+        const char *adj = didSnap ? "snap" : "slew over 60s";
+        if (rateMeasured) {
+            Log_Append("clock: sync \xe2\x80\x94"
+                       " residual %+lldms  adj=%s  rate %+d\xe2\x86\x92"
+                       "%+d ppm (\xce\x94%+d, EMA \xce\xb1=0.25)",
+                       (long long)errorMs, adj,
+                       (int)oldRate, (int)newRate,
+                       (int)(newRate - oldRate));
+        } else {
+            Log_Append("clock: sync \xe2\x80\x94"
+                       " residual %+lldms  adj=%s  rate %+d ppm "
+                       "(interval too short to re-measure)",
+                       (long long)errorMs, adj, (int)newRate);
+        }
+        break;
+    }
+    }
 }
 
 // Called by ntp.c at the end of every polling cycle. The concurrence
@@ -287,10 +365,18 @@ void Clock_OnPollCycle(TrustState state,
     (void)maxPairSpreadMs;   // reserved for future audit-log use
     if (!g_csInit) Clock_Init();
 
+    TrustState prev;
+    int64_t    faultDiffMs = 0;
+
     if (state == TRUST_INOP) {
         EnterCriticalSection(&g_cs);
+        prev = g_trust;
         g_trust = TRUST_INOP;
         LeaveCriticalSection(&g_cs);
+        if (prev != TRUST_INOP) {
+            Log_Append("clock: trust OK \xe2\x86\x92"
+                       " INOP (NTP cycle failed concurrence gate)");
+        }
         return;
     }
 
@@ -303,23 +389,40 @@ void Clock_OnPollCycle(TrustState state,
         int64_t predicted = ProjectLocked(bestQpc);
         int64_t diff = bestUtcMs - predicted;
         if (diff < 0) diff = -diff;
-        if (diff > 200) localFault = 1;
+        if (diff > 200) {
+            localFault  = 1;
+            faultDiffMs = bestUtcMs - predicted;
+        }
     }
     LeaveCriticalSection(&g_cs);
 
     if (localFault) {
         EnterCriticalSection(&g_cs);
+        prev = g_trust;
         g_trust = TRUST_INOP;
         LeaveCriticalSection(&g_cs);
+        Log_Append("clock: local-oscillator fault \xe2\x80\x94"
+                   " 3/3 servers concurred but our projection differs "
+                   "by %+lldms (>200ms); tripping INOP",
+                   (long long)faultDiffMs);
+        if (prev != TRUST_INOP) {
+            Log_Append("clock: trust OK \xe2\x86\x92 INOP");
+        }
         return;
     }
 
     // Accept the sample: run the normal PLL/slew update.
+    // (Clock_OnSyncedNtpUtc emits its own log line.)
     Clock_OnSyncedNtpUtc(bestUtcMs, bestQpc);
 
     EnterCriticalSection(&g_cs);
+    prev = g_trust;
     g_trust = state;
     LeaveCriticalSection(&g_cs);
+    if (prev != state && state == TRUST_OK) {
+        Log_Append("clock: trust INOP \xe2\x86\x92"
+                   " OK (3/3 sources concurred)");
+    }
 }
 
 TrustState Clock_Trust(void) {
