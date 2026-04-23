@@ -50,11 +50,37 @@ static int64_t    g_slewDurationMs = 0;  // over how long (currently 60000)
 // TRUST_INOP and stays there until the first cycle achieves concurrence.
 static TrustState g_trust         = TRUST_INOP;
 
-#define RATE_CLAMP_PPM       500    // reject/clamp absurd rate updates
-#define RATE_EMA_NUM         1      // new rate weight = 1/4 (EMA alpha 0.25)
-#define RATE_EMA_DEN         4
-#define SLEW_THRESHOLD_MS    2000   // residual above this snaps instead
-#define SLEW_WINDOW_MS       60000  // slew small residuals over ~60 s
+// Counts consecutive local-oscillator-fault rejections. If the NTP
+// cycle concurs (≥2 core + NTS agree) but our running projection
+// disagrees by >200 ms for several cycles in a row, our anchor/rate
+// are clearly wrong -- an automatic escape hatch forces a snap after
+// LOCAL_FAULT_ESCAPE_N faults to recover without user intervention.
+static int        g_consecutiveLocalFaults = 0;
+#define LOCAL_FAULT_ESCAPE_N  3
+
+// --- Discipline-loop constants --------------------------------------------
+//
+// Rate control is a PI loop where the integral term is the per-cycle
+// rate correction:
+//
+//   observed_ppm  = residual * 1e6 / interval_ms
+//   delta_ppm     = observed_ppm * KI_NUM / KI_DEN       -- integral step
+//   delta_ppm     = clamp(delta_ppm, ±PER_CYCLE_RATE_CLAMP_PPM)
+//   new_rate_ppm  = clamp(old + delta, ±RATE_CLAMP_PPM)
+//
+// Phase correction is absorbed by re-anchoring the clockwork to the
+// server's reading on every sync (the anchor always represents truth).
+// The visible-slew mechanism in ProjectLocked() is a pure cosmetic
+// decay that keeps the second hand smooth across a re-anchor; it is
+// NOT baked into the anchor and therefore cannot contaminate the next
+// cycle's residual measurement -- a previous design that did bake the
+// slew produced a self-reinforcing limit cycle (see audit 2026-04-23).
+#define RATE_CLAMP_PPM              200    // realistic quartz: ±50 ppm typ
+#define PER_CYCLE_RATE_CLAMP_PPM    20     // max rate swing per single cycle
+#define KI_NUM                      1      // integral gain = 1/8 (gentle)
+#define KI_DEN                      8
+#define SLEW_THRESHOLD_MS           2000   // residual above this snaps instead
+#define SLEW_WINDOW_MS              60000  // cosmetic decay window (~60 s)
 
 int64_t Clock_Qpc(void) {
     LARGE_INTEGER q;
@@ -135,43 +161,48 @@ void Clock_Shutdown(void) {
 }
 
 // Project a QPC tick onto disciplined UTC ms using current anchor + rate.
+//
+// The anchor (g_anchorQpc, g_anchorUtcMs) always represents our best
+// belief of truth at that QPC moment. Between syncs we project forward
+// using g_ratePpm. On top of that we may add a cosmetic VISUAL slew
+// that decays from g_slewTotalMs to zero over g_slewDurationMs: its
+// sole purpose is to smooth the transition when a sync re-anchors to a
+// slightly different UTC than we were projecting, so the second hand
+// does not jump. The cosmetic slew is NEVER baked into the anchor,
+// because the anchor already represents truth -- baking the visual
+// residual back in was the source of a self-reinforcing limit cycle
+// in the pre-2026-04-23 design.
 static int64_t ProjectLocked(int64_t qpc) {
-    // elapsed_sec = (qpc - anchorQpc) / qpcFreq
-    // elapsed_ms  = elapsed_sec * 1000
-    // corrected   = elapsed_ms  * (1 + ratePpm/1e6)
-    // anchorUtcMs + corrected
     int64_t dQ = qpc - g_anchorQpc;
-    // Base elapsed ms with 64-bit precision:
-    //   dMs_base = dQ * 1000 / freq
-    // Keep this in int64 with rounding to nearest to avoid accumulating
-    // a truncation bias.
+    // Base elapsed ms with 64-bit precision and round-to-nearest.
     int64_t dMs_base;
     if (dQ >= 0) dMs_base = (dQ * 1000LL + g_qpcFreq / 2) / g_qpcFreq;
     else         dMs_base = (dQ * 1000LL - g_qpcFreq / 2) / g_qpcFreq;
 
-    // Rate correction: ppm deviation. Integer ms result.
-    //   rateMs = dMs_base * ratePpm / 1e6
     int64_t rateMs = (dMs_base * (int64_t)g_ratePpm) / 1000000LL;
     int64_t utcMs  = g_anchorUtcMs + dMs_base + rateMs;
 
-    // Slew any pending residual: if we have to move the displayed time
-    // by +/- S ms gradually over W ms since slewStartQpc, inject
-    // S * progress(0..1) and retire the residual when progress reaches 1.
+    // Cosmetic visual slew: linearly decay the residual from its
+    // initial value to zero over g_slewDurationMs. Initial value is
+    // (displayed_before_reanchor - anchor_utc), so at slew start the
+    // displayed time equals what the user saw immediately before the
+    // re-anchor. It then ramps to the (now-authoritative) anchor-based
+    // projection.
     if (g_slewTotalMs != 0 && g_slewDurationMs > 0) {
-        int64_t sinceMs;
         int64_t dq2 = qpc - g_slewStartQpc;
         if (dq2 < 0) dq2 = 0;
-        sinceMs = (dq2 * 1000LL + g_qpcFreq / 2) / g_qpcFreq;
+        int64_t sinceMs = (dq2 * 1000LL + g_qpcFreq / 2) / g_qpcFreq;
         if (sinceMs >= g_slewDurationMs) {
-            utcMs += g_slewTotalMs;
-            // Bake finished slew into the anchor so subsequent reads
-            // don't re-apply it.
-            g_anchorUtcMs   += g_slewTotalMs;
+            // Cosmetic slew has fully decayed to zero: clear state.
+            // Crucially we do NOT modify the anchor here -- the anchor
+            // was already truth when the slew was installed.
             g_slewTotalMs    = 0;
             g_slewDurationMs = 0;
         } else {
-            int64_t add = (g_slewTotalMs * sinceMs) / g_slewDurationMs;
-            utcMs += add;
+            int64_t remaining =
+                (g_slewTotalMs * (g_slewDurationMs - sinceMs))
+                / g_slewDurationMs;
+            utcMs += remaining;
         }
     }
     return utcMs;
@@ -255,53 +286,68 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
         g_slewDurationMs = 0;
         newRate = g_ratePpm;
     } else {
-        // Subsequent sync. Compare server UTC to what WE thought the
-        // time was at localQpc, given our current anchor+rate.
-        int64_t predicted = ProjectLocked(localQpc);
-        int64_t error     = ntpUtcMs - predicted;   // >0: we're behind
+        // Subsequent sync. Measure clean drift error relative to the
+        // anchor-only projection (no cosmetic slew component) so the
+        // residual reflects true oscillator drift, not the visual
+        // decay still in flight from the previous cycle.
+        int64_t dQ = localQpc - g_anchorQpc;
+        int64_t dMs_base = (dQ >= 0)
+            ? (dQ * 1000LL + g_qpcFreq / 2) / g_qpcFreq
+            : (dQ * 1000LL - g_qpcFreq / 2) / g_qpcFreq;
+        int64_t rateMs   = (dMs_base * (int64_t)g_ratePpm) / 1000000LL;
+        int64_t projectionPure = g_anchorUtcMs + dMs_base + rateMs;
+        int64_t error          = ntpUtcMs - projectionPure;    // >0: we're behind
         errorMs = error;
         oldRate = g_ratePpm;
 
-        // Measure the drift since the previous sync for the PLL update.
+        // What the user is currently SEEING (anchor projection plus any
+        // still-decaying cosmetic slew). We use this only to set up the
+        // next cosmetic slew so the transition is seamless.
+        int64_t displayedNow = ProjectLocked(localQpc);
+
+        // PI rate update: integral term on residual-rate.
         int64_t dqpc   = localQpc - g_lastSyncQpc;
         int64_t elapMs = (dqpc * 1000LL + g_qpcFreq / 2) / g_qpcFreq;
         if (elapMs > 30000) {
-            // newPpm deviation suggested by THIS interval:
-            //   observed_rate = (error / elapMs)   (as fraction of 1)
-            //   observed_ppm  = error * 1e6 / elapMs
-            // Current rate was g_ratePpm; if we were perfectly right
-            // then error would be zero. So the correction we need to
-            // *apply* is observed_ppm.
-            int64_t corr = (error * 1000000LL) / elapMs;
-            if (corr >  RATE_CLAMP_PPM * 4) corr =  RATE_CLAMP_PPM * 4;
-            if (corr < -RATE_CLAMP_PPM * 4) corr = -RATE_CLAMP_PPM * 4;
-            int32_t target = (int32_t)(g_ratePpm + corr);
+            // observed_ppm = residual rate error (X - R_old) in ppm.
+            int64_t observed_ppm = (error * 1000000LL) / elapMs;
+            // Integral step: gentle gain (Ki = 1/8).
+            int64_t delta = (observed_ppm * KI_NUM) / KI_DEN;
+            // Per-cycle change clamp: a single measurement can never
+            // swing the rate by more than PER_CYCLE_RATE_CLAMP_PPM.
+            // This is the anti-oscillation safety net.
+            if (delta >  PER_CYCLE_RATE_CLAMP_PPM) delta =  PER_CYCLE_RATE_CLAMP_PPM;
+            if (delta < -PER_CYCLE_RATE_CLAMP_PPM) delta = -PER_CYCLE_RATE_CLAMP_PPM;
+            int32_t target = (int32_t)(g_ratePpm + delta);
+            // Absolute rate clamp.
             if (target >  RATE_CLAMP_PPM) target =  RATE_CLAMP_PPM;
             if (target < -RATE_CLAMP_PPM) target = -RATE_CLAMP_PPM;
-
-            // EMA: new = old + (target - old) * alpha
-            int32_t old = g_ratePpm;
-            int32_t delta = (int32_t)(((int64_t)(target - old)
-                                       * RATE_EMA_NUM) / RATE_EMA_DEN);
-            g_ratePpm = old + delta;
+            g_ratePpm  = target;
             g_haveRate = 1;
             rateMeasured = 1;
         }
         newRate = g_ratePpm;
 
+        // Phase correction: ALWAYS re-anchor to the server's reading.
+        // The anchor now represents truth; subsequent residual
+        // measurements are clean.
+        g_anchorQpc   = localQpc;
+        g_anchorUtcMs = ntpUtcMs;
+
         if (error > SLEW_THRESHOLD_MS || error < -SLEW_THRESHOLD_MS) {
-            // Big jump (sleep-wake, user changed clock, first NTP
-            // after a bad bootstrap). Snap.
-            g_anchorQpc    = localQpc;
-            g_anchorUtcMs  = ntpUtcMs;
-            g_slewTotalMs  = 0;
+            // Big jump (sleep-wake, user changed clock, bad bootstrap
+            // replaced by first good sync). No cosmetic smoothing --
+            // smoothing a 2+ s error would be worse than the jump.
+            g_slewTotalMs    = 0;
             g_slewDurationMs = 0;
             didSnap = 1;
         } else {
-            // Small residual: slew gradually so the second hand stays
-            // smooth. Any currently-running slew is superseded.
+            // Small error: install a cosmetic visual slew so the display
+            // does not jump at the moment of re-anchor. The slew starts
+            // at (displayedNow - ntpUtcMs) and decays linearly to 0 over
+            // SLEW_WINDOW_MS, bringing the user smoothly to the new truth.
             g_slewStartQpc   = localQpc;
-            g_slewTotalMs    = error;
+            g_slewTotalMs    = displayedNow - ntpUtcMs;
             g_slewDurationMs = SLEW_WINDOW_MS;
             didSnap = 0;
         }
@@ -335,10 +381,11 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
         if (rateMeasured) {
             Log_Append("clock: sync \xe2\x80\x94"
                        " residual %+lldms  adj=%s  rate %+d\xe2\x86\x92"
-                       "%+d ppm (\xce\x94%+d, EMA \xce\xb1=0.25)",
+                       "%+d ppm (\xce\x94%+d, PI Ki=1/8, clamp \xc2\xb1%d/cycle)",
                        (long long)errorMs, adj,
                        (int)oldRate, (int)newRate,
-                       (int)(newRate - oldRate));
+                       (int)(newRate - oldRate),
+                       PER_CYCLE_RATE_CLAMP_PPM);
         } else {
             Log_Append("clock: sync \xe2\x80\x94"
                        " residual %+lldms  adj=%s  rate %+d ppm "
@@ -397,19 +444,57 @@ void Clock_OnPollCycle(TrustState state,
     LeaveCriticalSection(&g_cs);
 
     if (localFault) {
+        int faultCount;
+        EnterCriticalSection(&g_cs);
+        g_consecutiveLocalFaults++;
+        faultCount = g_consecutiveLocalFaults;
+        LeaveCriticalSection(&g_cs);
+
+        if (faultCount >= LOCAL_FAULT_ESCAPE_N) {
+            // Escape hatch: N consecutive cycles where all gating
+            // sources concurred but we rejected them means OUR state
+            // (anchor/rate) is the broken party, not the network.
+            // Force-accept this sample as a snap to recover without
+            // user intervention, and reset the counter.
+            EnterCriticalSection(&g_cs);
+            g_consecutiveLocalFaults = 0;
+            LeaveCriticalSection(&g_cs);
+            Log_Append("clock: escape hatch \xe2\x80\x94"
+                       " %d consecutive local-oscillator faults "
+                       "(diff %+lldms); forcing snap to recover",
+                       faultCount, (long long)faultDiffMs);
+            Clock_OnSyncedNtpUtc(bestUtcMs, bestQpc);
+
+            EnterCriticalSection(&g_cs);
+            prev = g_trust;
+            g_trust = state;
+            LeaveCriticalSection(&g_cs);
+            if (prev != state && state == TRUST_OK) {
+                Log_Append("clock: trust INOP \xe2\x86\x92"
+                           " OK (recovered via escape hatch)");
+            }
+            return;
+        }
+
         EnterCriticalSection(&g_cs);
         prev = g_trust;
         g_trust = TRUST_INOP;
         LeaveCriticalSection(&g_cs);
         Log_Append("clock: local-oscillator fault \xe2\x80\x94"
                    " 3/3 servers concurred but our projection differs "
-                   "by %+lldms (>200ms); tripping INOP",
-                   (long long)faultDiffMs);
+                   "by %+lldms (>200ms); tripping INOP [%d/%d before escape]",
+                   (long long)faultDiffMs,
+                   faultCount, LOCAL_FAULT_ESCAPE_N);
         if (prev != TRUST_INOP) {
             Log_Append("clock: trust OK \xe2\x86\x92 INOP");
         }
         return;
     }
+
+    // Sample accepted (no local fault). Reset fault counter.
+    EnterCriticalSection(&g_cs);
+    g_consecutiveLocalFaults = 0;
+    LeaveCriticalSection(&g_cs);
 
     // Accept the sample: run the normal PLL/slew update.
     // (Clock_OnSyncedNtpUtc emits its own log line.)

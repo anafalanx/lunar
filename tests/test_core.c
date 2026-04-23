@@ -467,21 +467,24 @@ static void test_clock_discipline(void) {
 
     // Second sample: pretend 1 hour of QPC elapsed, and the server says
     // we drifted +100 ms. Observed rate correction = +100 ms / 3.6e6 ms
-    // = +27.7 ppm. EMA alpha = 0.25, starting from 0 => new rate ~= 6-7 ppm.
+    // = +27.7 ppm. PI Ki=1/8, starting from 0 => new rate ~= 3 ppm.
     int64_t oneHourQpc = t0_qpc + qpcFreq * 3600;
     int64_t t1_utc     = t0_utc + 3600LL * 1000 + 100;  // server says +100ms
     Clock_OnSyncedNtpUtc(t1_utc, oneHourQpc);
     int32_t r1 = Clock_RatePpm();
-    CHECK(r1 >= 5 && r1 <= 9);   // 27.7 * 0.25 = 6.9
+    CHECK(r1 >= 2 && r1 <= 5);   // 27.7 * (1/8) = 3.5
 
-    // Third sample another hour later, again +100 ms drift vs our
-    // (still-too-slow) rate of ~7 ppm. EMA should pull us further up.
+    // Third sample another hour later: re-anchor means the clock's
+    // anchor is now (oneHourQpc, t1_utc) with rate r1. Over the next
+    // hour with ~3 ppm, projection accounts for ~10.8 ms; server
+    // reports another +100 ms total drift, leaving ~89 ms residual.
+    // observed_ppm ~= 24.7, delta ~= 3 ppm, so r2 ~= r1 + 3.
     int64_t twoHourQpc = t0_qpc + qpcFreq * 7200;
     int64_t t2_utc     = t1_utc + 3600LL * 1000 + 100;
     Clock_OnSyncedNtpUtc(t2_utc, twoHourQpc);
     int32_t r2 = Clock_RatePpm();
-    CHECK(r2 > r1);            // PLL is converging toward ~28 ppm
-    CHECK(r2 < 35);            // but clamped/smoothed, not overshooting
+    CHECK(r2 > r1);            // PI is converging toward ~28 ppm
+    CHECK(r2 < 20);            // gently, bounded by per-cycle clamp
 
     // Clock_Shutdown must persist r2 and a >30-day-old timestamp must
     // be rejected on reload. First shutdown+reload with fresh timestamp
