@@ -447,11 +447,11 @@ static int HitTestHour(float mx, float my, float cx, float cy, float S) {
 // Timezone label + trust indicator -> window title
 // ---------------------------------------------------------------------------
 //
-// Title format (U+2014 em-dashes separate the segments):
+// Title format:
 //
-//   14:37  -  CET  -  Lunar
-//   2:37 PM  -  Europe/Paris (UTC+1)  -  Lunar
-//   UTC  -  Lunar                                   (no trusted time yet)
+//   14:37  Europe/Paris (UTC+2, DST)
+//   2:37 PM  Europe/Paris (UTC+1)
+//   UTC                                   (no trusted time yet)
 //
 // Called from Tick() every ~200 ms; SetWindowTextW is only invoked when
 // the composed string actually changes, so the caption does not churn.
@@ -492,11 +492,9 @@ static void UpdateTitleBar(void) {
 
     WCHAR title[192];
     if (when[0]) {
-        _snwprintf_s(title, 192, _TRUNCATE,
-                     L"%ls  \x2014  %ls  \x2014  Lunar", when, tz);
+        _snwprintf_s(title, 192, _TRUNCATE, L"%ls  %ls", when, tz);
     } else {
-        _snwprintf_s(title, 192, _TRUNCATE,
-                     L"%ls  \x2014  Lunar", tz);
+        _snwprintf_s(title, 192, _TRUNCATE, L"%ls", tz);
     }
 
     if (wcscmp(title, s_last) != 0) {
