@@ -50,6 +50,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <assert.h>
 
 #include "ntp.h"
 #include "clock.h"
@@ -63,9 +64,17 @@
 #define NTP_PORT_NUM         123
 #define NTP_TIMEOUT_MS       6000      // core slot UDP recv timeout
 #define NTS_SLOT_TIMEOUT_MS  20000     // KE (TLS 1.3 + handshake) + authenticated UDP
+#define NTP_PACKET_LEN       48
 #define NTP_EPOCH_DELTA_S    2208988800ULL        // seconds between 1900 and 1970
 #define FRESH_WINDOW_MS      (2LL * 60LL * 60LL * 1000LL) // 2 hours
 #define CONCUR_THRESHOLD_MS  200
+
+static_assert(NTP_CORE_COUNT + NTP_NTS_COUNT == NTP_SOURCE_COUNT,
+              "NTP source slots must sum to the published total");
+static_assert(NTP_FIRST_NTS_SLOT == NTP_CORE_COUNT,
+              "NTS slots must immediately follow core slots");
+static_assert(NTP_PACKET_LEN == 48,
+              "SNTP client packet header must be 48 bytes");
 
 // --- Core pool (plain SNTP) ---------------------------------------------
 
@@ -88,22 +97,25 @@ typedef struct {
 } NtpSource;
 
 static const NtpSource kCorePool[] = {
-    { "time.nist.gov",     "NIST",    "US"  },   // Boulder / Gaithersburg
-    { "tick.usno.navy.mil","USNO-a",  "US"  },   // US Naval Observatory (east)
-    { "tock.usno.navy.mil","USNO-b",  "US"  },   // US Naval Observatory (alt)
-    { "ptbtime1.ptb.de",   "PTB-1",   "DE"  },   // Physikalisch-Tech. Bundesanstalt
-    { "ptbtime2.ptb.de",   "PTB-2",   "DE"  },
-    { "ntp1.npl.co.uk",    "NPL-1",   "UK"  },   // Nat. Physical Laboratory
-    { "ntp2.npl.co.uk",    "NPL-2",   "UK"  },
-    { "ntp.nict.jp",       "NICT",    "JP"  },   // Nat. Inst. of Info. and Comm. Tech.
-    { "ntp1.inrim.it",     "INRIM-1", "IT"  },   // Ist. Naz. di Ricerca Metrologica
-    { "ntp2.inrim.it",     "INRIM-2", "IT"  },
-    { "hora.roa.es",       "ROA",     "ES"  },   // Real Instituto y Observatorio de la Armada
-    { "ntp11.metas.ch",    "METAS",   "CH"  },   // Swiss Federal Institute of Metrology
-    { "ntp1.sp.se",        "RISE",    "SE"  },   // RISE Research Institutes of Sweden
+    { .host = "time.nist.gov",      .label = "NIST",    .geo = "US" }, // Boulder / Gaithersburg
+    { .host = "tick.usno.navy.mil", .label = "USNO-a",  .geo = "US" }, // US Naval Observatory (east)
+    { .host = "tock.usno.navy.mil", .label = "USNO-b",  .geo = "US" }, // US Naval Observatory (alt)
+    { .host = "ptbtime1.ptb.de",    .label = "PTB-1",   .geo = "DE" }, // Physikalisch-Tech. Bundesanstalt
+    { .host = "ptbtime2.ptb.de",    .label = "PTB-2",   .geo = "DE" },
+    { .host = "ntp1.npl.co.uk",     .label = "NPL-1",   .geo = "UK" }, // Nat. Physical Laboratory
+    { .host = "ntp2.npl.co.uk",     .label = "NPL-2",   .geo = "UK" },
+    { .host = "ntp.nict.jp",        .label = "NICT",    .geo = "JP" }, // Nat. Inst. of Info. and Comm. Tech.
+    { .host = "ntp1.inrim.it",      .label = "INRIM-1", .geo = "IT" }, // Ist. Naz. di Ricerca Metrologica
+    { .host = "ntp2.inrim.it",      .label = "INRIM-2", .geo = "IT" },
+    { .host = "hora.roa.es",        .label = "ROA",     .geo = "ES" }, // Real Instituto y Observatorio de la Armada
+    { .host = "ntp11.metas.ch",     .label = "METAS",   .geo = "CH" }, // Swiss Federal Institute of Metrology
+    { .host = "ntp1.sp.se",         .label = "RISE",    .geo = "SE" }, // RISE Research Institutes of Sweden
 };
 
 #define CORE_POOL_SIZE   (sizeof kCorePool / sizeof kCorePool[0])
+
+static_assert(CORE_POOL_SIZE >= NTP_CORE_COUNT,
+              "core NTP pool must have enough sources for each cycle");
 
 // Published label buffers for each NTS slot. Pointed to by
 // g_results[4..5].label, so they MUST outlive the aggregator thread
@@ -154,7 +166,7 @@ static int NtpQueryHost(const char *host,
                         int64_t *outNtpUtcMs,
                         int64_t *outQpcAtT4,
                         uint32_t *outRttMs) {
-    unsigned char pkt[48];
+    unsigned char pkt[NTP_PACKET_LEN];
     memset(pkt, 0, sizeof(pkt));
     pkt[0] = 0x23;  // LI=0, VN=4, Mode=3 (client)
 

@@ -37,13 +37,15 @@ extern "C" {
 #define NTS_EF_COOKIE_PLACEHOLDER   0x0304
 #define NTS_EF_AUTHENTICATOR        0x0404
 
+#define NTS_NTP_HEADER_LEN          48
 #define NTS_UNIQUE_ID_LEN           32
 #define NTS_NONCE_LEN               16   // what we use; RFC allows >= 16
 
 // Build an NTS-authenticated SNTP client request.
 //
 // Inputs:
-//   ntp_header[48]   Caller-composed NTP header (LI/VN/Mode, stratum,
+//   ntp_header[NTS_NTP_HEADER_LEN]
+//                    Caller-composed NTP header (LI/VN/Mode, stratum,
 //                    poll, precision, root delay / dispersion, refid,
 //                    ref/originate/receive timestamps, and the
 //                    Transmit Timestamp the caller wants echoed). This
@@ -66,7 +68,7 @@ extern "C" {
 //
 // Returns 0 on success, non-zero on any failure (bad args, short
 // output buffer, SIV error).
-int NtsEf_BuildRequest(const uint8_t  ntp_header[48],
+int NtsEf_BuildRequest(const uint8_t  ntp_header[NTS_NTP_HEADER_LEN],
                        const uint8_t  unique_id[NTS_UNIQUE_ID_LEN],
                        const uint8_t  nonce[NTS_NONCE_LEN],
                        const uint8_t *cookie, size_t clen,

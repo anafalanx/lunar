@@ -37,6 +37,12 @@
 #include "nts_ef.h"
 #include "siv.h"
 #include <string.h>
+#include <assert.h>
+
+static_assert(NTS_NTP_HEADER_LEN == 48,
+              "NTS extension fields must preserve the 48-byte NTP header");
+static_assert(NTS_NONCE_LEN >= 16,
+              "NTS authenticator nonce must satisfy RFC 8915 minimum length");
 
 // --- Small helpers ----------------------------------------------------
 
@@ -72,7 +78,7 @@ static size_t emit_ef(uint8_t *buf, size_t cap, size_t pos,
 
 // --- Request builder --------------------------------------------------
 
-int NtsEf_BuildRequest(const uint8_t  ntp_header[48],
+int NtsEf_BuildRequest(const uint8_t  ntp_header[NTS_NTP_HEADER_LEN],
                        const uint8_t  unique_id[NTS_UNIQUE_ID_LEN],
                        const uint8_t  nonce[NTS_NONCE_LEN],
                        const uint8_t *cookie, size_t clen,
@@ -85,10 +91,10 @@ int NtsEf_BuildRequest(const uint8_t  ntp_header[48],
         !c2s_key || !out || !out_len) return -1;
     if (clen == 0 || clen > NTSKE_MAX_COOKIE_LEN) return -1;
     if (n_placeholder >= NTSKE_MAX_COOKIES) return -1;
-    if (out_cap < 48) return -1;
+    if (out_cap < NTS_NTP_HEADER_LEN) return -1;
 
-    size_t pos = 48;
-    memcpy(out, ntp_header, 48);
+    size_t pos = NTS_NTP_HEADER_LEN;
+    memcpy(out, ntp_header, NTS_NTP_HEADER_LEN);
 
     size_t w;
 
@@ -174,9 +180,9 @@ int NtsEf_ParseResponse(const uint8_t *in, size_t in_len,
         !out_new_cookies || !out_new_cookie_lens || !out_new_count) return -1;
 
     *out_new_count = 0;
-    if (in_len < 48) return -1;
+    if (in_len < NTS_NTP_HEADER_LEN) return -1;
 
-    size_t pos        = 48;
+    size_t pos        = NTS_NTP_HEADER_LEN;
     int    saw_uid    = 0;
     size_t auth_pos   = 0;
     int    saw_auth   = 0;

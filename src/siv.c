@@ -28,6 +28,7 @@
 #include "siv.h"
 
 #include <string.h>
+#include <assert.h>
 
 #include "mbedtls/cipher.h"
 #include "mbedtls/cmac.h"
@@ -35,25 +36,37 @@
 #include "mbedtls/constant_time.h"
 #include "mbedtls/platform_util.h"
 
+enum {
+    SIV_KEY_LEN = 32,
+    SIV_HALF_KEY_LEN = 16,
+    SIV_BLOCK_LEN = 16,
+    SIV_AES_KEY_BITS = 128,
+};
+
+static_assert(SIV_KEY_LEN == 2 * SIV_HALF_KEY_LEN,
+              "AES-SIV-CMAC-256 key must split into K1 || K2");
+static_assert(SIV_HALF_KEY_LEN == SIV_BLOCK_LEN,
+              "AES-128 SIV half-key length must match the block length");
+
 // GF(2^128) doubling used by S2V (RFC 5297 §2.3). Big-endian 16-byte
 // block v is treated as a polynomial; this left-shifts by 1 and, if
 // the top bit was set, XORs the reduction constant 0x87 into the
 // low byte. This is the same "dbl" used by CMAC key derivation.
-static void siv_dbl(uint8_t v[16])
+static void siv_dbl(uint8_t v[SIV_BLOCK_LEN])
 {
     uint8_t carry = (uint8_t)(v[0] >> 7);
-    for (int i = 0; i < 15; i++) {
+    for (int i = 0; i < SIV_BLOCK_LEN - 1; i++) {
         v[i] = (uint8_t)((v[i] << 1) | (v[i + 1] >> 7));
     }
-    v[15] = (uint8_t)(v[15] << 1);
+    v[SIV_BLOCK_LEN - 1] = (uint8_t)(v[SIV_BLOCK_LEN - 1] << 1);
     if (carry) {
-        v[15] ^= 0x87;
+        v[SIV_BLOCK_LEN - 1] ^= 0x87;
     }
 }
 
 static void siv_xor16(uint8_t *dst, const uint8_t *a, const uint8_t *b)
 {
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < SIV_BLOCK_LEN; i++) {
         dst[i] = a[i] ^ b[i];
     }
 }
@@ -62,14 +75,14 @@ static void siv_xor16(uint8_t *dst, const uint8_t *a, const uint8_t *b)
 // cipher_info. Returns 0 on success.
 static int siv_cmac(const uint8_t *key16,
                     const uint8_t *in, size_t in_len,
-                    uint8_t out[16])
+                    uint8_t out[SIV_BLOCK_LEN])
 {
     const mbedtls_cipher_info_t *info =
         mbedtls_cipher_info_from_type(MBEDTLS_CIPHER_AES_128_ECB);
     if (info == NULL) {
         return -1;
     }
-    return mbedtls_cipher_cmac(info, key16, 128, in, in_len, out);
+    return mbedtls_cipher_cmac(info, key16, SIV_AES_KEY_BITS, in, in_len, out);
 }
 
 // S2V -- the synthetic-IV construction from RFC 5297 §2.4. Absorbs
@@ -78,13 +91,13 @@ static int siv_cmac(const uint8_t *key16,
 static int siv_s2v(const uint8_t  *k1,
                    const SivSlice *ad, size_t nad,
                    const uint8_t  *pt, size_t pt_len,
-                   uint8_t         out[16])
+                   uint8_t         out[SIV_BLOCK_LEN])
 {
-    static const uint8_t zero16[16] = { 0 };
-    uint8_t d[16], cm[16];
+    static const uint8_t zero16[SIV_BLOCK_LEN] = { 0 };
+    uint8_t d[SIV_BLOCK_LEN], cm[SIV_BLOCK_LEN];
     int rc;
 
-    rc = siv_cmac(k1, zero16, 16, d);
+    rc = siv_cmac(k1, zero16, SIV_BLOCK_LEN, d);
     if (rc != 0) {
         return rc;
     }
@@ -100,7 +113,7 @@ static int siv_s2v(const uint8_t  *k1,
         siv_xor16(d, d, cm);
     }
 
-    if (pt_len >= 16) {
+    if (pt_len >= SIV_BLOCK_LEN) {
         // T = pt with its LAST 16 bytes XOR-ed with D; CMAC(K, T).
         // Stream the head (all bytes except last 16) through CMAC,
         // then the XOR-ed tail as the final 16 bytes.
@@ -114,12 +127,12 @@ static int siv_s2v(const uint8_t  *k1,
             goto done;
         }
         rc = mbedtls_cipher_setup(&ctx, info);
-        if (rc == 0) rc = mbedtls_cipher_cmac_starts(&ctx, k1, 128);
+        if (rc == 0) rc = mbedtls_cipher_cmac_starts(&ctx, k1, SIV_AES_KEY_BITS);
         if (rc != 0) {
             mbedtls_cipher_free(&ctx);
             goto done;
         }
-        size_t head = pt_len - 16;
+        size_t head = pt_len - SIV_BLOCK_LEN;
         if (head > 0) {
             rc = mbedtls_cipher_cmac_update(&ctx, pt, head);
             if (rc != 0) {
@@ -127,23 +140,23 @@ static int siv_s2v(const uint8_t  *k1,
                 goto done;
             }
         }
-        uint8_t tail[16];
+        uint8_t tail[SIV_BLOCK_LEN];
         siv_xor16(tail, pt + head, d);
-        rc = mbedtls_cipher_cmac_update(&ctx, tail, 16);
+        rc = mbedtls_cipher_cmac_update(&ctx, tail, SIV_BLOCK_LEN);
         if (rc == 0) rc = mbedtls_cipher_cmac_finish(&ctx, out);
         mbedtls_platform_zeroize(tail, sizeof tail);
         mbedtls_cipher_free(&ctx);
     } else {
         // T = dbl(D) XOR pad(pt), where pad is pt || 0x80 || 0x00*.
-        uint8_t padded[16] = { 0 };
+        uint8_t padded[SIV_BLOCK_LEN] = { 0 };
         if (pt_len > 0) {
             memcpy(padded, pt, pt_len);
         }
         padded[pt_len] = 0x80;
         siv_dbl(d);
-        uint8_t t[16];
+        uint8_t t[SIV_BLOCK_LEN];
         siv_xor16(t, d, padded);
-        rc = siv_cmac(k1, t, 16, out);
+        rc = siv_cmac(k1, t, SIV_BLOCK_LEN, out);
         mbedtls_platform_zeroize(padded, sizeof padded);
         mbedtls_platform_zeroize(t, sizeof t);
     }
@@ -156,23 +169,23 @@ done:
 
 // Run AES-128-CTR with the SIV as the initial counter, after masking
 // bits 31 and 63 per RFC 5297 §2.5. siv_in may alias siv_out.
-static int siv_ctr(const uint8_t  k2[16],
-                   const uint8_t  siv_in[16],
+static int siv_ctr(const uint8_t  k2[SIV_HALF_KEY_LEN],
+                   const uint8_t  siv_in[SIV_BLOCK_LEN],
                    const uint8_t *in,
                    uint8_t       *out,
                    size_t         len)
 {
-    uint8_t nonce_counter[16];
-    memcpy(nonce_counter, siv_in, 16);
+    uint8_t nonce_counter[SIV_BLOCK_LEN];
+    memcpy(nonce_counter, siv_in, SIV_BLOCK_LEN);
     nonce_counter[8]  &= 0x7f;     // bit 63 = MSB of V[8]  cleared
     nonce_counter[12] &= 0x7f;     // bit 31 = MSB of V[12] cleared
 
     mbedtls_aes_context aes;
     mbedtls_aes_init(&aes);
-    int rc = mbedtls_aes_setkey_enc(&aes, k2, 128);
+    int rc = mbedtls_aes_setkey_enc(&aes, k2, SIV_AES_KEY_BITS);
     if (rc == 0 && len > 0) {
         size_t nc_off = 0;
-        uint8_t stream_block[16] = { 0 };
+        uint8_t stream_block[SIV_BLOCK_LEN] = { 0 };
         rc = mbedtls_aes_crypt_ctr(&aes, len, &nc_off,
                                    nonce_counter, stream_block,
                                    in, out);
@@ -183,7 +196,7 @@ static int siv_ctr(const uint8_t  k2[16],
     return rc;
 }
 
-int Siv_Encrypt(const uint8_t   key[32],
+int Siv_Encrypt(const uint8_t   key[SIV_KEY_LEN],
                 const SivSlice *ad, size_t nad,
                 const uint8_t  *pt, size_t pt_len,
                 uint8_t        *out)
@@ -193,37 +206,37 @@ int Siv_Encrypt(const uint8_t   key[32],
     if (nad > 0 && ad == NULL)      return -1;
 
     const uint8_t *k1 = key;
-    const uint8_t *k2 = key + 16;
+    const uint8_t *k2 = key + SIV_HALF_KEY_LEN;
 
-    uint8_t siv[16];
+    uint8_t siv[SIV_BLOCK_LEN];
     int rc = siv_s2v(k1, ad, nad, pt, pt_len, siv);
     if (rc != 0) {
         mbedtls_platform_zeroize(siv, sizeof siv);
         return rc;
     }
 
-    memcpy(out, siv, 16);
+    memcpy(out, siv, SIV_BLOCK_LEN);
     if (pt_len > 0) {
-        rc = siv_ctr(k2, siv, pt, out + 16, pt_len);
+        rc = siv_ctr(k2, siv, pt, out + SIV_BLOCK_LEN, pt_len);
     }
     mbedtls_platform_zeroize(siv, sizeof siv);
     return rc;
 }
 
-int Siv_Decrypt(const uint8_t   key[32],
+int Siv_Decrypt(const uint8_t   key[SIV_KEY_LEN],
                 const SivSlice *ad, size_t nad,
                 const uint8_t  *ct, size_t ct_len,
                 uint8_t        *out_pt)
 {
     if (key == NULL || ct == NULL) return -1;
-    if (ct_len < 16)               return -1;
+    if (ct_len < SIV_BLOCK_LEN)    return -1;
     if (nad > 0 && ad == NULL)     return -1;
 
-    size_t pt_len = ct_len - 16;
+    size_t pt_len = ct_len - SIV_BLOCK_LEN;
     if (pt_len > 0 && out_pt == NULL) return -1;
 
     const uint8_t *k1 = key;
-    const uint8_t *k2 = key + 16;
+    const uint8_t *k2 = key + SIV_HALF_KEY_LEN;
 
     // Decrypt the ciphertext body under CTR, keyed by K2, using the
     // received SIV as the starting counter. We write the tentative
@@ -232,14 +245,14 @@ int Siv_Decrypt(const uint8_t   key[32],
     // bytes to the caller.
     int rc = 0;
     if (pt_len > 0) {
-        rc = siv_ctr(k2, ct, ct + 16, out_pt, pt_len);
+        rc = siv_ctr(k2, ct, ct + SIV_BLOCK_LEN, out_pt, pt_len);
         if (rc != 0) {
             mbedtls_platform_zeroize(out_pt, pt_len);
             return rc;
         }
     }
 
-    uint8_t expected[16];
+    uint8_t expected[SIV_BLOCK_LEN];
     rc = siv_s2v(k1, ad, nad, out_pt, pt_len, expected);
     if (rc != 0) {
         if (pt_len > 0) mbedtls_platform_zeroize(out_pt, pt_len);
@@ -247,7 +260,7 @@ int Siv_Decrypt(const uint8_t   key[32],
         return rc;
     }
 
-    int eq = mbedtls_ct_memcmp(expected, ct, 16);
+    int eq = mbedtls_ct_memcmp(expected, ct, SIV_BLOCK_LEN);
     mbedtls_platform_zeroize(expected, sizeof expected);
     if (eq != 0) {
         if (pt_len > 0) mbedtls_platform_zeroize(out_pt, pt_len);
