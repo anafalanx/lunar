@@ -33,11 +33,23 @@
 //       nextdns       45.90.28.0
 //       mullvad       194.242.2.2
 //
-// 2. For every cache-miss hostname we pick TWO distinct resolvers at
-//    random (Fisher-Yates over the enabled pool, BCryptGenRandom) and
-//    query each in series. If the two result sets overlap in at least
-//    one IP, we accept that IP and cache it. If they disagree
-//    entirely, or either query fails, we return failure.
+// 2. Per cache-miss we pick ONE resolver at random from the enabled
+//    pool (Fisher-Yates over 5 entries, BCryptGenRandom). Primary
+//    anycast IP is tried first; on TCP/TLS failure we fall back to
+//    the resolver's secondary IP if one is listed. A successful
+//    reply's A records are cached under a TTL clamped to
+//    [60s, 3600s]; the first A record becomes the returned IP.
+//
+//    An earlier design queried TWO resolvers and required their
+//    A-record sets to overlap ("agreement gate"). That failed
+//    constantly against legitimate geo-aware authoritative DNS:
+//    Cloudflare's resolver sees the query from Cloudflare's network
+//    and gets back IPs near that edge; Google's resolver sees it
+//    from Google's network and gets back a disjoint set. Both
+//    answers are honest and correct; the sets just don't overlap.
+//    We removed the gate because the single-operator-compromise
+//    threat it was meant to catch is already neutralised downstream
+//    (see Threat model below).
 //
 // 3. Hard fail. There is NO plain-DNS fallback. A network that blocks
 //    all 5 pinned resolvers simultaneously will push Lunar to INOP,
@@ -64,14 +76,19 @@
 // - Compromised OS resolver config / hosts file: defeated (we bypass
 //   getaddrinfo entirely).
 // - Compromised CA minting a cert for cloudflare-dns.com: defeated by
-//   SPKI pin.
-// - Compromise of ONE DoH resolver operator: detected by the 2-of-2
-//   agreement gate -- the second pinned operator returns a different
-//   IP, the query fails, Lunar goes INOP rather than trusting the
-//   tampered IP.
-// - Compromise of TWO DoH resolver operators simultaneously: out of
-//   scope. At this point an attacker with that much reach has also
-//   compromised the NTS operators we'd route to.
+//   SPKI pin on the DoH leaf.
+// - Compromise of ONE DoH resolver operator (returns a forged A set
+//   for, say, time.cloudflare.com): caught DOWNSTREAM, not here.
+//     * NTS-KE: TLS to the time operator is SPKI-pinned, so a
+//       DNS-level redirect fails at TLS handshake.
+//     * NTS SNTP: packets are AEAD-authenticated with c2s/s2c keys
+//       derived from that pinned KE session, so a lying IP cannot
+//       forge a valid sample.
+//     * Core SNTP: offsets must agree within 200 ms with the midpoint
+//       of the two authenticated NTS samples, so a lying core IP
+//       cannot bias the clock.
+//   Random pick over 5 operators additionally limits a compromised
+//   operator to ~1/5 of our lookups on average.
 // - Network blocking port 443 to all pinned resolvers: not a security
 //   failure, just a denial-of-service. We go INOP and display that.
 //
@@ -96,12 +113,12 @@ extern "C" {
 //
 // Failure modes:
 //   * No enabled DoH resolvers (pool wiped).
-//   * Both randomly-picked resolvers fail to complete the DoH query.
-//   * Resolvers returned disjoint A-record sets (agreement gate).
+//   * Randomly-picked resolver failed to complete the DoH query on
+//     both its primary and secondary bootstrap IPs.
 //   * Hostname is syntactically invalid or too long.
 //
-// Thread-safe. May block for several seconds on a cache miss (two
-// serial TLS handshakes).
+// Thread-safe. May block for several seconds on a cache miss (one
+// TLS handshake; up to two if primary IP fails and secondary exists).
 int Dns_Resolve(const char *host, char out_ip[16]);
 
 // Clear the entire in-memory cache. Primarily for tests.

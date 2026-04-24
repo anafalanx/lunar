@@ -744,56 +744,60 @@ int Dns_Resolve(const char *host, char out_ip[16])
 
     if (cache_lookup(host, out_ip)) return 0;
 
-    const DnsResolver *picked[2] = { NULL, NULL };
-    size_t got = Dns_PickResolvers(picked, 2);
-    if (got < 2) {
-        // Cannot satisfy the 2-of-N agreement requirement with < 2
-        // enabled resolvers. Fail closed; there is no safe fallback.
-        Log_Append("dns: cannot resolve %s -- need 2 enabled DoH resolvers, have %zu",
-                   host, got);
+    // Pick ONE pinned resolver at random per cache-miss. A prior
+    // design required two resolvers to return overlapping A-record
+    // sets ("agreement gate") to catch a single-operator compromise
+    // at the DNS level. In practice that gate fires constantly on
+    // legitimate queries because every serious public NTP/NTS host
+    // uses geo-aware authoritative DNS: Cloudflare's resolver sees
+    // the query from Cloudflare's network and gets back IPs near
+    // that edge; Google's resolver sees it from Google's network and
+    // gets back a completely disjoint set near Google's edge. Both
+    // answers are correct and honest; the sets just don't overlap.
+    //
+    // The single-operator-compromise threat the gate was meant to
+    // address is already neutralised downstream:
+    //   * NTS-KE: TLS to the time operator is SPKI-pinned, so a
+    //     DNS-level redirect fails at TLS handshake.
+    //   * NTS SNTP: packets are AEAD-authenticated with keys from
+    //     that pinned KE, so a lying IP can't forge a valid sample.
+    //   * Core SNTP: offsets must agree within 200 ms with the NTS
+    //     midpoint anchor, so a lying IP can't bias the clock.
+    //
+    // Random pick over 5 pinned DoH operators still limits any one
+    // compromised operator to ~1/5 of our lookups, and per-resolver
+    // primary->secondary IP failover preserves reachability when an
+    // individual anycast edge drops.
+    const DnsResolver *picked[1] = { NULL };
+    size_t got = Dns_PickResolvers(picked, 1);
+    if (got < 1) {
+        Log_Append("dns: cannot resolve %s -- no enabled DoH resolvers", host);
         return -1;
     }
 
-    // A fresh transaction ID per query, per resolver. DoH doesn't
-    // technically require it (the TLS channel already defeats off-
-    // path spoofing), but it helps us reject cross-wired responses.
-    uint16_t qid_a = 0, qid_b = 0;
-    BCryptGenRandom(NULL, (PUCHAR)&qid_a, sizeof qid_a,
+    // Fresh QID per query. DoH doesn't require it (the TLS channel
+    // already defeats off-path spoofing) but it costs nothing and
+    // lets us reject cross-wired responses from a buggy resolver.
+    uint16_t qid = 0;
+    BCryptGenRandom(NULL, (PUCHAR)&qid, sizeof qid,
                     BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-    BCryptGenRandom(NULL, (PUCHAR)&qid_b, sizeof qid_b,
-                    BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 
-    char  ips_a[DNS_ANSWERS_MAX][16];
-    char  ips_b[DNS_ANSWERS_MAX][16];
-    size_t n_a = 0, n_b = 0;
-    uint32_t ttl_a = 0, ttl_b = 0;
+    char     ips[DNS_ANSWERS_MAX][16];
+    size_t   n_ips = 0;
+    uint32_t ttl   = 0;
 
-    int ra = doh_query_resolver(picked[0], host, qid_a,
-                                ips_a, DNS_ANSWERS_MAX, &n_a, &ttl_a);
-    int rb = doh_query_resolver(picked[1], host, qid_b,
-                                ips_b, DNS_ANSWERS_MAX, &n_b, &ttl_b);
-    if (ra != 0 || rb != 0 || n_a == 0 || n_b == 0) {
-        Log_Append("dns: resolve %s FAIL (%s=%s, %s=%s)", host,
-                   picked[0]->label, ra == 0 ? "ok" : "fail",
-                   picked[1]->label, rb == 0 ? "ok" : "fail");
+    if (doh_query_resolver(picked[0], host, qid,
+                           ips, DNS_ANSWERS_MAX, &n_ips, &ttl) != 0 ||
+        n_ips == 0) {
+        Log_Append("dns: resolve %s FAIL (via %s)", host, picked[0]->label);
         return -1;
     }
 
-    char agreed[16];
-    if (Dns_Intersect(ips_a, n_a, ips_b, n_b, agreed) != 0) {
-        // Both resolvers answered, but with disjoint A-record sets.
-        // Exactly the 1-compromised-resolver case we designed the
-        // agreement gate to detect. Fail closed; the cycle will INOP.
-        Log_Append("dns: resolve %s DISAGREE (%s vs %s) -- refusing to trust",
-                   host, picked[0]->label, picked[1]->label);
-        return -1;
-    }
-
-    _snprintf(out_ip, 16, "%s", agreed);
-    uint32_t ttl = (ttl_a < ttl_b) ? ttl_a : ttl_b;
-    cache_insert(host, agreed, ttl);
-    Log_Append("dns: resolve %s -> %s  (via %s+%s, ttl=%us)",
-               host, agreed, picked[0]->label, picked[1]->label,
-               (unsigned)ttl);
+    // Take the first A record. Order is resolver-defined; for geo-
+    // DNS it's typically already latency-sorted for our vantage.
+    _snprintf(out_ip, 16, "%s", ips[0]);
+    cache_insert(host, ips[0], ttl);
+    Log_Append("dns: resolve %s -> %s  (via %s, ttl=%us)",
+               host, ips[0], picked[0]->label, (unsigned)ttl);
     return 0;
 }
