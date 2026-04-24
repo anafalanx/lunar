@@ -28,10 +28,15 @@ import sys
 from datetime import datetime, timezone
 
 PROVIDERS = [
-    ("time.cloudflare.com",      4460, "cloudflare"),
-    ("nts.netnod.se",            4460, "netnod"),
-    ("ohio.time.system76.com",   4460, "system76-ohio"),
-    ("nts.time.nl",              4460, "sidn"),
+    ("time.cloudflare.com",        4460, "cloudflare"),
+    ("nts.netnod.se",              4460, "netnod"),
+    ("sth1.nts.netnod.se",         4460, "netnod-sth1"),
+    ("sth2.nts.netnod.se",         4460, "netnod-sth2"),
+    ("ohio.time.system76.com",     4460, "system76-ohio"),
+    ("virginia.time.system76.com", 4460, "system76-virginia"),
+    ("oregon.time.system76.com",   4460, "system76-oregon"),
+    ("paris.time.system76.com",    4460, "system76-paris"),
+    ("nts.time.nl",                4460, "sidn"),
 ]
 
 

@@ -534,137 +534,209 @@ static void test_ntp_concur(void) {
     // frequency for the projection code path. It is idempotent.
     Clock_Init();
 
+    // Layout (from ntp.h): slots 0..NTP_CORE_COUNT-1 are core SNTP,
+    // slots NTP_FIRST_NTS_SLOT..NTP_SOURCE_COUNT-1 are NTS. Verify
+    // compile-time assumptions this test relies on so a future
+    // re-tuning of the slot counts trips the assertion rather than
+    // silently corrupting scenario indices.
+    CHECK_EQ_INT(NTP_CORE_COUNT, 4);
+    CHECK_EQ_INT(NTP_NTS_COUNT, 2);
+    CHECK_EQ_INT(NTP_FIRST_NTS_SLOT, 4);
+    CHECK_EQ_INT(NTP_SOURCE_COUNT, 6);
+
     NtpSourceResult s[NTP_SOURCE_COUNT];
     int64_t best = 0, qpc = 0, spread = 0;
     const int64_t Q = 1000;  // shared qpcAtT4 -- projection delta = 0
 
-    // 1) All four ok, all UTC identical -> OK, anchor = NTS, spread 0.
+    // ---- Path A: both NTS succeed and mutually agree ----
+
+    // 1) All six ok, all UTC identical -> OK, midpoint = 1000.
     s[0] = MkSrc(1, 1000, Q, "A");
     s[1] = MkSrc(1, 1000, Q, "B");
     s[2] = MkSrc(1, 1000, Q, "C");
-    s[3] = MkSrc(1, 1000, Q, "NTS");
+    s[3] = MkSrc(1, 1000, Q, "D");
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[5] = MkSrc(1, 1000, Q, "NTS2");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
     CHECK_EQ_INT(spread, 0);
     CHECK_EQ_INT(best, 1000);
     CHECK_EQ_INT(qpc, Q);
 
-    // 2) Core disagree a bit but all within 200 ms of NTS -> OK.
-    s[0] = MkSrc(1,  850, Q, "A");   // -150 from NTS
-    s[1] = MkSrc(1, 1100, Q, "B");   // +100 from NTS
-    s[2] = MkSrc(1,  900, Q, "C");   // -100 from NTS
-    s[3] = MkSrc(1, 1000, Q, "NTS");
-    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
-    CHECK_EQ_INT(best, 1000);        // NTS anchor
-    CHECK_EQ_INT(spread, 150);       // worst abs deviation
-
-    // 3) Boundary: exactly 200 ms off in both directions -> OK (<=).
-    s[0] = MkSrc(1,  800, Q, "A");   // -200 (boundary)
-    s[1] = MkSrc(1, 1200, Q, "B");   // +200 (boundary)
-    s[2] = MkSrc(1, 1000, Q, "C");   //    0
-    s[3] = MkSrc(1, 1000, Q, "NTS");
-    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
-    CHECK_EQ_INT(spread, 200);
-
-    // 4) One core 201 ms off, two within -> still OK (2 concur, 1 not).
+    // 2) NTS pair brackets truth: 990 and 1010 -> midpoint 1000.
+    // Cores at 1000 -> all four agree -> OK.
     s[0] = MkSrc(1, 1000, Q, "A");
     s[1] = MkSrc(1, 1000, Q, "B");
-    s[2] = MkSrc(1, 1201, Q, "C");   // disagrees by 201 ms
-    s[3] = MkSrc(1, 1000, Q, "NTS");
+    s[2] = MkSrc(1, 1000, Q, "C");
+    s[3] = MkSrc(1, 1000, Q, "D");
+    s[4] = MkSrc(1,  990, Q, "NTS1");
+    s[5] = MkSrc(1, 1010, Q, "NTS2");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
-    CHECK_EQ_INT(spread, 201);       // worst deviation reported
+    CHECK_EQ_INT(best, 1000);        // midpoint of 990 and 1010
 
-    // 5) Two cores 201 ms off, one within -> INOP (only 1 concurs).
+    // 3) Both NTS agree, 3 of 4 cores concur, 1 core far off -> OK.
     s[0] = MkSrc(1, 1000, Q, "A");
-    s[1] = MkSrc(1, 1201, Q, "B");
-    s[2] = MkSrc(1,  799, Q, "C");
-    s[3] = MkSrc(1, 1000, Q, "NTS");
+    s[1] = MkSrc(1, 1100, Q, "B");   // +100 ok
+    s[2] = MkSrc(1,  900, Q, "C");   // -100 ok
+    s[3] = MkSrc(1, 1500, Q, "D");   // +500 OUTLIER
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[5] = MkSrc(1, 1000, Q, "NTS2");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
+    CHECK_EQ_INT(best, 1000);
+    CHECK_EQ_INT(spread, 500);       // worst core deviation
+
+    // 4) Both NTS agree, only 2 of 4 cores concur -> INOP (<3).
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1500, Q, "C");
+    s[3] = MkSrc(1, 1500, Q, "D");
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[5] = MkSrc(1, 1000, Q, "NTS2");
     best = qpc = -1;
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
     CHECK_EQ_INT(best, 0); CHECK_EQ_INT(qpc, 0);
 
-    // 6) NTS fails -> INOP regardless of cores agreeing.
+    // 5) Both NTS agree, 3 cores OK, 1 core failed -> OK (3 of 4).
     s[0] = MkSrc(1, 1000, Q, "A");
     s[1] = MkSrc(1, 1000, Q, "B");
     s[2] = MkSrc(1, 1000, Q, "C");
-    s[3] = MkSrc(0,    0, 0, "NTS");
-    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
-    CHECK_EQ_INT(best, 0);
+    s[3] = MkSrc(0,    0, 0, "D");
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[5] = MkSrc(1, 1000, Q, "NTS2");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
 
-    // 7) NTS fails, cores wildly disagree -> INOP (NTS is the gate).
-    s[0] = MkSrc(1, 1000, Q, "A");
-    s[1] = MkSrc(1, 2000, Q, "B");
-    s[2] = MkSrc(1, 3000, Q, "C");
-    s[3] = MkSrc(0,    0, 0, "NTS");
-    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
-
-    // 8) NTS ok, two cores failed, one agrees -> INOP (need >= 2).
-    s[0] = MkSrc(1, 1000, Q, "A");
-    s[1] = MkSrc(0,    0, 0, "B");
-    s[2] = MkSrc(0,    0, 0, "C");
-    s[3] = MkSrc(1, 1000, Q, "NTS");
-    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
-
-    // 9) NTS ok, two cores agree, one failed -> OK (2 of 3).
+    // 6) Both NTS disagree by 201 ms -> INOP, spread reports NTS gap.
     s[0] = MkSrc(1, 1000, Q, "A");
     s[1] = MkSrc(1, 1000, Q, "B");
-    s[2] = MkSrc(0,    0, 0, "C");
-    s[3] = MkSrc(1, 1000, Q, "NTS");
+    s[2] = MkSrc(1, 1000, Q, "C");
+    s[3] = MkSrc(1, 1000, Q, "D");
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[5] = MkSrc(1, 1201, Q, "NTS2");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+    CHECK_EQ_INT(spread, 201);
+
+    // 7) Both NTS exactly 200 ms apart (boundary) -> OK.
+    s[4] = MkSrc(1,  900, Q, "NTS1");
+    s[5] = MkSrc(1, 1100, Q, "NTS2");
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1000, Q, "C");
+    s[3] = MkSrc(1, 1000, Q, "D");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
     CHECK_EQ_INT(best, 1000);
 
-    // 10) All cores fail, NTS ok -> INOP.
-    s[0] = MkSrc(0, 0, 0, "A");
-    s[1] = MkSrc(0, 0, 0, "B");
-    s[2] = MkSrc(0, 0, 0, "C");
-    s[3] = MkSrc(1, 1000, Q, "NTS");
-    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+    // ---- Path B: strict single-NTS fallback ----
 
-    // 11) Everything fails -> INOP.
-    s[0] = MkSrc(0, 0, 0, "A");
-    s[1] = MkSrc(0, 0, 0, "B");
-    s[2] = MkSrc(0, 0, 0, "C");
-    s[3] = MkSrc(0, 0, 0, "NTS");
-    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
-
-    // 12) NULL out-parameters are tolerated.
+    // 8) Only NTS1 ok, ALL 4 cores agree -> OK, anchor = NTS1.
     s[0] = MkSrc(1, 1000, Q, "A");
     s[1] = MkSrc(1, 1000, Q, "B");
     s[2] = MkSrc(1, 1000, Q, "C");
-    s[3] = MkSrc(1, 1000, Q, "NTS");
-    CHECK_EQ_INT(Ntp_Concur(s, NULL, NULL, NULL), TRUST_OK);
+    s[3] = MkSrc(1, 1000, Q, "D");
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[5] = MkSrc(0,    0, 0, "NTS2");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
+    CHECK_EQ_INT(best, 1000);
+    CHECK_EQ_INT(qpc, Q);
 
-    // 13) Negative UTCs (pre-1970) work.
+    // 9) Only NTS2 ok, 3 of 4 cores agree -> INOP (fallback is strict).
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1000, Q, "C");
+    s[3] = MkSrc(1, 1500, Q, "D");     // one outlier
+    s[4] = MkSrc(0,    0, 0, "NTS1");
+    s[5] = MkSrc(1, 1000, Q, "NTS2");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+
+    // 10) Only NTS1 ok, 3 cores ok 1 failed -> INOP (need 4/4).
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1000, Q, "C");
+    s[3] = MkSrc(0,    0, 0, "D");
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[5] = MkSrc(0,    0, 0, "NTS2");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+
+    // ---- Path C: no NTS at all ----
+
+    // 11) Both NTS fail, cores agree -> INOP (no anchor).
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1000, Q, "C");
+    s[3] = MkSrc(1, 1000, Q, "D");
+    s[4] = MkSrc(0,    0, 0, "NTS1");
+    s[5] = MkSrc(0,    0, 0, "NTS2");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+
+    // 12) Everything fails -> INOP.
+    for (int i = 0; i < NTP_SOURCE_COUNT; i++) s[i] = MkSrc(0, 0, 0, "x");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+
+    // ---- NULL out-parameters ----
+
+    // 13) NULL outs tolerated on both OK and INOP paths.
+    for (int i = 0; i < NTP_SOURCE_COUNT; i++) s[i] = MkSrc(1, 1000, Q, "x");
+    CHECK_EQ_INT(Ntp_Concur(s, NULL, NULL, NULL), TRUST_OK);
+    s[4] = MkSrc(0, 0, 0, "NTS1");
+    s[5] = MkSrc(0, 0, 0, "NTS2");
+    CHECK_EQ_INT(Ntp_Concur(s, NULL, NULL, NULL), TRUST_INOP);
+
+    // ---- Negative UTCs (pre-1970) ----
+
+    // 14) Negative UTCs work on the full-OK path.
     s[0] = MkSrc(1, -100, Q, "A");
     s[1] = MkSrc(1, -100, Q, "B");
     s[2] = MkSrc(1, -100, Q, "C");
-    s[3] = MkSrc(1, -100, Q, "NTS");
+    s[3] = MkSrc(1, -100, Q, "D");
+    s[4] = MkSrc(1, -100, Q, "NTS1");
+    s[5] = MkSrc(1, -100, Q, "NTS2");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
     CHECK_EQ_INT(best, -100);
 
-    // 14) QPC-projection sanity: three cores captured at different
-    // qpc moments with UTC staggered to match perfectly -- projected
-    // onto NTS's qpc, they should all agree. Stagger = 100 ms.
+    // ---- QPC projection across staggered captures ----
+
     int64_t freq = Clock_QpcFreq();
     CHECK(freq > 0);
     int64_t tick100ms = freq / 10;
-    s[0] = MkSrc(1, 1000 - 100, Q - tick100ms, "A");
-    s[1] = MkSrc(1, 1000 + 100, Q + tick100ms, "B");
+
+    // 15) Cores captured at different qpc moments with UTC staggered
+    // to match perfectly -- projected onto the NTS midpoint they
+    // should all concur with zero spread.
+    s[0] = MkSrc(1, 1000 - 100, Q - tick100ms,     "A");
+    s[1] = MkSrc(1, 1000 + 100, Q + tick100ms,     "B");
     s[2] = MkSrc(1, 1000 + 200, Q + 2 * tick100ms, "C");
-    s[3] = MkSrc(1, 1000,       Q, "NTS");
+    s[3] = MkSrc(1, 1000 - 200, Q - 2 * tick100ms, "D");
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[5] = MkSrc(1, 1000, Q, "NTS2");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
-    CHECK_EQ_INT(spread, 0);         // projection cancels the staggering
+    CHECK_EQ_INT(spread, 0);
     CHECK_EQ_INT(best, 1000);
 
-    // 15) QPC-projection divergence: hold core UTC constant while
-    // their qpcAtT4 drifts past NTS by 300 ms each. Projected
-    // deltas exceed the threshold -> INOP.
+    // 16) Hold core UTC constant while qpcAtT4 drifts past the NTS
+    // pair by >= 300 ms each. Projected deltas diverge -> INOP
+    // because fewer than 3 cores remain within 200 ms.
     int64_t tick300ms = (freq * 3) / 10;
     s[0] = MkSrc(1, 1000, Q + tick300ms,     "A");  // +300 proj
     s[1] = MkSrc(1, 1000, Q + 2 * tick300ms, "B");  // +600 proj
     s[2] = MkSrc(1, 1000, Q + 3 * tick300ms, "C");  // +900 proj
-    s[3] = MkSrc(1, 1000, Q, "NTS");
+    s[3] = MkSrc(1, 1000, Q + 4 * tick300ms, "D");  // +1200 proj
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[5] = MkSrc(1, 1000, Q, "NTS2");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
-    CHECK(spread >= 899 && spread <= 901);
+    CHECK(spread >= 1199 && spread <= 1201);
+
+    // 17) Two NTS captured at different qpc moments whose UTCs
+    // stagger to match -- after projection they must agree. Put
+    // NTS2 100 ms in the future (both qpc and utc) so projection
+    // onto NTS1's qpc collapses the delta to ~zero.
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1000, Q, "C");
+    s[3] = MkSrc(1, 1000, Q, "D");
+    s[4] = MkSrc(1, 1000,       Q,              "NTS1");
+    s[5] = MkSrc(1, 1000 + 100, Q + tick100ms,  "NTS2");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
+    // Midpoint projection: NTS2 projected onto NTS1's qpc = 1000,
+    // so midpoint = 1000.
+    CHECK_EQ_INT(best, 1000);
 }
 
 // ---------------------------------------------------------------------------

@@ -1,20 +1,42 @@
-﻿// ntp.c -- Parallel SNTP+NTS client. Queries four sources in parallel
-// every cycle:
+﻿// ntp.c -- Parallel SNTP+NTS client. Every polling cycle, six sources
+// are queried in parallel:
 //
-//    slot 0: NIST (time.nist.gov)      -- USA
-//    slot 1: PTB  (ptbtime1.ptb.de)    -- Germany
-//    slot 2: NICT (ntp.nict.jp)        -- Japan
-//    slot 3: NTS  (rotating)           -- per-cycle random pick from a
-//                                         short pool of NTS providers
-//                                         with SPKI-pinned TLS 1.3
-//                                         authentication (src/nts.c)
+//    slots 0..3: four core (plain-SNTP) sources, randomly drawn
+//                per-cycle from the kCorePool[] list of reputable
+//                stratum-1 national metrology / research time servers
+//                across diverse continents, operators, and upstream
+//                routes. Leap-smearing operators (Google, Facebook,
+//                AWS) are DELIBERATELY EXCLUDED because their 12-24h
+//                smear window produces false disagreement with the
+//                non-smearing metrology institutes during that
+//                window, which would poison the concurrence gate.
 //
-// One UDP socket per core source + one TCP+UDP pair for the NTS slot,
+//    slots 4..5: two NTS-authenticated SNTP sources, randomly drawn
+//                per-cycle from the pinned NTS provider pool in
+//                src/nts.c. TLS 1.3 + ALPN "ntske/1" + SPKI pin
+//                verification; picks are distinct within a cycle.
+//
+// One UDP socket per core source + one TCP+UDP pair per NTS slot,
 // one worker thread per source, all fired in parallel. Results are
 // collected per-source and a single concurrence verdict is computed:
-// NTS is the trust anchor, and at least 2 of the 3 core sources must
-// agree with it within 200 ms (after QPC projection) for the cycle to
-// be OK; otherwise the clockwork goes INOP.
+//
+//   * both NTS slots must succeed AND agree within 200 ms of each
+//     other (projected to a common QPC moment). The anchor is then
+//     the midpoint of the two NTS samples; an attacker would have to
+//     simultaneously defeat two independent operator's TLS + SPKI
+//     pins to shift this anchor.
+//
+//   * at least 3 of the 4 core sources must agree with the NTS
+//     midpoint to within 200 ms. The 3-of-4 super-majority tolerates
+//     one national outage or hijack while still rejecting a
+//     coordinated attack against a minority of core sources.
+//
+//   * strict fallback: if exactly one NTS slot succeeded, the cycle
+//     can still promote to TRUST_OK but ONLY if ALL FOUR core
+//     sources concur with the surviving NTS sample.
+//
+//   * otherwise (both NTS failed, NTS disagreement, too few cores
+//     concurring), the clockwork goes INOP.
 //
 // This translation unit is isolated from D2D headers because
 // <winsock2.h> + <windows.h> collide with their symbol names.
@@ -34,6 +56,8 @@
 #include "nts.h"
 #include "logbuf.h"
 
+#include <bcrypt.h>
+
 #define NTP_PORT             "123"
 #define NTP_TIMEOUT_MS       6000      // core slot UDP recv timeout
 #define NTS_SLOT_TIMEOUT_MS  20000     // KE (TLS 1.3 + handshake) + authenticated UDP
@@ -41,32 +65,53 @@
 #define FRESH_WINDOW_MS      (2LL * 60LL * 60LL * 1000LL) // 2 hours
 #define CONCUR_THRESHOLD_MS  200
 
-// --- Source list (core only; NTS slot handled separately) ---------------
+// --- Core pool (plain SNTP) ---------------------------------------------
 
-// Three independent national metrology institutes on three continents,
-// each running stratum-1 caesium / hydrogen maser references. Diverse
-// operators, geographies, and upstream routing make a coordinated spoof
-// or outage much less likely than a single-pool query.
+// Curated pool of reputable stratum-1 public NTP servers, run by
+// national metrology institutes, research labs and naval observatories
+// around the world. Four random picks are made per cycle (see
+// PickCoreSources below) so that any correlated attack or outage only
+// affects a subset of cycles.
+//
+// Deliberately EXCLUDED: Google, Facebook, AWS, Microsoft and other
+// "leap-smearing" operators. During a leap-second smear window
+// (typically 12-24h) their reported UTC differs from non-smearing
+// metrology institutes by up to 1 s; cross-checking them against a
+// national lab would falsely trip the concurrence gate.
 typedef struct {
     const char *host;
     const char *label;   // short display / log label
+    const char *geo;     // short region hint (display only, unused by
+                         // verdict logic)
 } NtpSource;
 
-static const NtpSource kSources[NTP_CORE_COUNT] = {
-    { "time.nist.gov",    "NIST" },    // USA      (Boulder / Gaithersburg)
-    { "ptbtime1.ptb.de",  "PTB"  },    // Germany  (Braunschweig)
-    { "ntp.nict.jp",      "NICT" },    // Japan    (Tokyo)
+static const NtpSource kCorePool[] = {
+    { "time.nist.gov",     "NIST",    "US"  },   // Boulder / Gaithersburg
+    { "tick.usno.navy.mil","USNO-a",  "US"  },   // US Naval Observatory (east)
+    { "tock.usno.navy.mil","USNO-b",  "US"  },   // US Naval Observatory (alt)
+    { "ptbtime1.ptb.de",   "PTB-1",   "DE"  },   // Physikalisch-Tech. Bundesanstalt
+    { "ptbtime2.ptb.de",   "PTB-2",   "DE"  },
+    { "ntp1.npl.co.uk",    "NPL-1",   "UK"  },   // Nat. Physical Laboratory
+    { "ntp2.npl.co.uk",    "NPL-2",   "UK"  },
+    { "ntp.nict.jp",       "NICT",    "JP"  },   // Nat. Inst. of Info. and Comm. Tech.
+    { "ntp1.inrim.it",     "INRIM-1", "IT"  },   // Ist. Naz. di Ricerca Metrologica
+    { "ntp2.inrim.it",     "INRIM-2", "IT"  },
+    { "hora.roa.es",       "ROA",     "ES"  },   // Real Instituto y Observatorio de la Armada
+    { "ntp11.metas.ch",    "METAS",   "CH"  },   // Swiss Federal Institute of Metrology
+    { "ntp1.sp.se",        "RISE",    "SE"  },   // RISE Research Institutes of Sweden
 };
 
-// Placeholder label used for the NTS slot when no provider is available
+#define CORE_POOL_SIZE   (sizeof kCorePool / sizeof kCorePool[0])
+
+// Published label buffers for each NTS slot. Pointed to by
+// g_results[4..5].label, so they MUST outlive the aggregator thread
+// that filled them -- which is exactly what file-scope storage gives
+// us. Guarded by g_cs on write and read.
+static char g_ntsLabelPublished[NTP_NTS_COUNT][32] = { { 0 } };
+
+// Placeholder label used for an NTS slot when no provider is available
 // (e.g. the shipped build has no SPKI pins populated yet).
 static const char kNtsNoPinLabel[] = "NTS--";
-
-// Published label buffer for the NTS slot. Pointed to by
-// g_results[NTP_NTS_SLOT].label, so it MUST outlive the aggregator
-// thread that filled it -- which is exactly what file-scope storage
-// gives us. Guarded by g_cs on write and read.
-static char g_ntsLabelPublished[32] = { 0 };
 
 // --- Shared state --------------------------------------------------------
 
@@ -186,18 +231,20 @@ static int NtpQueryHost(const char *host,
 // --- Per-source worker thread --------------------------------------------
 
 typedef struct {
-    int              index;    // 0..NTP_CORE_COUNT-1 for core workers
+    const NtpSource *src;      // chosen core-pool entry for this cycle
     NtpSourceResult  out;      // written by worker, read by aggregator
 } WorkerCtx;
 
-// Core (unauthenticated SNTP) worker. Only used for slots 0..2.
+// Core (unauthenticated SNTP) worker. Used for slots 0..NTP_CORE_COUNT-1.
 static DWORD WINAPI WorkerProc(LPVOID param) {
     WorkerCtx *ctx = (WorkerCtx *)param;
-    const NtpSource *src = &kSources[ctx->index];
+    const NtpSource *src = ctx->src;
 
     NtpSourceResult *r = &ctx->out;
     memset(r, 0, sizeof(*r));
-    r->label = src->label;
+    r->label = src ? src->label : "?";
+
+    if (!src) { r->ok = 0; return 0; }
 
     int64_t off = 0, utc = 0, qpc = 0;
     uint32_t rtt = 0;
@@ -213,16 +260,46 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
     return 0;
 }
 
-// NTS (authenticated) worker. Picks a provider at random from the
-// SPKI-pinned pool, performs a full KE, then one authenticated SNTP
-// round trip. Because the pool is small and the pick is per-cycle,
-// this slot ALSO provides geographic and operator diversity against
-// the core trio -- an adversary would need to simultaneously defeat
-// the authenticated NTS provider PLUS two of the three core sources.
+// Pick `n_want` DISTINCT core pool entries at random (uniform over
+// the pool) for one cycle. Fisher-Yates partial shuffle seeded by
+// BCryptGenRandom for crypto-grade source-set unpredictability --
+// avoiding the "always the same four targets" fingerprint. Returns
+// the number actually written (== min(n_want, CORE_POOL_SIZE)).
+static size_t PickCoreSources(const NtpSource **out, size_t n_want)
+{
+    if (!out || n_want == 0) return 0;
+    size_t pool = CORE_POOL_SIZE;
+    if (n_want > pool) n_want = pool;
+
+    size_t idx[CORE_POOL_SIZE];
+    for (size_t i = 0; i < pool; i++) idx[i] = i;
+
+    for (size_t i = 0; i < n_want; i++) {
+        uint32_t r = 0;
+        if (BCryptGenRandom(NULL, (PUCHAR)&r, sizeof r,
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+            // Crypto RNG failed; degrade to a deterministic linear
+            // pick so the cycle still runs. Safety > entropy here.
+            for (size_t k = i; k < n_want; k++) out[k] = &kCorePool[idx[k]];
+            return n_want;
+        }
+        size_t j = i + (size_t)(r % (uint32_t)(pool - i));
+        size_t tmp = idx[i]; idx[i] = idx[j]; idx[j] = tmp;
+        out[i] = &kCorePool[idx[i]];
+    }
+    return n_want;
+}
+
+// NTS (authenticated) worker. The aggregator pre-selects a distinct
+// provider for each slot (see AggregatorProc) so the two NTS picks
+// don't collide within one cycle. We perform a full KE + one
+// authenticated SNTP round trip. Because the pool is pinned per
+// leaf SPKI, an adversary would need to simultaneously defeat TWO
+// independent NTS operators' TLS to shift the consensus anchor.
 typedef struct {
-    NtpSourceResult out;
-    const char     *pickedLabel;   // filled in by worker with provider label
-    char            labelBuf[32];  // "NTS:<provider>", owned by this struct
+    const NtsProvider *provider;     // chosen by aggregator; NULL => fail
+    NtpSourceResult    out;
+    char               labelBuf[32]; // "NTS:<provider>", owned by this struct
 } NtsCtx;
 
 static DWORD WINAPI NtsWorkerProc(LPVOID param) {
@@ -231,12 +308,11 @@ static DWORD WINAPI NtsWorkerProc(LPVOID param) {
     memset(r, 0, sizeof(*r));
     r->label = kNtsNoPinLabel;
 
-    const NtsProvider *p = Nts_PickProvider();
+    const NtsProvider *p = ctx->provider;
     if (p == NULL) {
-        // No provider enabled (no pins populated) -- this slot fails
-        // unconditionally, which means the concurrence gate will
-        // drive INOP until the operator runs fetch_nts_spki_pins.py.
-        ctx->pickedLabel = NULL;
+        // No provider assigned (pool empty or fewer than 2 pinned) --
+        // this slot fails. The aggregator's fallback rules decide
+        // whether the cycle can still promote to TRUST_OK.
         r->ok = 0;
         return 0;
     }
@@ -247,7 +323,6 @@ static DWORD WINAPI NtsWorkerProc(LPVOID param) {
               p->label ? p->label : "?");
     ctx->labelBuf[sizeof ctx->labelBuf - 1] = 0;
     r->label = ctx->labelBuf;
-    ctx->pickedLabel = ctx->labelBuf;
 
     int64_t utc = 0, qpc = 0;
     uint32_t rtt = 0;
@@ -407,7 +482,7 @@ static void AuditWrite(TrustState trust,
     char stamp[32];
     int trusted = BestLogStamp(stamp, sizeof stamp);
 
-    char line[512];
+    char line[768];
     int  pos = 0;
     pos += _snprintf(line + pos, sizeof(line) - (size_t)pos,
                      "%s%c %-4s  spread=%5lldms",
@@ -454,28 +529,47 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
         return 0;
     }
 
-    // Three core workers (slots 0..2) plus one NTS worker (slot 3).
+    // Four core workers (slots 0..3) plus two NTS workers (slots 4..5).
     WorkerCtx core_ctx[NTP_CORE_COUNT];
-    NtsCtx    nts_ctx;
+    NtsCtx    nts_ctx[NTP_NTS_COUNT];
     HANDLE    threads[NTP_SOURCE_COUNT] = { 0 };
     int       spawned = 0;
 
+    // Draw a fresh random subset of core-pool hosts for THIS cycle so
+    // no single attacker can rely on always facing the same four
+    // targets. The crypto-grade RNG inside PickCoreSources gives an
+    // unpredictable cycle-to-cycle permutation.
+    const NtpSource *chosenCore[NTP_CORE_COUNT] = { 0 };
+    (void)PickCoreSources(chosenCore, NTP_CORE_COUNT);
+
     for (int i = 0; i < NTP_CORE_COUNT; i++) {
-        core_ctx[i].index = i;
+        core_ctx[i].src = chosenCore[i];
         memset(&core_ctx[i].out, 0, sizeof(core_ctx[i].out));
-        core_ctx[i].out.label = kSources[i].label;
+        core_ctx[i].out.label = chosenCore[i] ? chosenCore[i]->label : "?";
         threads[i] = CreateThread(NULL, 0, WorkerProc, &core_ctx[i], 0, NULL);
         if (threads[i]) spawned++;
     }
-    memset(&nts_ctx, 0, sizeof nts_ctx);
-    threads[NTP_NTS_SLOT] = CreateThread(NULL, 0, NtsWorkerProc, &nts_ctx, 0, NULL);
-    if (threads[NTP_NTS_SLOT]) spawned++;
+
+    // Pick two DISTINCT NTS providers for this cycle. Even if one is
+    // somehow compromised (cert rotation fumbled, leaf key disclosed,
+    // operator coerced), the second pin comes from an independent
+    // operator and the agreement gate detects the divergence.
+    const NtsProvider *chosenNts[NTP_NTS_COUNT] = { 0 };
+    (void)Nts_PickProviders(chosenNts, NTP_NTS_COUNT);
+
+    for (int i = 0; i < NTP_NTS_COUNT; i++) {
+        int slot = NTP_FIRST_NTS_SLOT + i;
+        memset(&nts_ctx[i], 0, sizeof nts_ctx[i]);
+        nts_ctx[i].provider = chosenNts[i];
+        threads[slot] = CreateThread(NULL, 0, NtsWorkerProc, &nts_ctx[i], 0, NULL);
+        if (threads[slot]) spawned++;
+    }
 
     // Cap total wall time at the NTS slot's budget: the KE phase alone
     // can take ~5 s on a cold connect, plus ~3 s for the SNTP round
     // trip, plus slack for TLS handshake variability. Core SNTP
     // workers finish in ~NTP_TIMEOUT_MS; they just wait for the slow
-    // slot to catch up.
+    // slots to catch up.
     if (spawned > 0) {
         HANDLE hs[NTP_SOURCE_COUNT];
         int    nh = 0;
@@ -488,7 +582,8 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
 
     NtpSourceResult snapshot[NTP_SOURCE_COUNT];
     for (int i = 0; i < NTP_CORE_COUNT; i++) snapshot[i] = core_ctx[i].out;
-    snapshot[NTP_NTS_SLOT] = nts_ctx.out;
+    for (int i = 0; i < NTP_NTS_COUNT;  i++)
+        snapshot[NTP_FIRST_NTS_SLOT + i] = nts_ctx[i].out;
 
     int64_t    bestUtcMs = 0;
     int64_t    bestQpc   = 0;
@@ -497,7 +592,8 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
 
     // Rewrite snapshot[i].offsetMs to the MEANINGFUL display value:
     // this source's deviation from the cycle's trust anchor, projected
-    // to a common QPC moment. NTS is the anchor when it succeeded;
+    // to a common QPC moment. The anchor is the Ntp_Concur result
+    // (midpoint of NTS pair on full OK; surviving NTS on fallback);
     // otherwise fall back to the first successful source so the audit
     // log still carries informative per-source numbers.
     {
@@ -505,17 +601,27 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
         if (qpcFreq <= 0) qpcFreq = 1;
         int64_t refQpc = 0, refUtc = 0;
         int have_ref = 0;
-        if (snapshot[NTP_NTS_SLOT].ok) {
-            refQpc = snapshot[NTP_NTS_SLOT].qpcAtT4;
-            refUtc = snapshot[NTP_NTS_SLOT].ntpUtcMs;
+        if (trust == TRUST_OK) {
+            refQpc = bestQpc;
+            refUtc = bestUtcMs;
             have_ref = 1;
         } else {
-            for (int i = 0; i < NTP_SOURCE_COUNT; i++) {
+            for (int i = NTP_FIRST_NTS_SLOT; i < NTP_SOURCE_COUNT; i++) {
                 if (snapshot[i].ok) {
                     refQpc = snapshot[i].qpcAtT4;
                     refUtc = snapshot[i].ntpUtcMs;
                     have_ref = 1;
                     break;
+                }
+            }
+            if (!have_ref) {
+                for (int i = 0; i < NTP_SOURCE_COUNT; i++) {
+                    if (snapshot[i].ok) {
+                        refQpc = snapshot[i].qpcAtT4;
+                        refUtc = snapshot[i].ntpUtcMs;
+                        have_ref = 1;
+                        break;
+                    }
                 }
             }
         }
@@ -530,19 +636,21 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
         }
     }
 
-    // Publish shared state. The NTS slot's label points into
-    // `nts_ctx.labelBuf`, which is an AggregatorProc local and will
-    // cease to exist when this function returns; copy it into the
-    // file-scope g_ntsLabelPublished buffer and rewrite the pointer
-    // so About-dialog / audit-log readers don't chase a dangling
-    // pointer.
+    // Publish shared state. Each NTS slot's label points into the
+    // matching nts_ctx[i].labelBuf, which is an AggregatorProc local
+    // and will cease to exist when this function returns; copy into
+    // the file-scope g_ntsLabelPublished[] buffers and rewrite the
+    // pointers so About-dialog / audit-log readers don't chase a
+    // dangling pointer.
     if (g_csInit) EnterCriticalSection(&g_cs);
-    {
-        const char *lbl = snapshot[NTP_NTS_SLOT].label
-                          ? snapshot[NTP_NTS_SLOT].label : kNtsNoPinLabel;
-        _snprintf(g_ntsLabelPublished, sizeof g_ntsLabelPublished, "%s", lbl);
-        g_ntsLabelPublished[sizeof g_ntsLabelPublished - 1] = 0;
-        snapshot[NTP_NTS_SLOT].label = g_ntsLabelPublished;
+    for (int i = 0; i < NTP_NTS_COUNT; i++) {
+        int slot = NTP_FIRST_NTS_SLOT + i;
+        const char *lbl = snapshot[slot].label
+                          ? snapshot[slot].label : kNtsNoPinLabel;
+        _snprintf(g_ntsLabelPublished[i], sizeof g_ntsLabelPublished[i],
+                  "%s", lbl);
+        g_ntsLabelPublished[i][sizeof g_ntsLabelPublished[i] - 1] = 0;
+        snapshot[slot].label = g_ntsLabelPublished[i];
     }
     for (int i = 0; i < NTP_SOURCE_COUNT; i++) g_results[i] = snapshot[i];
     if (g_csInit) LeaveCriticalSection(&g_cs);
@@ -564,24 +672,40 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
     // consensus), RTT, and server-believed UTC so operators can see
     // exactly what each source returned.
     {
-        int okCount = 0;
+        int okCount   = 0;
+        int ntsOk     = 0;
+        int coreConcur= 0;
         for (int i = 0; i < NTP_SOURCE_COUNT; i++)
             if (snapshot[i].ok) okCount++;
-        const char *ntsLabel = snapshot[NTP_NTS_SLOT].label
-                               ? snapshot[NTP_NTS_SLOT].label : "NTS--";
-        Log_Append("ntp: cycle %s  concurring=%d/%d  spread=%lldms  "
-                   "gate=%s  anchor=%s",
+        for (int i = NTP_FIRST_NTS_SLOT; i < NTP_SOURCE_COUNT; i++)
+            if (snapshot[i].ok) ntsOk++;
+        for (int i = 0; i < NTP_CORE_COUNT; i++) {
+            if (!snapshot[i].ok) continue;
+            int64_t off = snapshot[i].offsetMs;
+            if (off < 0) off = -off;
+            if (off <= CONCUR_THRESHOLD_MS) coreConcur++;
+        }
+        Log_Append("ntp: cycle %s  concur=%d/%d core + %d/%d NTS  "
+                   "spread=%lldms  gate=%s",
                    (trust == TRUST_OK) ? "TRUST_OK" : "TRUST_INOP",
-                   okCount, NTP_SOURCE_COUNT,
+                   coreConcur, NTP_CORE_COUNT,
+                   ntsOk, NTP_NTS_COUNT,
                    (long long)maxSpread,
                    (trust == TRUST_OK)
-                       ? "NTS+2-of-3 core within \xc2\xb1" "200ms"
-                       : "need NTS + 2-of-3 core within \xc2\xb1" "200ms",
-                   snapshot[NTP_NTS_SLOT].ok ? ntsLabel : "(NTS unavailable)");
+                       ? (ntsOk == NTP_NTS_COUNT
+                          ? "both NTS agree + \xe2\x89\xa5" "3/4 core within \xc2\xb1" "200ms"
+                          : "1 NTS + 4/4 core within \xc2\xb1" "200ms (strict fallback)")
+                       : "need 2 NTS agreeing + \xe2\x89\xa5" "3/4 core, "
+                         "or 1 NTS + 4/4 core");
+        (void)okCount;
         for (int i = 0; i < NTP_SOURCE_COUNT; i++) {
             const char *lbl  = snapshot[i].label ? snapshot[i].label : "?";
-            const char *host = (i < NTP_CORE_COUNT) ? kSources[i].host
-                                                    : "(NTS pool)";
+            const char *host;
+            if (i < NTP_CORE_COUNT) {
+                host = chosenCore[i] ? chosenCore[i]->host : "(unassigned)";
+            } else {
+                host = "(NTS pool)";
+            }
             if (snapshot[i].ok) {
                 char iso[40];
                 FormatIsoUtc(snapshot[i].ntpUtcMs, iso, sizeof iso);
@@ -595,8 +719,8 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
                 Log_Append("  [%d] %-18s  %-22s  FAIL  (no valid reply within "
                            "%dms \xe2\x80\x94" " DNS/timeout/blackhole/rate-limit)",
                            i, lbl, host,
-                           (i == NTP_NTS_SLOT) ? NTS_SLOT_TIMEOUT_MS
-                                               : NTP_TIMEOUT_MS);
+                           (i >= NTP_FIRST_NTS_SLOT) ? NTS_SLOT_TIMEOUT_MS
+                                                     : NTP_TIMEOUT_MS);
             }
         }
     }
@@ -621,28 +745,81 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
 // Pure concurrence evaluator (exported; unit-tested in tests/test_core.c)
 // ---------------------------------------------------------------------------
 //
-// Per ntp.h: NTS (slot 3) is the trust anchor. The three core SNTP
-// sources (slots 0..2) must corroborate it: at least 2 of 3 must agree
-// to within CONCUR_THRESHOLD_MS after projection to a common QPC
-// moment. Otherwise the verdict is INOP.
+// Per ntp.h: slots NTP_FIRST_NTS_SLOT..NTP_SOURCE_COUNT-1 are the TWO
+// NTS (authenticated) sources; they are the trust anchor. Slots
+// 0..NTP_CORE_COUNT-1 are core (plain-SNTP) sources that corroborate.
+//
+// Full-OK rules:
+//   * Both NTS slots ok AND they mutually agree within 200 ms
+//     (projected to a common QPC). The anchor is the QPC-aligned
+//     midpoint of the two NTS samples, so a compromise of ONE NTS
+//     operator cannot bias the clock -- the second pinned operator's
+//     reading pulls the midpoint by exactly half the error, and the
+//     attack becomes visible as a large NTS disagreement.
+//   * >= 3 of the 4 core sources must agree with the NTS midpoint to
+//     within 200 ms. The 3-of-4 super-majority tolerates one national
+//     outage while still requiring a strong majority.
+//
+// Strict fallback: if exactly one NTS slot succeeded and the other
+// failed for any reason (network, KE timeout, pool empty), the cycle
+// can still promote to TRUST_OK but only when ALL FOUR core sources
+// agree with the surviving NTS reading to within 200 ms. This avoids
+// latching INOP when one NTS operator has a transient outage without
+// weakening the guarantee on any single cycle.
 //
 // Rationale: the NTS reply is cryptographically authenticated, so an
-// on-path adversary cannot forge it without defeating TLS 1.3 plus our
-// SPKI pin. Plain SNTP packets, in contrast, are forgeable. Using NTS
-// as the anchor elevates authentication above geographic consensus:
-// even if all three core sources were hijacked, the verdict would still
-// be INOP because they would not match the authenticated NTS reading.
+// on-path adversary cannot forge it without defeating TLS 1.3 plus
+// the pinned leaf SPKI. Plain SNTP packets, in contrast, are
+// forgeable. Two independent NTS anchors + strong core majority raise
+// the bar to "compromise two independent NTS operators AND a majority
+// of national labs simultaneously".
 //
 // Each source captured its qpcAtT4 at a slightly different moment, so
-// we cannot compare ntpUtcMs values directly (the raw diff would
-// include elapsed local time between captures). Instead we project
-// every core source's UTC estimate onto the NTS source's qpc moment
-// using the local QPC frequency, then threshold on the signed delta.
-// This is pure arithmetic on monotonic QPC + server timestamps; the
-// Windows system clock is never consulted.
+// we cannot compare ntpUtcMs values directly. Instead we project all
+// source UTC estimates onto a common QPC moment using the local QPC
+// frequency, then threshold on the signed delta. This is pure
+// arithmetic on monotonic QPC + server timestamps; the Windows system
+// clock is never consulted.
 //
 // maxSpreadMs carries the largest absolute core deviation from the
 // NTS anchor for logging, independent of the verdict.
+
+// Project a source's ntpUtcMs onto `refQpc` (pure QPC arithmetic).
+static int64_t ProjectUtcOntoQpc(int64_t sourceUtcMs,
+                                 int64_t sourceQpc,
+                                 int64_t refQpc,
+                                 int64_t qpcFreq) {
+    int64_t dq = refQpc - sourceQpc;
+    int64_t dms = (dq >= 0)
+        ? (dq * 1000LL + qpcFreq / 2) / qpcFreq
+        : (dq * 1000LL - qpcFreq / 2) / qpcFreq;
+    return sourceUtcMs + dms;
+}
+
+// Count core sources whose projected UTC agrees with (refUtc, refQpc)
+// to within CONCUR_THRESHOLD_MS, and report the worst absolute
+// deviation among successful cores.
+static int CountCoreConcurring(const NtpSourceResult results[NTP_SOURCE_COUNT],
+                               int64_t refUtc,
+                               int64_t refQpc,
+                               int64_t qpcFreq,
+                               int64_t *outWorstAbs) {
+    int concurring = 0;
+    int64_t worst = 0;
+    for (int i = 0; i < NTP_CORE_COUNT; i++) {
+        const NtpSourceResult *r = &results[i];
+        if (!r->ok) continue;
+        int64_t projected = ProjectUtcOntoQpc(r->ntpUtcMs, r->qpcAtT4,
+                                              refQpc, qpcFreq);
+        int64_t delta = projected - refUtc;
+        int64_t absD  = delta < 0 ? -delta : delta;
+        if (absD > worst) worst = absD;
+        if (absD <= CONCUR_THRESHOLD_MS) concurring++;
+    }
+    if (outWorstAbs) *outWorstAbs = worst;
+    return concurring;
+}
+
 TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
                       int64_t *outBestUtcMs,
                       int64_t *outBestQpc,
@@ -651,40 +828,67 @@ TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
     if (outBestQpc)     *outBestQpc     = 0;
     if (outMaxSpreadMs) *outMaxSpreadMs = 0;
 
-    const NtpSourceResult *nts = &results[NTP_NTS_SLOT];
-    if (!nts->ok) return TRUST_INOP;
-
     int64_t qpcFreq = Clock_QpcFreq();
     if (qpcFreq <= 0) return TRUST_INOP;
 
-    int64_t refQpc = nts->qpcAtT4;
-    int64_t refUtc = nts->ntpUtcMs;
+    // Count successful NTS slots and find them.
+    int ntsOkCount = 0;
+    int ntsOkIdx[NTP_NTS_COUNT] = { -1, -1 };
+    for (int i = 0; i < NTP_NTS_COUNT; i++) {
+        int slot = NTP_FIRST_NTS_SLOT + i;
+        if (results[slot].ok) {
+            ntsOkIdx[ntsOkCount++] = slot;
+        }
+    }
+    if (ntsOkCount == 0) return TRUST_INOP;
 
-    int concurring = 0;
-    int64_t worstAbs = 0;
-    for (int i = 0; i < NTP_CORE_COUNT; i++) {
-        const NtpSourceResult *r = &results[i];
-        if (!r->ok) continue;
-        int64_t dq = refQpc - r->qpcAtT4;
-        int64_t dms = (dq >= 0)
-            ? (dq * 1000LL + qpcFreq / 2) / qpcFreq
-            : (dq * 1000LL - qpcFreq / 2) / qpcFreq;
-        int64_t projected = r->ntpUtcMs + dms;
-        int64_t delta     = projected - refUtc;
-        int64_t absDelta  = delta < 0 ? -delta : delta;
-        if (absDelta > worstAbs) worstAbs = absDelta;
-        if (absDelta <= CONCUR_THRESHOLD_MS) concurring++;
+    // Both NTS slots succeeded: require mutual agreement within
+    // CONCUR_THRESHOLD_MS after QPC-projection. If they disagree,
+    // one of the two authenticated anchors is lying; refuse to
+    // discipline the clock on a split verdict.
+    if (ntsOkCount == 2) {
+        const NtpSourceResult *a = &results[ntsOkIdx[0]];
+        const NtpSourceResult *b = &results[ntsOkIdx[1]];
+        int64_t bProjOnA = ProjectUtcOntoQpc(b->ntpUtcMs, b->qpcAtT4,
+                                             a->qpcAtT4, qpcFreq);
+        int64_t ntsDelta = bProjOnA - a->ntpUtcMs;  // b - a at a's qpc
+        int64_t ntsAbs   = ntsDelta < 0 ? -ntsDelta : ntsDelta;
+        if (ntsAbs > CONCUR_THRESHOLD_MS) {
+            // NTS operators disagree: cannot trust either. Report the
+            // NTS disagreement as the spread so operators see why.
+            if (outMaxSpreadMs) *outMaxSpreadMs = ntsAbs;
+            return TRUST_INOP;
+        }
+
+        // Anchor = midpoint of the two NTS samples, expressed at
+        // slot a's qpcAtT4. (a + bProjOnA) / 2 == a + ntsDelta/2.
+        int64_t midUtc = a->ntpUtcMs + ntsDelta / 2;
+        int64_t midQpc = a->qpcAtT4;
+
+        int64_t worstCore = 0;
+        int coreConcur = CountCoreConcurring(results, midUtc, midQpc,
+                                             qpcFreq, &worstCore);
+        if (outMaxSpreadMs) *outMaxSpreadMs = worstCore;
+
+        if (coreConcur < 3) return TRUST_INOP;   // need >= 3 of 4
+
+        if (outBestUtcMs) *outBestUtcMs = midUtc;
+        if (outBestQpc)   *outBestQpc   = midQpc;
+        return TRUST_OK;
     }
 
-    if (outMaxSpreadMs) *outMaxSpreadMs = worstAbs;
+    // Strict single-NTS fallback: exactly one NTS slot succeeded.
+    // Require ALL FOUR core sources to agree with it.
+    const NtpSourceResult *only = &results[ntsOkIdx[0]];
+    int64_t worstCore = 0;
+    int coreConcur = CountCoreConcurring(results, only->ntpUtcMs, only->qpcAtT4,
+                                         qpcFreq, &worstCore);
+    if (outMaxSpreadMs) *outMaxSpreadMs = worstCore;
 
-    if (concurring < 2) return TRUST_INOP;
+    if (coreConcur < NTP_CORE_COUNT) return TRUST_INOP;
 
-    // NTS is the anchor: return its exact (utcMs, qpcAtT4) so the
-    // clockwork anchor is sub-millisecond accurate regardless of
-    // which core sources happened to agree.
-    if (outBestUtcMs) *outBestUtcMs = nts->ntpUtcMs;
-    if (outBestQpc)   *outBestQpc   = nts->qpcAtT4;
+    if (outBestUtcMs) *outBestUtcMs = only->ntpUtcMs;
+    if (outBestQpc)   *outBestQpc   = only->qpcAtT4;
     return TRUST_OK;
 }
 
@@ -696,11 +900,14 @@ void Ntp_Start(void) {
         Log_Append("ntp: sync requested but a cycle is already in flight");
         return;
     }
-    Log_Append("ntp: cycle start \xe2\x80\x94" " querying 4 sources in parallel "
-               "(core timeout %dms, NTS timeout %dms)",
+    Log_Append("ntp: cycle start \xe2\x80\x94"
+               " querying %d sources in parallel "
+               "(%d core SNTP + %d NTS, core timeout %dms, NTS timeout %dms)",
+               NTP_SOURCE_COUNT, NTP_CORE_COUNT, NTP_NTS_COUNT,
                NTP_TIMEOUT_MS, NTS_SLOT_TIMEOUT_MS);
-    Log_Append("  core: NIST=%s  PTB=%s  NICT=%s  (UDP/123, SNTPv4)",
-               kSources[0].host, kSources[1].host, kSources[2].host);
+    Log_Append("  core pool: %d curated stratum-1 servers "
+               "(national metrology / research labs); %d random picks per cycle",
+               (int)CORE_POOL_SIZE, NTP_CORE_COUNT);
     HANDLE th = CreateThread(NULL, 0, AggregatorProc, NULL, 0, NULL);
     if (th) {
         CloseHandle(th);

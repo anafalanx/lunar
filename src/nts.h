@@ -65,6 +65,14 @@ const NtsProvider *Nts_Pool(size_t *out_len);
 // enabled (i.e. pins haven't been populated yet).
 const NtsProvider *Nts_PickProvider(void);
 
+// Pick `n_want` DISTINCT providers at random (uniform over enabled
+// pool). Writes pointers into out[0 .. n-1] and returns the number
+// actually picked; this is min(n_want, pool_size). Providers that
+// have no SPKI pin populated are silently excluded. Returns 0 if no
+// providers are enabled. Intended for multi-slot NTS polling where
+// the caller wants geographic / operator diversity within one cycle.
+size_t Nts_PickProviders(const NtsProvider **out, size_t n_want);
+
 // Perform a full NTS-KE exchange:
 //   TCP connect -> TLS 1.3 handshake (ALPN "ntske/1") -> SPKI pin
 //   check -> NTS-KE records -> TLS exporter -> graceful close.

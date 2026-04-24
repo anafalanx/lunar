@@ -74,11 +74,23 @@ static const NtsProvider kProviders[] = {
           0xa3, 0xa6, 0xae, 0xa8, 0x0b, 0xf6, 0x5f, 0x9c,
           0x44, 0x1b, 0x63, 0xfb, 0xd8, 0x66, 0x7e, 0x05,
           0x7b, 0x0f, 0x11, 0x2f, 0xc3, 0x21, 0x1e, 0xfa } },
+    { "sth1.nts.netnod.se",  0, "netnod-sth1",
+      /* spki_pin (leaf expires 2026-06-22) = */ {
+          0x10, 0xfe, 0xf1, 0xa0, 0x92, 0xd2, 0xf6, 0x8b,
+          0x06, 0x31, 0x49, 0xc8, 0xdf, 0x34, 0xbc, 0xb1,
+          0x5a, 0x94, 0x9c, 0x5d, 0xf0, 0x30, 0xb3, 0xc2,
+          0x2c, 0x9c, 0x49, 0xa3, 0x3c, 0x15, 0x14, 0xed } },
+    { "sth2.nts.netnod.se",  0, "netnod-sth2",
+      /* spki_pin (leaf expires 2026-06-22) = */ {
+          0xb7, 0x06, 0x7a, 0xce, 0x17, 0x9c, 0x64, 0x7a,
+          0xca, 0x14, 0x2f, 0x15, 0xcd, 0x35, 0xc0, 0xc3,
+          0x3a, 0xdb, 0x2b, 0xf0, 0x08, 0x83, 0x54, 0x62,
+          0xc1, 0x11, 0xcb, 0xc8, 0x9d, 0xe3, 0xdd, 0xa1 } },
     /* NOTE: ptbtime{1..4}.ptb.de KE + cookies work, but PTB silently
      * drops NTS-sized (>48 byte) UDP packets at the NTP endpoint, so
      * the authenticated round trip never completes. We keep PTB as a
-     * plain-SNTP core source (see src/ntp.c) and use System76's Ohio
-     * node here for the NTS slot. Verified 2026-04-21 via
+     * plain-SNTP core source (see src/ntp.c) and use System76's US
+     * nodes here for additional NTS diversity. Verified 2026-04-21 via
      * scripts/probe_nts.py on ptbtime{1..4}. */
     { "ohio.time.system76.com", 0, "system76-ohio",
       /* spki_pin (leaf expires 2026-06-03) = */ {
@@ -86,6 +98,24 @@ static const NtsProvider kProviders[] = {
           0x94, 0x17, 0xb3, 0x8b, 0x7c, 0x8f, 0xd4, 0x3f,
           0x67, 0x23, 0x01, 0xd8, 0x6f, 0xe0, 0x46, 0xe2,
           0x92, 0xf2, 0x15, 0xc4, 0x0e, 0x24, 0x39, 0xb7 } },
+    { "virginia.time.system76.com", 0, "system76-virginia",
+      /* spki_pin (leaf expires 2026-05-31) = */ {
+          0xb7, 0xe3, 0x66, 0x9c, 0x5a, 0x2e, 0x88, 0x88,
+          0x0f, 0xef, 0x64, 0x67, 0xb5, 0x04, 0xa7, 0x04,
+          0x99, 0xca, 0x47, 0x7c, 0x5b, 0x47, 0xbc, 0x4d,
+          0x43, 0x6e, 0x71, 0x5f, 0x7d, 0xfc, 0xd6, 0x72 } },
+    { "oregon.time.system76.com", 0, "system76-oregon",
+      /* spki_pin (leaf expires 2026-05-30) = */ {
+          0xc0, 0xfe, 0x53, 0x64, 0xcd, 0x9d, 0xb5, 0x92,
+          0xfb, 0xe0, 0x43, 0xed, 0xb7, 0xaa, 0x45, 0x9b,
+          0x0a, 0x20, 0xfe, 0x09, 0x9f, 0xf0, 0x5a, 0x1d,
+          0x88, 0x26, 0xe9, 0xdf, 0x15, 0x31, 0x91, 0xc9 } },
+    { "paris.time.system76.com", 0, "system76-paris",
+      /* spki_pin (leaf expires 2026-05-31) = */ {
+          0x5b, 0x0e, 0xb2, 0x79, 0xe0, 0xb0, 0x3d, 0xbf,
+          0xba, 0x68, 0x0c, 0x15, 0x7d, 0xb3, 0xbe, 0x89,
+          0xab, 0x17, 0xa5, 0x2e, 0xca, 0xa5, 0xb1, 0xcc,
+          0x9b, 0x7c, 0x30, 0xff, 0x1a, 0x82, 0x20, 0x74 } },
     { "nts.time.nl",         0, "sidn",
       /* spki_pin (leaf expires 2026-05-30) = */ {
           0x62, 0x13, 0x4a, 0x45, 0x9a, 0xd5, 0x3a, 0xb7,
@@ -123,6 +153,36 @@ const NtsProvider *Nts_PickProvider(void)
         return NULL;
     }
     return &kProviders[enabled[r % n_enabled]];
+}
+
+size_t Nts_PickProviders(const NtsProvider **out, size_t n_want)
+{
+    if (!out || n_want == 0) return 0;
+    size_t n = sizeof kProviders / sizeof kProviders[0];
+    size_t enabled[sizeof kProviders / sizeof kProviders[0]];
+    size_t n_enabled = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (!pin_is_zero(kProviders[i].spki_pin)) enabled[n_enabled++] = i;
+    }
+    if (n_enabled == 0) return 0;
+    if (n_want > n_enabled) n_want = n_enabled;
+
+    // Fisher-Yates partial shuffle over the enabled indices using
+    // BCryptGenRandom for each draw. n is small (<= pool size), so
+    // this is trivially constant-work and uniform.
+    for (size_t i = 0; i < n_want; i++) {
+        uint32_t r = 0;
+        if (BCryptGenRandom(NULL, (PUCHAR)&r, sizeof r,
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+            return i;   // partial result; caller decides what to do
+        }
+        size_t j = i + (size_t)(r % (uint32_t)(n_enabled - i));
+        size_t tmp = enabled[i];
+        enabled[i] = enabled[j];
+        enabled[j] = tmp;
+        out[i] = &kProviders[enabled[i]];
+    }
+    return n_want;
 }
 
 // ---------------------------------------------------------------------------
