@@ -8,6 +8,7 @@
 #define LUNAR_NO_MAIN
 #include "../src/lunar.c"
 #include "../src/tzif.h"
+#include "../src/dns.h"
 
 #include <stdio.h>
 
@@ -1907,6 +1908,199 @@ static void test_posix_footer_hardening(void) {
 }
 
 // ---------------------------------------------------------------------------
+// DNS-over-HTTPS resolver: wire format + pool invariants + agreement
+// ---------------------------------------------------------------------------
+
+static void test_dns_pool_pins(void) {
+    // Same invariant as test_nts_pool_pins but for the DoH resolver
+    // pool: pool must exist, at least one enabled entry, every entry
+    // must carry the bootstrap fields we depend on before the first
+    // network call.
+    size_t n = 0;
+    const DnsResolver *p = Dns_Pool(&n);
+    CHECK(p != NULL);
+    CHECK(n >= 2);   // need two for the agreement gate
+
+    int n_enabled = 0;
+    for (size_t i = 0; i < n; i++) {
+        CHECK(p[i].hostname    != NULL && p[i].hostname[0]    != 0);
+        CHECK(p[i].ip_primary  != NULL && p[i].ip_primary[0]  != 0);
+        CHECK(p[i].label       != NULL && p[i].label[0]       != 0);
+        uint8_t acc = 0;
+        for (int j = 0; j < 32; j++) acc |= p[i].spki_pin[j];
+        if (acc != 0) n_enabled++;
+    }
+    CHECK(n_enabled >= 2);
+}
+
+static void test_dns_pick_resolvers(void) {
+    // Asking for 2 must yield 2 distinct enabled resolvers.
+    const DnsResolver *pick[4] = {0};
+    size_t got = Dns_PickResolvers(pick, 2);
+    CHECK_EQ_INT(got, 2);
+    CHECK(pick[0] != NULL && pick[1] != NULL);
+    CHECK(pick[0] != pick[1]);
+
+    // Asking for more than the enabled pool clamps down.
+    got = Dns_PickResolvers(pick, 100);
+    CHECK(got >= 2);
+    // All returned entries must be distinct and enabled.
+    for (size_t i = 0; i < got; i++) {
+        CHECK(pick[i] != NULL);
+        uint8_t acc = 0;
+        for (int j = 0; j < 32; j++) acc |= pick[i]->spki_pin[j];
+        CHECK(acc != 0);
+        for (size_t j = i + 1; j < got; j++) {
+            CHECK(pick[i] != pick[j]);
+        }
+    }
+
+    // Zero-want returns zero, writes nothing.
+    got = Dns_PickResolvers(pick, 0);
+    CHECK_EQ_INT(got, 0);
+
+    // NULL buffer returns zero.
+    got = Dns_PickResolvers(NULL, 2);
+    CHECK_EQ_INT(got, 0);
+}
+
+static void test_dns_build_query(void) {
+    // Known-answer for "example.com" / A / id=0x1234.
+    uint8_t buf[512];
+    size_t  len = 0;
+    int     rc = Dns_BuildQueryA("example.com", 0x1234, buf, sizeof buf, &len);
+    CHECK_EQ_INT(rc, 0);
+    // Header is 12 bytes; body = 7 (example) + 3 (com) + 2 NULs + 4 (type+class).
+    //   12 + 1 + 7 + 1 + 3 + 1 + 2 + 2 = 29
+    CHECK_EQ_INT(len, 29);
+    CHECK_EQ_INT(buf[0], 0x12);
+    CHECK_EQ_INT(buf[1], 0x34);
+    // QR=0, OPCODE=0, RD=1  -> flags high byte = 0x01; low byte = 0.
+    CHECK_EQ_INT(buf[2], 0x01);
+    CHECK_EQ_INT(buf[3], 0x00);
+    // QDCOUNT = 1, ANCOUNT = ARCOUNT = NSCOUNT = 0.
+    CHECK_EQ_INT(buf[4], 0); CHECK_EQ_INT(buf[5], 1);
+    CHECK_EQ_INT(buf[6], 0); CHECK_EQ_INT(buf[7], 0);
+    CHECK_EQ_INT(buf[8], 0); CHECK_EQ_INT(buf[9], 0);
+    CHECK_EQ_INT(buf[10], 0); CHECK_EQ_INT(buf[11], 0);
+    // Qname: 7 "example" 3 "com" 0
+    CHECK_EQ_INT(buf[12], 7);
+    CHECK(memcmp(buf + 13, "example", 7) == 0);
+    CHECK_EQ_INT(buf[20], 3);
+    CHECK(memcmp(buf + 21, "com", 3) == 0);
+    CHECK_EQ_INT(buf[24], 0);
+    // QTYPE = A (1), QCLASS = IN (1).
+    CHECK_EQ_INT(buf[25], 0); CHECK_EQ_INT(buf[26], 1);
+    CHECK_EQ_INT(buf[27], 0); CHECK_EQ_INT(buf[28], 1);
+
+    // Invalid inputs: empty label, oversized label, total-too-long.
+    CHECK_EQ_INT(Dns_BuildQueryA("",            0, buf, sizeof buf, &len), -1);
+    CHECK_EQ_INT(Dns_BuildQueryA(".",           0, buf, sizeof buf, &len), -1);
+    CHECK_EQ_INT(Dns_BuildQueryA("a..b",        0, buf, sizeof buf, &len), -1);
+    char big[300]; memset(big, 'a', sizeof big); big[sizeof big - 1] = 0;
+    CHECK_EQ_INT(Dns_BuildQueryA(big, 0, buf, sizeof buf, &len), -1);
+    // Tiny out buffer.
+    CHECK_EQ_INT(Dns_BuildQueryA("example.com", 0, buf, 10, &len), -1);
+}
+
+static void test_dns_parse_response(void) {
+    // Hand-built response: id=0xabcd, QR=1, RD=1, RA=1, QDCOUNT=1,
+    //   ANCOUNT=2, one A record 93.184.216.34 (TTL 300) + one A
+    //   record 10.0.0.1 (TTL 120). Question uses the wire form, and
+    //   each answer uses a 0xC00C compression pointer back to the
+    //   qname.
+    uint8_t r[512];
+    size_t  pos = 0;
+    r[pos++] = 0xab; r[pos++] = 0xcd;        // id
+    r[pos++] = 0x81; r[pos++] = 0x80;        // QR=1 RD=1 RA=1 RCODE=0
+    r[pos++] = 0x00; r[pos++] = 0x01;        // QDCOUNT
+    r[pos++] = 0x00; r[pos++] = 0x02;        // ANCOUNT
+    r[pos++] = 0x00; r[pos++] = 0x00;        // NSCOUNT
+    r[pos++] = 0x00; r[pos++] = 0x00;        // ARCOUNT
+    // qname: example.com
+    r[pos++] = 7; memcpy(r + pos, "example", 7); pos += 7;
+    r[pos++] = 3; memcpy(r + pos, "com",     3); pos += 3;
+    r[pos++] = 0;
+    r[pos++] = 0; r[pos++] = 1;              // type A
+    r[pos++] = 0; r[pos++] = 1;              // class IN
+    // Answer 1: name=pointer to 0x000C, type A, class IN, TTL 300, rdlen 4, rdata
+    r[pos++] = 0xc0; r[pos++] = 0x0c;
+    r[pos++] = 0; r[pos++] = 1;
+    r[pos++] = 0; r[pos++] = 1;
+    r[pos++] = 0; r[pos++] = 0; r[pos++] = 0x01; r[pos++] = 0x2c;  // TTL 300
+    r[pos++] = 0; r[pos++] = 4;
+    r[pos++] = 93; r[pos++] = 184; r[pos++] = 216; r[pos++] = 34;
+    // Answer 2: same name ptr, A, IN, TTL 120, rdata 10.0.0.1
+    r[pos++] = 0xc0; r[pos++] = 0x0c;
+    r[pos++] = 0; r[pos++] = 1;
+    r[pos++] = 0; r[pos++] = 1;
+    r[pos++] = 0; r[pos++] = 0; r[pos++] = 0; r[pos++] = 120;
+    r[pos++] = 0; r[pos++] = 4;
+    r[pos++] = 10; r[pos++] = 0; r[pos++] = 0; r[pos++] = 1;
+
+    char ips[8][16];
+    size_t n_ips = 0;
+    uint32_t min_ttl = 0;
+
+    // Good path.
+    CHECK_EQ_INT(Dns_ParseResponseA(r, pos, 0xabcd, "example.com",
+                                    ips, 8, &n_ips, &min_ttl), 0);
+    CHECK_EQ_INT(n_ips, 2);
+    CHECK_EQ_STR(ips[0], "93.184.216.34");
+    CHECK_EQ_STR(ips[1], "10.0.0.1");
+    CHECK_EQ_INT(min_ttl, 120);
+
+    // QID mismatch.
+    CHECK_EQ_INT(Dns_ParseResponseA(r, pos, 0x0000, "example.com",
+                                    ips, 8, &n_ips, &min_ttl), -3);
+    // Host mismatch (case-insensitive OK, "EXAMPLE.COM" should still match).
+    CHECK_EQ_INT(Dns_ParseResponseA(r, pos, 0xabcd, "EXAMPLE.COM",
+                                    ips, 8, &n_ips, &min_ttl), 0);
+    // Host mismatch (real).
+    CHECK_EQ_INT(Dns_ParseResponseA(r, pos, 0xabcd, "other.com",
+                                    ips, 8, &n_ips, &min_ttl), -3);
+    // Truncated.
+    CHECK_EQ_INT(Dns_ParseResponseA(r, 11, 0xabcd, "example.com",
+                                    ips, 8, &n_ips, &min_ttl), -1);
+
+    // RCODE != 0.
+    uint8_t r_rcode[64];
+    memcpy(r_rcode, r, pos);
+    r_rcode[3] = 0x83;     // RCODE = 3 (NXDOMAIN), QR=1 RD=1 RA=1
+    CHECK_EQ_INT(Dns_ParseResponseA(r_rcode, pos, 0xabcd, "example.com",
+                                    ips, 8, &n_ips, &min_ttl), -2);
+}
+
+static void test_dns_intersect(void) {
+    char a[4][16] = { "1.2.3.4", "5.6.7.8", "9.10.11.12", "" };
+    char b[4][16] = { "99.0.0.1", "5.6.7.8", "1.2.3.4", "" };
+    char out[16] = {0};
+
+    // First overlap (in a's order) is 1.2.3.4.
+    CHECK_EQ_INT(Dns_Intersect(a, 3, b, 3, out), 0);
+    CHECK_EQ_STR(out, "1.2.3.4");
+
+    // Disjoint.
+    char c[2][16] = { "8.8.8.8", "9.9.9.9" };
+    char d[2][16] = { "1.1.1.1", "2.2.2.2" };
+    CHECK_EQ_INT(Dns_Intersect(c, 2, d, 2, out), -1);
+
+    // Empty sets: both orderings return -1.
+    CHECK_EQ_INT(Dns_Intersect(a, 0, b, 3, out), -1);
+    CHECK_EQ_INT(Dns_Intersect(a, 3, b, 0, out), -1);
+    CHECK_EQ_INT(Dns_Intersect(a, 0, b, 0, out), -1);
+}
+
+static void test_dns_cache_clear(void) {
+    // Just make sure the API is callable and idempotent. Actual cache
+    // hit/miss behaviour is exercised end-to-end in live validation,
+    // since the cache state is internal.
+    Dns_CacheClear();
+    Dns_CacheClear();
+    CHECK(1);
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -1945,6 +2139,13 @@ int main(void) {
     test_settings_legacy_v1();
     test_settings_invalid_tz();
     test_posix_footer_hardening();
+
+    test_dns_pool_pins();
+    test_dns_pick_resolvers();
+    test_dns_build_query();
+    test_dns_parse_response();
+    test_dns_intersect();
+    test_dns_cache_clear();
 
     printf("\n%d checks, %d failed\n", g_pass + g_fail, g_fail);
     return g_fail == 0 ? 0 : 1;

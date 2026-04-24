@@ -54,11 +54,13 @@
 #include "ntp.h"
 #include "clock.h"
 #include "nts.h"
+#include "dns.h"
 #include "logbuf.h"
 
 #include <bcrypt.h>
 
 #define NTP_PORT             "123"
+#define NTP_PORT_NUM         123
 #define NTP_TIMEOUT_MS       6000      // core slot UDP recv timeout
 #define NTS_SLOT_TIMEOUT_MS  20000     // KE (TLS 1.3 + handshake) + authenticated UDP
 #define NTP_EPOCH_DELTA_S    2208988800ULL        // seconds between 1900 and 1970
@@ -156,15 +158,22 @@ static int NtpQueryHost(const char *host,
     memset(pkt, 0, sizeof(pkt));
     pkt[0] = 0x23;  // LI=0, VN=4, Mode=3 (client)
 
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family   = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    hints.ai_protocol = IPPROTO_UDP;
-    if (getaddrinfo(host, NTP_PORT, &hints, &res) != 0 || !res) return 0;
+    // Resolve via DoH (2-of-N pinned resolvers + agreement gate) so
+    // an on-path attacker cannot redirect this SNTP packet to a fake
+    // UDP listener by forging a plain-DNS reply. See src/dns.h for
+    // the design rationale. No fallback to getaddrinfo: if DoH is
+    // blocked, this source fails and the cycle goes INOP.
+    char ip[16];
+    if (Dns_Resolve(host, ip) != 0) return 0;
 
-    SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (s == INVALID_SOCKET) { freeaddrinfo(res); return 0; }
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port   = htons(NTP_PORT_NUM);
+    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) return 0;
+
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (s == INVALID_SOCKET) return 0;
 
     DWORD tmo = NTP_TIMEOUT_MS;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof(tmo));
@@ -172,8 +181,7 @@ static int NtpQueryHost(const char *host,
 
     int64_t qpcT1 = Clock_Qpc();
     int sent = sendto(s, (const char *)pkt, (int)sizeof(pkt), 0,
-                      res->ai_addr, (int)res->ai_addrlen);
-    freeaddrinfo(res);
+                      (struct sockaddr *)&sa, (int)sizeof sa);
     if (sent != (int)sizeof(pkt)) { closesocket(s); return 0; }
 
     int recvd = recv(s, (char *)pkt, (int)sizeof(pkt), 0);

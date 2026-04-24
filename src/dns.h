@@ -1,0 +1,171 @@
+// dns.h -- DNS-over-HTTPS resolver with pinned leaves and cross-
+// resolver agreement. The ONLY DNS path this binary uses.
+//
+// =============================================================================
+// Why this module exists
+// =============================================================================
+//
+// Every upstream socket (SNTP to core, TLS to NTS-KE, UDP to the NTS
+// NTP server) starts with a hostname -> IP resolution. Plain DNS over
+// UDP/53 is trivially spoofable by any on-path attacker and by any
+// compromised forwarder the OS happens to be configured with. That
+// defeats the entire trust chain: an attacker who controls the DNS
+// reply for time.cloudflare.com can redirect our NTS-KE session to
+// their own TLS server. The SPKI pin would still catch it (they don't
+// have the right leaf key), but the pin only guards the cases where we
+// actually reached the pinned operator; a forged DNS reply for a core
+// SNTP host simply redirects SNTP to a fake UDP listener.
+//
+// =============================================================================
+// Design
+// =============================================================================
+//
+// 1. All resolution goes through DNS-over-HTTPS (RFC 8484). Bootstrap
+//    is from a hardcoded table of 5 well-known resolvers, each
+//    identified by (a) a hardcoded anycast IPv4 address so we never
+//    need DNS to find the DNS, and (b) a pinned SHA-256(SPKI) of the
+//    TLS leaf certificate so a compromised CA cannot mint a trusted
+//    substitute.
+//
+//       cloudflare    1.1.1.1, 1.0.0.1
+//       quad9         9.9.9.9, 149.112.112.112
+//       google        8.8.8.8, 8.8.4.4
+//       nextdns       45.90.28.0
+//       mullvad       194.242.2.2
+//
+// 2. For every cache-miss hostname we pick TWO distinct resolvers at
+//    random (Fisher-Yates over the enabled pool, BCryptGenRandom) and
+//    query each in series. If the two result sets overlap in at least
+//    one IP, we accept that IP and cache it. If they disagree
+//    entirely, or either query fails, we return failure.
+//
+// 3. Hard fail. There is NO plain-DNS fallback. A network that blocks
+//    all 5 pinned resolvers simultaneously will push Lunar to INOP,
+//    which is the correct outcome -- we MUST NOT silently degrade to
+//    spoofable UDP/53 just because the secure path is unavailable.
+//    An attacker who could force such a fallback would have defeated
+//    the whole purpose of this module.
+//
+// 4. In-memory cache, 32 entries, per-host TTL = min(DNS TTL, 1 hour)
+//    with a 60-second floor. Cleared on process restart (bootstrap
+//    IPs are hardcoded, so the cache is never load-bearing for
+//    reachability). The cache is protected by its own critical
+//    section; concurrent worker threads may call Dns_Resolve freely.
+//
+// 5. IPv4 only in this cut. AAAA can follow. All upstream call sites
+//    currently use AF_INET or AF_UNSPEC with IPv4 fallbacks that work.
+//
+// =============================================================================
+// Threat model
+// =============================================================================
+//
+// - On-path attacker with UDP/53 manipulation: defeated (we never
+//   issue a UDP/53 query).
+// - Compromised OS resolver config / hosts file: defeated (we bypass
+//   getaddrinfo entirely).
+// - Compromised CA minting a cert for cloudflare-dns.com: defeated by
+//   SPKI pin.
+// - Compromise of ONE DoH resolver operator: detected by the 2-of-2
+//   agreement gate -- the second pinned operator returns a different
+//   IP, the query fails, Lunar goes INOP rather than trusting the
+//   tampered IP.
+// - Compromise of TWO DoH resolver operators simultaneously: out of
+//   scope. At this point an attacker with that much reach has also
+//   compromised the NTS operators we'd route to.
+// - Network blocking port 443 to all pinned resolvers: not a security
+//   failure, just a denial-of-service. We go INOP and display that.
+//
+// =============================================================================
+
+#ifndef LUNAR_DNS_H
+#define LUNAR_DNS_H
+
+#include <stddef.h>
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// --- Public API --------------------------------------------------------------
+
+// Resolve `host` to an IPv4 dotted-quad string in `out_ip` (buffer
+// must be at least 16 bytes: "255.255.255.255\0"). On success returns
+// 0 and writes a NUL-terminated dotted-quad. On any failure returns
+// -1 and the contents of out_ip are unspecified.
+//
+// Failure modes:
+//   * No enabled DoH resolvers (pool wiped).
+//   * Both randomly-picked resolvers fail to complete the DoH query.
+//   * Resolvers returned disjoint A-record sets (agreement gate).
+//   * Hostname is syntactically invalid or too long.
+//
+// Thread-safe. May block for several seconds on a cache miss (two
+// serial TLS handshakes).
+int Dns_Resolve(const char *host, char out_ip[16]);
+
+// Clear the entire in-memory cache. Primarily for tests.
+void Dns_CacheClear(void);
+
+// --- Pool introspection (for tests + random picks) --------------------------
+
+typedef struct {
+    const char *hostname;          // SNI + HTTP Host:, e.g. "cloudflare-dns.com"
+    const char *ip_primary;         // hardcoded anycast IPv4 dotted-quad
+    const char *ip_secondary;       // NULL if no secondary
+    const char *label;              // short tag for logs, e.g. "cloudflare"
+    uint8_t     spki_pin[32];       // all-zero => disabled
+} DnsResolver;
+
+// Return the full pinned-resolver table and its length.
+const DnsResolver *Dns_Pool(size_t *out_len);
+
+// Fisher-Yates partial shuffle over the ENABLED (non-zero pin) subset.
+// Writes up to `n_want` distinct resolver pointers to out[0..n-1].
+// Returns the number actually written (<= n_want, <= enabled pool
+// size). 0 on bad args or RNG failure.
+size_t Dns_PickResolvers(const DnsResolver **out, size_t n_want);
+
+// --- DNS wire format (exported for tests) -----------------------------------
+//
+// Minimal RFC 1035 encoder/decoder, A records only, no compression on
+// the wire we emit (servers may use compression in responses; we
+// follow pointers during parse). No EDNS -- DoH already gives us the
+// secure channel, and EDNS adds parsing surface for no gain.
+
+// Build a DNS query for host/A. Writes `*out_len` bytes on success.
+// Caller supplies `id` (typically from a CSPRNG). Returns 0 on
+// success, -1 if out is too small or the host is syntactically
+// invalid (labels > 63 octets, total > 255 octets, empty labels).
+int Dns_BuildQueryA(const char *host, uint16_t id,
+                    uint8_t *out, size_t out_cap, size_t *out_len);
+
+// Parse a DNS response for A records. Writes up to `ips_cap`
+// dotted-quad strings (each 16 bytes) into `out_ips`, and writes the
+// number actually written to `*out_count`. Also writes the smallest
+// TTL among the A records to `*out_min_ttl` (clamped sensibly by the
+// caller). Returns 0 on success, -1 on malformed response, -2 on RCODE
+// != NOERROR, -3 if QID/question mismatch the expected `expect_id`
+// and `expect_host`. CNAME chains are followed to the terminal A
+// records; other RR types are skipped.
+int Dns_ParseResponseA(const uint8_t *in, size_t in_len,
+                       uint16_t expect_id, const char *expect_host,
+                       char (*out_ips)[16], size_t ips_cap,
+                       size_t *out_count,
+                       uint32_t *out_min_ttl);
+
+// --- Agreement gate (exported for tests) ------------------------------------
+
+// Given two A-record sets, find the first IP from `set_a` that also
+// appears in `set_b`. Writes it to out_ip (16-byte buffer) and
+// returns 0. Returns -1 if no overlap. Case-sensitive string compare
+// on dotted quads.
+int Dns_Intersect(const char (*set_a)[16], size_t n_a,
+                  const char (*set_b)[16], size_t n_b,
+                  char out_ip[16]);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

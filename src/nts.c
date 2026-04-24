@@ -44,6 +44,7 @@
 #include "nts_ke.h"
 #include "nts_ef.h"
 #include "clock.h"
+#include "dns.h"
 
 // ---------------------------------------------------------------------------
 // Provider pool
@@ -273,53 +274,46 @@ static int bio_recv(void *ctx, unsigned char *buf, size_t len)
 
 static SOCKET tcp_connect(const char *host, uint16_t port)
 {
-    char portbuf[8];
-    _snprintf(portbuf, sizeof portbuf, "%u", (unsigned)port);
+    // Resolve via DoH (pinned, 2-of-N agreement). No getaddrinfo
+    // fallback: an attacker able to forge plain DNS could redirect
+    // our NTS-KE TLS session to a host whose leaf they control.
+    // SPKI pinning would still refuse that session, but failing
+    // BEFORE we connect is both cheaper and clearer in logs.
+    char ip[16];
+    if (Dns_Resolve(host, ip) != 0) return INVALID_SOCKET;
 
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    if (getaddrinfo(host, portbuf, &hints, &res) != 0 || res == NULL) {
-        return INVALID_SOCKET;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port   = htons(port);
+    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) return INVALID_SOCKET;
+
+    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+
+    // Non-blocking connect with select() for a hard timeout.
+    u_long nb = 1;
+    ioctlsocket(s, FIONBIO, &nb);
+    int cr = connect(s, (struct sockaddr *)&sa, (int)sizeof sa);
+    if (cr != 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
+        closesocket(s); return INVALID_SOCKET;
     }
 
-    SOCKET s = INVALID_SOCKET;
-    for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
-        s = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (s == INVALID_SOCKET) continue;
+    fd_set wfd; FD_ZERO(&wfd); FD_SET(s, &wfd);
+    struct timeval tv;
+    tv.tv_sec  =  NTS_CONNECT_TIMEOUT_MS / 1000;
+    tv.tv_usec = (NTS_CONNECT_TIMEOUT_MS % 1000) * 1000;
+    int sel = select(0, NULL, &wfd, NULL, &tv);
+    if (sel <= 0) { closesocket(s); return INVALID_SOCKET; }
 
-        // Non-blocking connect with select() for a hard timeout.
-        u_long nb = 1;
-        ioctlsocket(s, FIONBIO, &nb);
-        int cr = connect(s, ai->ai_addr, (int)ai->ai_addrlen);
-        if (cr != 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
-            closesocket(s); s = INVALID_SOCKET; continue;
-        }
+    int err = 0; int errlen = sizeof err;
+    getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen);
+    if (err != 0) { closesocket(s); return INVALID_SOCKET; }
 
-        fd_set wfd; FD_ZERO(&wfd); FD_SET(s, &wfd);
-        struct timeval tv;
-        tv.tv_sec  =  NTS_CONNECT_TIMEOUT_MS / 1000;
-        tv.tv_usec = (NTS_CONNECT_TIMEOUT_MS % 1000) * 1000;
-        int sel = select(0, NULL, &wfd, NULL, &tv);
-        if (sel <= 0) {
-            closesocket(s); s = INVALID_SOCKET; continue;
-        }
-
-        // Check SO_ERROR for a completed-but-failed connect.
-        int err = 0; int errlen = sizeof err;
-        getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen);
-        if (err != 0) { closesocket(s); s = INVALID_SOCKET; continue; }
-
-        // Restore blocking + set I/O timeouts.
-        nb = 0; ioctlsocket(s, FIONBIO, &nb);
-        DWORD tmo = NTS_IO_TIMEOUT_MS;
-        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof tmo);
-        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tmo, sizeof tmo);
-        break;
-    }
-    freeaddrinfo(res);
+    nb = 0; ioctlsocket(s, FIONBIO, &nb);
+    DWORD tmo = NTS_IO_TIMEOUT_MS;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof tmo);
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tmo, sizeof tmo);
     return s;
 }
 
@@ -575,17 +569,22 @@ int Nts_FetchSample(const NtsProvider *p,
 
     int           rc = 0;
     SOCKET        s  = INVALID_SOCKET;
-    struct addrinfo hints, *res = NULL;
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family   = AF_UNSPEC;
-    hints.ai_socktype = SOCK_DGRAM;
-    hints.ai_protocol = IPPROTO_UDP;
 
-    char portbuf[8];
-    snprintf(portbuf, sizeof portbuf, "%u", (unsigned)port);
-    if (getaddrinfo(host, portbuf, &hints, &res) != 0 || res == NULL) goto udp_done;
+    // DoH resolution: same no-fallback policy as tcp_connect above.
+    // The host here is either the NTS-KE host or an override the
+    // server sent via NTSKE_REC_NTPV4_SERVER. Either way, we MUST NOT
+    // trust OS DNS to tell us where to send our authenticated SNTP
+    // packet.
+    char ip[16];
+    if (Dns_Resolve(host, ip) != 0) goto udp_done;
 
-    s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port   = htons(port);
+    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) goto udp_done;
+
+    s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) goto udp_done;
 
     DWORD tmo = NTS_UDP_TIMEOUT_MS;
@@ -594,7 +593,7 @@ int Nts_FetchSample(const NtsProvider *p,
 
     int64_t qpcT1 = Clock_Qpc();
     int sent = sendto(s, (const char *)pkt, (int)pkt_len, 0,
-                      res->ai_addr, (int)res->ai_addrlen);
+                      (struct sockaddr *)&sa, (int)sizeof sa);
     if (sent != (int)pkt_len) goto udp_done;
 
     uint8_t reply[NTS_UDP_MAX_PKT];
@@ -634,7 +633,6 @@ int Nts_FetchSample(const NtsProvider *p,
     mbedtls_platform_zeroize(new_cookies, sizeof new_cookies);
 
 udp_done:
-    if (res) freeaddrinfo(res);
     if (s != INVALID_SOCKET) closesocket(s);
     WSACleanup();
     mbedtls_platform_zeroize(uid,   sizeof uid);

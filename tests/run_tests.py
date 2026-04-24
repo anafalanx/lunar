@@ -63,6 +63,7 @@ def main() -> int:
         SRC  / "nts_ke.c",
         SRC  / "nts_ef.c",
         SRC  / "nts.c",
+        SRC  / "dns.c",
     ]
     # No -mwindows: we want a console main(). -Werror to catch new warnings.
     cmd = [
