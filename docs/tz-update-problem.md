@@ -66,8 +66,8 @@ The obvious fixes each carry real cost for a cosmetic benefit:
   trust in a third party. Adds a signing key to manage, a server to
   keep alive, certificate pinning to maintain, retry/staleness
   semantics to design.
-- Doubles Lunar's network trust surface (currently only four
-  SPKI-pinned NTP/NTS providers).
+- Doubles Lunar's network trust surface beyond the existing DoH/NTS
+  endpoints authenticated through local enrolled pins.
 - Massive complexity win for users who would mostly never see the
   benefit.
 

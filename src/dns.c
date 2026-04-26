@@ -1,5 +1,5 @@
-// dns.c -- DNS-over-HTTPS resolver with SPKI-pinned leaves + 2-of-N
-// cross-resolver agreement gate. See dns.h for design rationale.
+// dns.c -- DNS-over-HTTPS resolver with local SPKI enrollment and
+// randomized enrolled-resolver failover. See dns.h for design rationale.
 
 // clang-format off
 #include <winsock2.h>
@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <assert.h>
@@ -17,25 +18,19 @@
 #include "dns.h"
 #include "logbuf.h"
 #include "clock.h"
+#include "pinned_tls.h"
+#include "pin_store.h"
 
-#include "psa/crypto.h"
 #include "mbedtls/ssl.h"
-#include "mbedtls/entropy.h"
-#include "mbedtls/ctr_drbg.h"
-#include "mbedtls/x509_crt.h"
-#include "mbedtls/sha256.h"
-#include "mbedtls/platform_util.h"
-#include "mbedtls/constant_time.h"
 
 // ---------------------------------------------------------------------------
 // Pinned resolver table
 // ---------------------------------------------------------------------------
 //
-// Each resolver has (a) hardcoded anycast IP(s) so bootstrap needs no
-// DNS, and (b) an SPKI pin captured by scripts/fetch_doh_spki_pins.py.
-// Leaf rotations require a pin refresh + rebuild; see docs/pins.md.
-// An all-zero pin disables the entry (tests use this to shrink the
-// pool without removing entries).
+// Each resolver has hardcoded anycast IP(s) so bootstrap needs no DNS.
+// These addresses are reachability hints, not trust anchors: first-run
+// enrollment validates the resolver certificate through Windows/Web PKI
+// and stores the leaf SPKI in the protected local pin store.
 
 static const DnsResolver kResolvers[] = {
     {
@@ -43,12 +38,7 @@ static const DnsResolver kResolvers[] = {
         .ip_primary = "1.1.1.1",
         .ip_secondary = "1.0.0.1",
         .label = "cloudflare",
-        /* spki_pin (leaf expires 2026-12-21) = */
-        .spki_pin = {
-            0x96, 0xd4, 0x3a, 0x69, 0x7c, 0xb7, 0xb6, 0xaa,
-            0x4d, 0x64, 0xa2, 0x5d, 0x9d, 0xeb, 0xcc, 0x0f,
-            0xba, 0x11, 0xf8, 0x8b, 0x08, 0xe6, 0xb3, 0x56,
-            0x6c, 0xeb, 0x2c, 0x14, 0x3a, 0xe5, 0xf8, 0x4c },
+        .operator_family = "cloudflare",
     },
 
     {
@@ -56,12 +46,7 @@ static const DnsResolver kResolvers[] = {
         .ip_primary = "9.9.9.9",
         .ip_secondary = "149.112.112.112",
         .label = "quad9",
-        /* spki_pin (leaf expires 2026-07-27) = */
-        .spki_pin = {
-            0x8b, 0x69, 0x0e, 0x6d, 0xfc, 0xf4, 0xa8, 0x82,
-            0x82, 0x18, 0xd5, 0xad, 0xec, 0xc8, 0xc1, 0x51,
-            0xe4, 0xab, 0x87, 0x40, 0xf2, 0x8d, 0xbd, 0x3f,
-            0xcd, 0x62, 0x0d, 0x22, 0x66, 0x44, 0x4b, 0xe2 },
+        .operator_family = "quad9",
     },
 
     {
@@ -69,12 +54,7 @@ static const DnsResolver kResolvers[] = {
         .ip_primary = "8.8.8.8",
         .ip_secondary = "8.8.4.4",
         .label = "google",
-        /* spki_pin (leaf expires 2026-06-22) = */
-        .spki_pin = {
-            0x6a, 0x48, 0x59, 0x8c, 0x97, 0x8e, 0x53, 0xe1,
-            0x57, 0xec, 0xb6, 0x3b, 0xb1, 0x09, 0x3e, 0xcc,
-            0xde, 0x3a, 0xd9, 0x3d, 0x9f, 0xb7, 0xa3, 0x85,
-            0x43, 0xe8, 0xd2, 0xc9, 0xac, 0xee, 0xa5, 0xed },
+        .operator_family = "google",
     },
 
     {
@@ -82,12 +62,7 @@ static const DnsResolver kResolvers[] = {
         .ip_primary = "45.90.28.0",
         .ip_secondary = NULL,
         .label = "nextdns",
-        /* spki_pin (leaf expires 2026-05-26) = */
-        .spki_pin = {
-            0xc9, 0xdc, 0x3d, 0x6f, 0x37, 0x02, 0x33, 0xac,
-            0x4a, 0xc3, 0x36, 0x8d, 0xa7, 0x11, 0xa6, 0x74,
-            0x5e, 0x68, 0x26, 0x50, 0xd0, 0x6c, 0xa7, 0xdb,
-            0xe4, 0xd9, 0xcc, 0xae, 0xc2, 0x87, 0x2a, 0x3b },
+        .operator_family = "nextdns",
     },
 
     {
@@ -95,19 +70,12 @@ static const DnsResolver kResolvers[] = {
         .ip_primary = "194.242.2.2",
         .ip_secondary = NULL,
         .label = "mullvad",
-        /* spki_pin (leaf expires 2026-06-21) = */
-        .spki_pin = {
-            0xc8, 0x44, 0x8c, 0x68, 0x3d, 0x14, 0x2b, 0x43,
-            0x6e, 0x55, 0xa3, 0x86, 0xa1, 0x0b, 0xb6, 0xa2,
-            0x59, 0xc6, 0x1c, 0x82, 0x2a, 0xfb, 0x7d, 0xd0,
-            0x90, 0xeb, 0x46, 0xd4, 0x73, 0x53, 0x0e, 0x96 },
+        .operator_family = "mullvad",
     },
 };
 
 #define DNS_POOL_SIZE (sizeof kResolvers / sizeof kResolvers[0])
 
-static_assert(sizeof (((DnsResolver *)0)->spki_pin) == 32,
-              "DoH SPKI pin must be a SHA-256 digest");
 static_assert(DNS_POOL_SIZE >= 2,
               "DoH resolver pool must keep random-provider diversity");
 
@@ -117,22 +85,12 @@ const DnsResolver *Dns_Pool(size_t *out_len)
     return kResolvers;
 }
 
-static int pin_is_zero(const uint8_t pin[32])
-{
-    uint8_t acc = 0;
-    for (int i = 0; i < 32; i++) acc |= pin[i];
-    return acc == 0;
-}
-
 size_t Dns_PickResolvers(const DnsResolver **out, size_t n_want)
 {
     if (!out || n_want == 0) return 0;
     size_t enabled[DNS_POOL_SIZE];
-    size_t n_enabled = 0;
-    for (size_t i = 0; i < DNS_POOL_SIZE; i++) {
-        if (!pin_is_zero(kResolvers[i].spki_pin)) enabled[n_enabled++] = i;
-    }
-    if (n_enabled == 0) return 0;
+    size_t n_enabled = DNS_POOL_SIZE;
+    for (size_t i = 0; i < DNS_POOL_SIZE; i++) enabled[i] = i;
     if (n_want > n_enabled) n_want = n_enabled;
 
     for (size_t i = 0; i < n_want; i++) {
@@ -488,74 +446,12 @@ void Dns_CacheClear(void)
 }
 
 // ===========================================================================
-// TLS / DoH transport
+// DoH transport
 // ===========================================================================
 
 #define DOH_CONNECT_TIMEOUT_MS   4000
 #define DOH_IO_TIMEOUT_MS        5000
 #define DOH_MAX_REPLY_BYTES      65536
-
-static CRITICAL_SECTION g_tls_init_cs;
-static volatile LONG    g_tls_init_cs_ready = 0;
-static int              g_tls_init_done     = 0;
-static mbedtls_entropy_context  g_entropy;
-static mbedtls_ctr_drbg_context g_drbg;
-
-static void tls_cs_ensure(void)
-{
-    if (InterlockedCompareExchange(&g_tls_init_cs_ready, 1, 0) == 0) {
-        InitializeCriticalSection(&g_tls_init_cs);
-        g_tls_init_cs_ready = 2;
-    }
-    while (g_tls_init_cs_ready != 2) { Sleep(0); }
-}
-
-static int tls_ensure_inited(void)
-{
-    tls_cs_ensure();
-    EnterCriticalSection(&g_tls_init_cs);
-    int rc = 0;
-    if (!g_tls_init_done) {
-        // psa_crypto_init is idempotent after first success; nts.c may
-        // have already called it. We tolerate either outcome.
-        (void)psa_crypto_init();
-        mbedtls_entropy_init(&g_entropy);
-        mbedtls_ctr_drbg_init(&g_drbg);
-        static const char pers[] = "lunar-dns";
-        rc = mbedtls_ctr_drbg_seed(&g_drbg, mbedtls_entropy_func, &g_entropy,
-                                   (const unsigned char *)pers, sizeof pers - 1);
-        if (rc == 0) g_tls_init_done = 1;
-    }
-    LeaveCriticalSection(&g_tls_init_cs);
-    return rc;
-}
-
-typedef struct { SOCKET s; } SockCtx;
-
-static int bio_send(void *ctx, const unsigned char *buf, size_t len)
-{
-    SockCtx *c = (SockCtx *)ctx;
-    int n = send(c->s, (const char *)buf, (int)len, 0);
-    if (n < 0) {
-        int e = WSAGetLastError();
-        if (e == WSAETIMEDOUT) return MBEDTLS_ERR_SSL_TIMEOUT;
-        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
-    }
-    return n;
-}
-
-static int bio_recv(void *ctx, unsigned char *buf, size_t len)
-{
-    SockCtx *c = (SockCtx *)ctx;
-    int n = recv(c->s, (char *)buf, (int)len, 0);
-    if (n < 0) {
-        int e = WSAGetLastError();
-        if (e == WSAETIMEDOUT) return MBEDTLS_ERR_SSL_TIMEOUT;
-        return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
-    }
-    if (n == 0) return MBEDTLS_ERR_SSL_CONN_EOF;
-    return n;
-}
 
 // TCP connect to a literal IPv4:port with a hard timeout. DoH
 // bootstrap needs this so we never depend on the OS resolver.
@@ -593,18 +489,6 @@ static SOCKET tcp_connect_ip(const char *ip_str, uint16_t port)
     return s;
 }
 
-static int verify_spki_pin(mbedtls_ssl_context *ssl, const uint8_t pin[32])
-{
-    const mbedtls_x509_crt *crt = mbedtls_ssl_get_peer_cert(ssl);
-    if (crt == NULL) return -1;
-    if (crt->pk_raw.p == NULL || crt->pk_raw.len == 0) return -1;
-    uint8_t got[32];
-    if (mbedtls_sha256(crt->pk_raw.p, crt->pk_raw.len, got, 0) != 0) return -1;
-    int diff = mbedtls_ct_memcmp(got, pin, 32);
-    mbedtls_platform_zeroize(got, sizeof got);
-    return diff == 0 ? 0 : -1;
-}
-
 // Execute a single DoH POST /dns-query against one pinned resolver IP.
 // Returns 0 on success with up to ips_cap A records in out_ips and
 // the smallest TTL in out_min_ttl. On any failure (connect, TLS, pin
@@ -615,45 +499,82 @@ static int doh_query_one(const DnsResolver *r, const char *ip_str,
                          size_t *out_count, uint32_t *out_min_ttl)
 {
     int      rc = -1;
-    SOCKET   s  = INVALID_SOCKET;
-    SockCtx  sc;
-    mbedtls_ssl_context ssl;
-    mbedtls_ssl_config  conf;
-    int ssl_inited = 0, conf_inited = 0;
+    PinnedTls tls;
+    uint8_t *reply = NULL;
+    PinnedTls_Init(&tls);
 
-    if (tls_ensure_inited() != 0) return -1;
-
-    s = tcp_connect_ip(ip_str, 443);
+    SOCKET s = tcp_connect_ip(ip_str, 443);
     if (s == INVALID_SOCKET) return -1;
-    sc.s = s;
 
-    mbedtls_ssl_init(&ssl);          ssl_inited = 1;
-    mbedtls_ssl_config_init(&conf);  conf_inited = 1;
-
-    if (mbedtls_ssl_config_defaults(&conf,
-                                    MBEDTLS_SSL_IS_CLIENT,
-                                    MBEDTLS_SSL_TRANSPORT_STREAM,
-                                    MBEDTLS_SSL_PRESET_DEFAULT) != 0) goto cleanup;
-    mbedtls_ssl_conf_min_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_3);
-    mbedtls_ssl_conf_max_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_3);
-    mbedtls_ssl_conf_authmode(&conf, MBEDTLS_SSL_VERIFY_NONE);  // pin is the trust
-    mbedtls_ssl_conf_ca_chain(&conf, NULL, NULL);
-    mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &g_drbg);
+    PinRecord pin;
+    int have_pin = PinStore_GetPin(PIN_ENDPOINT_DOH, r->label, r->hostname,
+                                   443, &pin);
+    int renew_due = have_pin ? PinStore_ShouldRenew(&pin) : 1;
+    int expired = have_pin ? PinStore_IsExpired(&pin) : 1;
+    int allow_ca = !have_pin || renew_due || expired;
+    if (!have_pin) {
+        Log_Append("dns: %s first-run enrollment required for %s:%u",
+                   r->label, r->hostname, 443u);
+    } else if (expired) {
+        Log_Append("dns: %s local pin expired (notAfter=%s); CA revalidation required",
+                   r->label, pin.not_after);
+    } else if (renew_due) {
+        Log_Append("dns: %s scheduled CA renewal due (notAfter=%s, renewalDue=%lld)",
+                   r->label, pin.not_after, (long long)pin.renewal_due_unix);
+    }
 
     static const char *alpn_list[] = { "http/1.1", NULL };
-    if (mbedtls_ssl_conf_alpn_protocols(&conf, alpn_list) != 0) goto cleanup;
-
-    if (mbedtls_ssl_setup(&ssl, &conf) != 0) goto cleanup;
-    if (mbedtls_ssl_set_hostname(&ssl, r->hostname) != 0) goto cleanup;
-    mbedtls_ssl_set_bio(&ssl, &sc, bio_send, bio_recv, NULL);
-
-    for (;;) {
-        int hr = mbedtls_ssl_handshake(&ssl);
-        if (hr == 0) break;
-        if (hr == MBEDTLS_ERR_SSL_WANT_READ || hr == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
+    PinnedTlsOpenResult openInfo;
+    if (PinnedTls_OpenEnrolled(&tls, s, r->hostname, alpn_list,
+                               (have_pin && !expired) ? pin.spki : NULL,
+                               allow_ca, renew_due && !expired, &openInfo) != 0) {
+        if (openInfo.pin_mismatched && !allow_ca) {
+            Log_Append("dns: %s pin mismatch before renewal window; endpoint rejected without CA refresh (peer_spki=%s stored_spki=%s)",
+                       r->label, openInfo.peer_spki_hex, pin.spki_hex);
+        } else if (openInfo.ca_attempted) {
+            Log_Append("dns: %s CA validation rejected host=%s chain=0x%lx policy=0x%lx revocation=%s subject=\"%s\" issuer=\"%s\" spki=%s",
+                       r->label, r->hostname,
+                       (unsigned long)openInfo.cert.chain_error_status,
+                       (unsigned long)openInfo.cert.policy_error,
+                       openInfo.cert.revocation_offline ? "offline" :
+                       (openInfo.cert.revocation_checked ? "checked" : "not-checked"),
+                       openInfo.cert.subject, openInfo.cert.issuer,
+                       openInfo.cert.spki_hex);
+        }
         goto cleanup;
     }
-    if (verify_spki_pin(&ssl, r->spki_pin) != 0) goto cleanup;
+    const char *neg = PinnedTls_NegotiatedAlpn(&tls);
+    if (openInfo.ca_attempted) {
+        Log_Append("dns: %s CA validation %s host=%s alpn=%s subject=\"%s\" issuer=\"%s\" notBefore=%s notAfter=%s spki=%s revocation=%s chain=0x%lx policy=0x%lx",
+                   r->label, openInfo.ca_valid ? "accepted" : "failed-but-pin-still-valid",
+                   r->hostname, neg ? neg : "(none)",
+                   openInfo.cert.subject, openInfo.cert.issuer,
+                   openInfo.cert.not_before, openInfo.cert.not_after,
+                   openInfo.cert.spki_hex,
+                   openInfo.cert.revocation_offline ? "offline" :
+                   (openInfo.cert.revocation_checked ? "checked" : "not-checked"),
+                   (unsigned long)openInfo.cert.chain_error_status,
+                   (unsigned long)openInfo.cert.policy_error);
+        if (openInfo.ca_valid) {
+            const char *status = have_pin
+                ? (expired ? "expired-renewal" :
+                   (openInfo.pin_matched ? "scheduled-renewal" : "pin-rotation"))
+                : "first-run-enrollment";
+            PinStore_SavePin(PIN_ENDPOINT_DOH, r->label, r->hostname, 443,
+                             r->operator_family,
+                             openInfo.cert.spki_sha256,
+                             openInfo.cert.spki_hex,
+                             openInfo.cert.not_before,
+                             openInfo.cert.not_after,
+                             openInfo.cert.not_before_unix,
+                             openInfo.cert.not_after_unix,
+                             status);
+        }
+    } else if (openInfo.pin_matched) {
+        Log_Append("dns: %s local pin match host=%s spki=%s notAfter=%s",
+                   r->label, r->hostname, pin.spki_hex, pin.not_after);
+    }
+    mbedtls_ssl_context *ssl = PinnedTls_Ssl(&tls);
 
     // Build DNS query.
     uint8_t dns_q[512];
@@ -676,7 +597,7 @@ static int doh_query_one(const DnsResolver *r, const char *ip_str,
     {
         size_t sent = 0;
         while (sent < (size_t)hlen) {
-            int wr = mbedtls_ssl_write(&ssl, (const unsigned char *)req_hdr + sent,
+            int wr = mbedtls_ssl_write(ssl, (const unsigned char *)req_hdr + sent,
                                        (size_t)hlen - sent);
             if (wr == MBEDTLS_ERR_SSL_WANT_READ || wr == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
             if (wr <= 0) goto cleanup;
@@ -684,7 +605,7 @@ static int doh_query_one(const DnsResolver *r, const char *ip_str,
         }
         sent = 0;
         while (sent < dns_q_len) {
-            int wr = mbedtls_ssl_write(&ssl, dns_q + sent, dns_q_len - sent);
+            int wr = mbedtls_ssl_write(ssl, dns_q + sent, dns_q_len - sent);
             if (wr == MBEDTLS_ERR_SSL_WANT_READ || wr == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
             if (wr <= 0) goto cleanup;
             sent += (size_t)wr;
@@ -692,11 +613,12 @@ static int doh_query_one(const DnsResolver *r, const char *ip_str,
     }
 
     // Drain reply.
-    static uint8_t reply[DOH_MAX_REPLY_BYTES];
-    size_t         reply_len = 0;
+    reply = (uint8_t *)malloc(DOH_MAX_REPLY_BYTES);
+    if (!reply) goto cleanup;
+    size_t reply_len = 0;
     for (;;) {
-        int rd = mbedtls_ssl_read(&ssl, reply + reply_len,
-                                  sizeof reply - reply_len);
+        int rd = mbedtls_ssl_read(ssl, reply + reply_len,
+                                  DOH_MAX_REPLY_BYTES - reply_len);
         if (rd == MBEDTLS_ERR_SSL_WANT_READ || rd == MBEDTLS_ERR_SSL_WANT_WRITE) continue;
         if (rd == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) break;
         if (rd <= 0) {
@@ -704,7 +626,7 @@ static int doh_query_one(const DnsResolver *r, const char *ip_str,
             goto cleanup;
         }
         reply_len += (size_t)rd;
-        if (reply_len >= sizeof reply) goto cleanup;
+        if (reply_len >= DOH_MAX_REPLY_BYTES) goto cleanup;
     }
 
     // Parse HTTP: status line, headers, body. We need Content-Length
@@ -737,12 +659,11 @@ static int doh_query_one(const DnsResolver *r, const char *ip_str,
     if (out_min_ttl) *out_min_ttl = min_ttl;
     rc = 0;
 
-    mbedtls_ssl_close_notify(&ssl);
+    PinnedTls_CloseNotify(&tls);
 
 cleanup:
-    if (ssl_inited)  mbedtls_ssl_free(&ssl);
-    if (conf_inited) mbedtls_ssl_config_free(&conf);
-    if (s != INVALID_SOCKET) closesocket(s);
+    PinnedTls_Free(&tls);
+    free(reply);
     return rc;
 }
 
@@ -780,60 +701,51 @@ int Dns_Resolve(const char *host, char out_ip[16])
 
     if (cache_lookup(host, out_ip)) return 0;
 
-    // Pick ONE pinned resolver at random per cache-miss. A prior
-    // design required two resolvers to return overlapping A-record
-    // sets ("agreement gate") to catch a single-operator compromise
-    // at the DNS level. In practice that gate fires constantly on
-    // legitimate queries because every serious public NTP/NTS host
-    // uses geo-aware authoritative DNS: Cloudflare's resolver sees
-    // the query from Cloudflare's network and gets back IPs near
-    // that edge; Google's resolver sees it from Google's network and
-    // gets back a completely disjoint set near Google's edge. Both
-    // answers are correct and honest; the sets just don't overlap.
-    //
-    // The single-operator-compromise threat the gate was meant to
-    // address is already neutralised downstream:
-    //   * NTS-KE: TLS to the time operator is SPKI-pinned, so a
-    //     DNS-level redirect fails at TLS handshake.
-    //   * NTS SNTP: packets are AEAD-authenticated with keys from
-    //     that pinned KE, so a lying IP can't forge a valid sample.
-    //   * Core SNTP: offsets must agree within 200 ms with the NTS
-    //     midpoint anchor, so a lying IP can't bias the clock.
-    //
-    // Random pick over 5 pinned DoH operators still limits any one
-    // compromised operator to ~1/5 of our lookups, and per-resolver
-    // primary->secondary IP failover preserves reachability when an
-    // individual anycast edge drops.
-    const DnsResolver *picked[1] = { NULL };
-    size_t got = Dns_PickResolvers(picked, 1);
+    // Shuffle the enabled pinned resolver pool and try it in that
+    // random order. We still never fall back to plain DNS. If one
+    // pinned DoH resolver is down, blocked, or has a transient
+    // TLS/pin/query failure, we fall through to the next pinned
+    // resolver in the shuffled list. A resolver that returns a
+    // syntactically valid but malicious A set is still handled by the
+    // downstream NTS SPKI pins, AEAD SNTP, and NTP concurrence gate.
+    const DnsResolver *picked[DNS_POOL_SIZE] = { NULL };
+    size_t got = Dns_PickResolvers(picked, DNS_POOL_SIZE);
     if (got < 1) {
         Log_Append("dns: cannot resolve %s -- no enabled DoH resolvers", host);
         return -1;
     }
 
-    // Fresh QID per query. DoH doesn't require it (the TLS channel
-    // already defeats off-path spoofing) but it costs nothing and
-    // lets us reject cross-wired responses from a buggy resolver.
-    uint16_t qid = 0;
-    BCryptGenRandom(NULL, (PUCHAR)&qid, sizeof qid,
-                    BCRYPT_USE_SYSTEM_PREFERRED_RNG);
-
     char     ips[DNS_ANSWERS_MAX][16];
-    size_t   n_ips = 0;
-    uint32_t ttl   = 0;
+    for (size_t i = 0; i < got; i++) {
+        // Fresh QID per DoH query. DoH doesn't require it (the TLS
+        // channel already defeats off-path spoofing) but it costs
+        // nothing and lets us reject cross-wired responses from a
+        // buggy resolver.
+        uint16_t qid = 0;
+        BCryptGenRandom(NULL, (PUCHAR)&qid, sizeof qid,
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 
-    if (doh_query_resolver(picked[0], host, qid,
-                           ips, DNS_ANSWERS_MAX, &n_ips, &ttl) != 0 ||
-        n_ips == 0) {
-        Log_Append("dns: resolve %s FAIL (via %s)", host, picked[0]->label);
-        return -1;
+        size_t   n_ips = 0;
+        uint32_t ttl   = 0;
+        if (doh_query_resolver(picked[i], host, qid,
+                               ips, DNS_ANSWERS_MAX, &n_ips, &ttl) == 0 &&
+            n_ips > 0) {
+            // Take the first A record. Order is resolver-defined; for
+            // geo-DNS it's typically already latency-sorted for our
+            // vantage.
+            _snprintf(out_ip, 16, "%s", ips[0]);
+            cache_insert(host, ips[0], ttl);
+            Log_Append("dns: resolve %s -> %s  (via %s, ttl=%us)",
+                       host, ips[0], picked[i]->label, (unsigned)ttl);
+            return 0;
+        }
+
+        Log_Append("dns: resolve %s failed via %s%s",
+                   host, picked[i]->label,
+                   (i + 1 < got) ? "; trying next pinned DoH resolver" : "");
     }
 
-    // Take the first A record. Order is resolver-defined; for geo-
-    // DNS it's typically already latency-sorted for our vantage.
-    _snprintf(out_ip, 16, "%s", ips[0]);
-    cache_insert(host, ips[0], ttl);
-    Log_Append("dns: resolve %s -> %s  (via %s, ttl=%us)",
-               host, ips[0], picked[0]->label, (unsigned)ttl);
-    return 0;
+    Log_Append("dns: resolve %s FAIL (all %u pinned DoH resolvers failed)",
+               host, (unsigned)got);
+    return -1;
 }

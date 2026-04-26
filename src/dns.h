@@ -1,5 +1,5 @@
-// dns.h -- DNS-over-HTTPS resolver with pinned leaves and cross-
-// resolver agreement. The ONLY DNS path this binary uses.
+// dns.h -- DNS-over-HTTPS resolver with local SPKI enrollment and
+// randomized enrolled-resolver failover. The ONLY DNS path this binary uses.
 //
 // =============================================================================
 // Why this module exists
@@ -33,23 +33,25 @@
 //       nextdns       45.90.28.0
 //       mullvad       194.242.2.2
 //
-// 2. Per cache-miss we pick ONE resolver at random from the enabled
-//    pool (Fisher-Yates over 5 entries, BCryptGenRandom). Primary
-//    anycast IP is tried first; on TCP/TLS failure we fall back to
-//    the resolver's secondary IP if one is listed. A successful
-//    reply's A records are cached under a TTL clamped to
-//    [60s, 3600s]; the first A record becomes the returned IP.
+// 2. Per cache-miss we shuffle the enabled resolver pool
+//    (Fisher-Yates over 5 entries, BCryptGenRandom) and try each
+//    pinned resolver in that random order until one succeeds. For
+//    each resolver, primary anycast IP is tried first; on TCP/TLS
+//    failure we fall back to the resolver's secondary IP if one is
+//    listed. A successful reply's A records are cached under a TTL
+//    clamped to [60s, 3600s]; the first A record becomes the returned
+//    IP.
 //
-//    An earlier design queried TWO resolvers and required their
-//    A-record sets to overlap ("agreement gate"). That failed
-//    constantly against legitimate geo-aware authoritative DNS:
-//    Cloudflare's resolver sees the query from Cloudflare's network
-//    and gets back IPs near that edge; Google's resolver sees it
-//    from Google's network and gets back a disjoint set. Both
-//    answers are honest and correct; the sets just don't overlap.
-//    We removed the gate because the single-operator-compromise
-//    threat it was meant to catch is already neutralised downstream
-//    (see Threat model below).
+//    An earlier design queried two resolvers and required their
+//    A-record sets to overlap. That failed constantly against
+//    legitimate geo-aware authoritative DNS: Cloudflare's resolver
+//    sees the query from Cloudflare's network and gets back IPs near
+//    that edge; Google's resolver sees it from Google's network and
+//    gets back a disjoint set. Both answers are honest and correct;
+//    the sets just don't overlap. We removed that resolver-level
+//    overlap check because the single-operator-compromise threat it
+//    was meant to catch is already neutralised downstream (see Threat
+//    model below).
 //
 // 3. Hard fail. There is NO plain-DNS fallback. A network that blocks
 //    all 5 pinned resolvers simultaneously will push Lunar to INOP,
@@ -79,16 +81,17 @@
 //   SPKI pin on the DoH leaf.
 // - Compromise of ONE DoH resolver operator (returns a forged A set
 //   for, say, time.cloudflare.com): caught DOWNSTREAM, not here.
-//     * NTS-KE: TLS to the time operator is SPKI-pinned, so a
-//       DNS-level redirect fails at TLS handshake.
+//     * NTS-KE: TLS to the time operator is authenticated by a local
+//       enrolled SPKI pin, so a DNS-level redirect fails at TLS.
 //     * NTS SNTP: packets are AEAD-authenticated with c2s/s2c keys
 //       derived from that pinned KE session, so a lying IP cannot
 //       forge a valid sample.
 //     * Core SNTP: offsets must agree within 200 ms with the midpoint
 //       of the two authenticated NTS samples, so a lying core IP
 //       cannot bias the clock.
-//   Random pick over 5 operators additionally limits a compromised
-//   operator to ~1/5 of our lookups on average.
+//   Randomized first choice over 5 operators additionally limits a
+//   compromised operator to ~1/5 of successful first answers on
+//   average; failover only helps transport/TLS/query failures.
 // - Network blocking port 443 to all pinned resolvers: not a security
 //   failure, just a denial-of-service. We go INOP and display that.
 //
@@ -113,12 +116,12 @@ extern "C" {
 //
 // Failure modes:
 //   * No enabled DoH resolvers (pool wiped).
-//   * Randomly-picked resolver failed to complete the DoH query on
-//     both its primary and secondary bootstrap IPs.
+//   * Every enabled pinned DoH resolver failed to complete the DoH
+//     query on its bootstrap IPs.
 //   * Hostname is syntactically invalid or too long.
 //
-// Thread-safe. May block for several seconds on a cache miss (one
-// TLS handshake; up to two if primary IP fails and secondary exists).
+// Thread-safe. May block for several seconds on a cache miss while
+// trying the shuffled pinned resolver list.
 int Dns_Resolve(const char *host, char out_ip[16]);
 
 // Clear the entire in-memory cache. Primarily for tests.
@@ -131,16 +134,16 @@ typedef struct {
     const char *ip_primary;         // hardcoded anycast IPv4 dotted-quad
     const char *ip_secondary;       // NULL if no secondary
     const char *label;              // short tag for logs, e.g. "cloudflare"
-    uint8_t     spki_pin[32];       // all-zero => disabled
+    const char *operator_family;    // independent operator grouping
 } DnsResolver;
 
-// Return the full pinned-resolver table and its length.
+// Return the full resolver metadata table and its length.
 const DnsResolver *Dns_Pool(size_t *out_len);
 
-// Fisher-Yates partial shuffle over the ENABLED (non-zero pin) subset.
+// Fisher-Yates partial shuffle over the resolver metadata pool.
 // Writes up to `n_want` distinct resolver pointers to out[0..n-1].
-// Returns the number actually written (<= n_want, <= enabled pool
-// size). 0 on bad args or RNG failure.
+// Returns the number actually written (<= n_want, <= pool size). 0 on
+// bad args or RNG failure.
 size_t Dns_PickResolvers(const DnsResolver **out, size_t n_want);
 
 // --- DNS wire format (exported for tests) -----------------------------------
@@ -171,7 +174,7 @@ int Dns_ParseResponseA(const uint8_t *in, size_t in_len,
                        size_t *out_count,
                        uint32_t *out_min_ttl);
 
-// --- Agreement gate (exported for tests) ------------------------------------
+// --- A-record set helper (exported for tests) -------------------------------
 
 // Given two A-record sets, find the first IP from `set_a` that also
 // appears in `set_b`. Writes it to out_ip (16-byte buffer) and

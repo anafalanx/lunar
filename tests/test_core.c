@@ -9,8 +9,11 @@
 #include "../src/lunar.c"
 #include "../src/tzif.h"
 #include "../src/dns.h"
+#include "../src/pin_store.h"
+#include "../src/cert_verify_win.h"
 
 #include <stdio.h>
+#include <wchar.h>
 
 static int g_pass = 0, g_fail = 0;
 
@@ -86,6 +89,9 @@ static void test_wav_header(void) {
     CHECK_EQ_INT(rd16(w + 34), 16);                                 // bits
     CHECK(memcmp(w + 36, "data", 4) == 0);
     CHECK_EQ_INT(rd32(w + 40), BEEP_DATA_BYTES);
+    CHECK_EQ_INT(BEEP_FRAMES, BEEP_SAMPLE_RATE / 4);
+    CHECK(BEEP_TARGET_SPEAKER_AMPLITUDE > 0.27f);
+    CHECK(BEEP_TARGET_SPEAKER_AMPLITUDE < 0.28f);
 
     // Envelope: first sample must be zero (attack starts at 0), last
     // sample must be zero (release ends at 0), peak must exceed 50% of
@@ -502,21 +508,65 @@ static void test_clock_discipline(void) {
     CHECK_EQ_INT(Clock_RatePpm(), r2);           // loaded bootstrap
 }
 
+static void test_clock_display_fail_closed(void) {
+    // Redirect APPDATA so we don't clobber the user's discipline.dat.
+    wchar_t scratchW[MAX_PATH + 32];
+    wchar_t cwd[MAX_PATH]; GetCurrentDirectoryW(MAX_PATH, cwd);
+    _snwprintf(scratchW, MAX_PATH + 32, L"%ls\\build\\test_scratch", cwd);
+    _wmkdir(scratchW);
+    wchar_t envsetW[MAX_PATH + 48];
+    _snwprintf(envsetW, MAX_PATH + 48, L"APPDATA=%ls", scratchW);
+    _wputenv(envsetW);
+
+    Clock_Init();
+
+    int64_t trustedUtc = make_utc_ms(2026, 4, 25, 12, 0, 0);
+    Clock_OnPollCycle(TRUST_OK, trustedUtc, Clock_Qpc(), 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_OK);
+
+    int64_t display = 0;
+    uint64_t gen1 = 0;
+    CHECK_EQ_INT(Clock_ReadDisplayTime(&display, &gen1), 1);
+    CHECK(gen1 != 0);
+    CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen1), 1);
+    CHECK(display >= trustedUtc);
+
+    Clock_OnPollCycle(TRUST_OK, display, Clock_Qpc(), 0);
+    uint64_t gen2 = 0;
+    CHECK_EQ_INT(Clock_ReadDisplayTime(&display, &gen2), 1);
+    CHECK(gen2 != 0);
+    CHECK(gen2 != gen1);
+    CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen1), 0);
+    CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen2), 1);
+    CHECK_EQ_INT(Clock_BeginDisplayCommit(gen2), 1);
+    Clock_EndDisplayCommit();
+
+    Clock_TestExpireDisplayLease();
+    CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen2), 0);
+    CHECK_EQ_INT(Clock_BeginDisplayCommit(gen2), 0);
+    CHECK_EQ_INT(Clock_NowUtcMs(&display), 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_INOP);
+
+    Clock_Init();
+    Clock_OnPollCycle(TRUST_OK, trustedUtc, Clock_Qpc(), 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_OK);
+    uint64_t gen3 = 0;
+    CHECK_EQ_INT(Clock_ReadDisplayTime(&display, &gen3), 1);
+    CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen3), 1);
+    Clock_TripInop("unit test");
+    CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen3), 0);
+    CHECK_EQ_INT(Clock_BeginDisplayCommit(gen3), 0);
+    CHECK_EQ_INT(Clock_NowUtcMs(&display), 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_INOP);
+}
+
 // ---------------------------------------------------------------------------
 // Ntp_Concur -- the pure trust-verdict evaluator (NTS-anchored)
 // ---------------------------------------------------------------------------
 //
-// Contract (from ntp.h, post-NTS refactor):
-//   * slot 3 is the NTS (authenticated) source and is the trust anchor;
-//   * if slot 3 failed, verdict is INOP regardless of core sources;
-//   * if slot 3 succeeded, AT LEAST 2 of the 3 core sources (0..2) must
-//     agree with the NTS anchor to within 200 ms (signed projection
-//     delta onto NTS's qpcAtT4). Otherwise INOP.
-//   * On OK, bestUtcMs + bestQpc are exactly the NTS source's raw
-//     (ntpUtcMs, qpcAtT4) -- the clockwork anchors onto the
-//     cryptographically authenticated reading.
-//   * maxSpreadMs is the largest absolute core deviation from the NTS
-//     anchor, reported regardless of verdict.
+// Contract (from ntp.h): both NTS slots must succeed, both must be
+// authenticated by enrolled pins, and they must come from different
+// operator families before core concurrence can promote the cycle.
 
 static NtpSourceResult MkSrc(int ok, int64_t utc, int64_t qpc,
                              const char *label) {
@@ -527,6 +577,15 @@ static NtpSourceResult MkSrc(int ok, int64_t utc, int64_t qpc,
     r.qpcAtT4  = qpc;
     r.rttMs    = 10;
     r.label    = label;
+    if (label && strcmp(label, "NTS1") == 0) {
+        r.authMode = NTP_AUTH_ENROLLED_PIN;
+        r.operatorFamily = "family-a";
+    } else if (label && strcmp(label, "NTS2") == 0) {
+        r.authMode = NTP_AUTH_ENROLLED_PIN;
+        r.operatorFamily = "family-b";
+    } else if (ok) {
+        r.authMode = NTP_AUTH_PLAIN_SNTP;
+    }
     return r;
 }
 
@@ -625,20 +684,18 @@ static void test_ntp_concur(void) {
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
     CHECK_EQ_INT(best, 1000);
 
-    // ---- Path B: strict single-NTS fallback ----
+    // ---- Path B: no single-NTS fallback ----
 
-    // 8) Only NTS1 ok, ALL 4 cores agree -> OK, anchor = NTS1.
+    // 8) Only NTS1 ok, ALL 4 cores agree -> INOP.
     s[0] = MkSrc(1, 1000, Q, "A");
     s[1] = MkSrc(1, 1000, Q, "B");
     s[2] = MkSrc(1, 1000, Q, "C");
     s[3] = MkSrc(1, 1000, Q, "D");
     s[4] = MkSrc(1, 1000, Q, "NTS1");
     s[5] = MkSrc(0,    0, 0, "NTS2");
-    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
-    CHECK_EQ_INT(best, 1000);
-    CHECK_EQ_INT(qpc, Q);
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
 
-    // 9) Only NTS2 ok, 3 of 4 cores agree -> INOP (fallback is strict).
+    // 9) Only NTS2 ok, 3 of 4 cores agree -> INOP.
     s[0] = MkSrc(1, 1000, Q, "A");
     s[1] = MkSrc(1, 1000, Q, "B");
     s[2] = MkSrc(1, 1000, Q, "C");
@@ -647,7 +704,7 @@ static void test_ntp_concur(void) {
     s[5] = MkSrc(1, 1000, Q, "NTS2");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
 
-    // 10) Only NTS1 ok, 3 cores ok 1 failed -> INOP (need 4/4).
+    // 10) Only NTS1 ok, 3 cores ok 1 failed -> INOP.
     s[0] = MkSrc(1, 1000, Q, "A");
     s[1] = MkSrc(1, 1000, Q, "B");
     s[2] = MkSrc(1, 1000, Q, "C");
@@ -658,7 +715,17 @@ static void test_ntp_concur(void) {
 
     // ---- Path C: no NTS at all ----
 
-    // 11) Both NTS fail, cores agree -> INOP (no anchor).
+    // 11) Both NTS are same operator family -> INOP.
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1000, Q, "C");
+    s[3] = MkSrc(1, 1000, Q, "D");
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[5] = MkSrc(1, 1000, Q, "NTS2");
+    s[5].operatorFamily = "family-a";
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+
+    // 12) Both NTS fail, cores agree -> INOP (no anchor).
     s[0] = MkSrc(1, 1000, Q, "A");
     s[1] = MkSrc(1, 1000, Q, "B");
     s[2] = MkSrc(1, 1000, Q, "C");
@@ -667,14 +734,19 @@ static void test_ntp_concur(void) {
     s[5] = MkSrc(0,    0, 0, "NTS2");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
 
-    // 12) Everything fails -> INOP.
+    // 13) Everything fails -> INOP.
     for (int i = 0; i < NTP_SOURCE_COUNT; i++) s[i] = MkSrc(0, 0, 0, "x");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
 
     // ---- NULL out-parameters ----
 
-    // 13) NULL outs tolerated on both OK and INOP paths.
-    for (int i = 0; i < NTP_SOURCE_COUNT; i++) s[i] = MkSrc(1, 1000, Q, "x");
+    // 14) NULL outs tolerated on both OK and INOP paths.
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1000, Q, "C");
+    s[3] = MkSrc(1, 1000, Q, "D");
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[5] = MkSrc(1, 1000, Q, "NTS2");
     CHECK_EQ_INT(Ntp_Concur(s, NULL, NULL, NULL), TRUST_OK);
     s[4] = MkSrc(0, 0, 0, "NTS1");
     s[5] = MkSrc(0, 0, 0, "NTS2");
@@ -682,7 +754,7 @@ static void test_ntp_concur(void) {
 
     // ---- Negative UTCs (pre-1970) ----
 
-    // 14) Negative UTCs work on the full-OK path.
+    // 15) Negative UTCs work on the full-OK path.
     s[0] = MkSrc(1, -100, Q, "A");
     s[1] = MkSrc(1, -100, Q, "B");
     s[2] = MkSrc(1, -100, Q, "C");
@@ -698,7 +770,7 @@ static void test_ntp_concur(void) {
     CHECK(freq > 0);
     int64_t tick100ms = freq / 10;
 
-    // 15) Cores captured at different qpc moments with UTC staggered
+    // 16) Cores captured at different qpc moments with UTC staggered
     // to match perfectly -- projected onto the NTS midpoint they
     // should all concur with zero spread.
     s[0] = MkSrc(1, 1000 - 100, Q - tick100ms,     "A");
@@ -711,7 +783,7 @@ static void test_ntp_concur(void) {
     CHECK_EQ_INT(spread, 0);
     CHECK_EQ_INT(best, 1000);
 
-    // 16) Hold core UTC constant while qpcAtT4 drifts past the NTS
+    // 17) Hold core UTC constant while qpcAtT4 drifts past the NTS
     // pair by >= 300 ms each. Projected deltas diverge -> INOP
     // because fewer than 3 cores remain within 200 ms.
     int64_t tick300ms = (freq * 3) / 10;
@@ -724,7 +796,7 @@ static void test_ntp_concur(void) {
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
     CHECK(spread >= 1199 && spread <= 1201);
 
-    // 17) Two NTS captured at different qpc moments whose UTCs
+    // 18) Two NTS captured at different qpc moments whose UTCs
     // stagger to match -- after projection they must agree. Put
     // NTS2 100 ms in the future (both qpc and utc) so projection
     // onto NTS1's qpc collapses the delta to ~zero.
@@ -1332,43 +1404,49 @@ static void test_logbuf_truncation(void) {
 }
 
 // ---------------------------------------------------------------------------
-// NTS provider pool -- pins populated, PickProvider returns an entry
+// NTS provider pool -- metadata only, PickProvider returns an entry
 // ---------------------------------------------------------------------------
 
 #include "../src/nts.h"
 
 static void test_nts_pool_pins(void) {
-    // Pool must exist and contain at least one entry with a populated
-    // SPKI pin. A build with every pin zeroed is a safety regression:
-    // Nts_PickProvider would return NULL, the NTS slot would always
-    // miss, and the concurrence gate would force INOP forever. Tests
-    // catch that situation here.
+    // The shipped binary must not contain provider cryptographic
+    // material. The pool is endpoint/operator metadata only; SPKI pins
+    // are enrolled into the local protected pin store at runtime.
     size_t n = 0;
     const NtsProvider *p = Nts_Pool(&n);
     CHECK(p != NULL);
     CHECK(n > 0);
 
-    int n_enabled = 0;
+    int n_families = 0;
     for (size_t i = 0; i < n; i++) {
         CHECK(p[i].host != NULL && p[i].host[0] != 0);
         CHECK(p[i].label != NULL);
-        uint8_t acc = 0;
-        for (int j = 0; j < 32; j++) acc |= p[i].spki_pin[j];
-        if (acc != 0) n_enabled++;
+        CHECK(p[i].operator_family != NULL && p[i].operator_family[0] != 0);
+        int first = 1;
+        for (size_t j = 0; j < i; j++) {
+            if (strcmp(p[i].operator_family, p[j].operator_family) == 0) first = 0;
+        }
+        if (first) n_families++;
     }
-    CHECK(n_enabled > 0);
+    CHECK(n_families >= 2);
 
-    // PickProvider must return a pinned (non-zero) entry from the pool.
+    // PickProvider must return an entry from the metadata pool.
     const NtsProvider *picked = Nts_PickProvider();
     CHECK(picked != NULL);
     if (picked) {
-        uint8_t acc = 0;
-        for (int j = 0; j < 32; j++) acc |= picked->spki_pin[j];
-        CHECK(acc != 0);
-        // And it must be one of ours -- sanity-check by pointer identity.
+        CHECK(picked->operator_family != NULL && picked->operator_family[0] != 0);
         int found = 0;
         for (size_t i = 0; i < n; i++) if (&p[i] == picked) found = 1;
         CHECK(found);
+    }
+
+    const NtsProvider *picked_many[4] = {0};
+    size_t got = Nts_PickProviders(picked_many, 4);
+    CHECK(got >= 2);
+    for (size_t i = 0; i < got; i++) {
+        CHECK(picked_many[i] != NULL);
+        for (size_t j = i + 1; j < got; j++) CHECK(picked_many[i] != picked_many[j]);
     }
 }
 
@@ -1912,44 +1990,35 @@ static void test_posix_footer_hardening(void) {
 // ---------------------------------------------------------------------------
 
 static void test_dns_pool_pins(void) {
-    // Same invariant as test_nts_pool_pins but for the DoH resolver
-    // pool: pool must exist, at least one enabled entry, every entry
-    // must carry the bootstrap fields we depend on before the first
-    // network call.
+    // Same metadata-only invariant as test_nts_pool_pins but for DoH.
     size_t n = 0;
     const DnsResolver *p = Dns_Pool(&n);
     CHECK(p != NULL);
-    CHECK(n >= 2);   // need two for the agreement gate
+    CHECK(n >= 2);   // need at least two for secure DoH failover
 
-    int n_enabled = 0;
     for (size_t i = 0; i < n; i++) {
         CHECK(p[i].hostname    != NULL && p[i].hostname[0]    != 0);
         CHECK(p[i].ip_primary  != NULL && p[i].ip_primary[0]  != 0);
         CHECK(p[i].label       != NULL && p[i].label[0]       != 0);
-        uint8_t acc = 0;
-        for (int j = 0; j < 32; j++) acc |= p[i].spki_pin[j];
-        if (acc != 0) n_enabled++;
+        CHECK(p[i].operator_family != NULL && p[i].operator_family[0] != 0);
     }
-    CHECK(n_enabled >= 2);
 }
 
 static void test_dns_pick_resolvers(void) {
-    // Asking for 2 must yield 2 distinct enabled resolvers.
+    // Asking for 2 must yield 2 distinct resolvers.
     const DnsResolver *pick[4] = {0};
     size_t got = Dns_PickResolvers(pick, 2);
     CHECK_EQ_INT(got, 2);
     CHECK(pick[0] != NULL && pick[1] != NULL);
     CHECK(pick[0] != pick[1]);
 
-    // Asking for more than the enabled pool clamps down.
+    // Asking for more than the pool clamps down.
     got = Dns_PickResolvers(pick, 100);
     CHECK(got >= 2);
-    // All returned entries must be distinct and enabled.
+    // All returned entries must be distinct metadata entries.
     for (size_t i = 0; i < got; i++) {
         CHECK(pick[i] != NULL);
-        uint8_t acc = 0;
-        for (int j = 0; j < 32; j++) acc |= pick[i]->spki_pin[j];
-        CHECK(acc != 0);
+        CHECK(pick[i]->operator_family != NULL && pick[i]->operator_family[0] != 0);
         for (size_t j = i + 1; j < got; j++) {
             CHECK(pick[i] != pick[j]);
         }
@@ -1962,6 +2031,59 @@ static void test_dns_pick_resolvers(void) {
     // NULL buffer returns zero.
     got = Dns_PickResolvers(NULL, 2);
     CHECK_EQ_INT(got, 0);
+}
+
+static void test_pin_store_roundtrip(void) {
+    wchar_t oldAppData[MAX_PATH];
+    DWORD oldLen = GetEnvironmentVariableW(L"APPDATA", oldAppData, MAX_PATH);
+    wchar_t tempRoot[MAX_PATH];
+    CHECK(GetTempPathW(MAX_PATH, tempRoot) > 0);
+
+    wchar_t tempAppData[MAX_PATH];
+    _snwprintf_s(tempAppData, MAX_PATH, _TRUNCATE,
+                 L"%lslunar-pinstore-test-%lu",
+                 tempRoot, (unsigned long)GetCurrentProcessId());
+    RemoveDirectoryW(tempAppData);
+    CHECK(CreateDirectoryW(tempAppData, NULL) || GetLastError() == ERROR_ALREADY_EXISTS);
+    CHECK(SetEnvironmentVariableW(L"APPDATA", tempAppData));
+    PinStore_TestReset();
+
+    uint8_t spki[32];
+    for (int i = 0; i < 32; i++) spki[i] = (uint8_t)(i + 1);
+    char hex[65];
+    CertVerifyWin_Hex32(spki, hex);
+
+    CHECK(PinStore_SavePin(PIN_ENDPOINT_DOH, "unit-doh", "resolver.example",
+                           443, "unit-family", spki, hex,
+                           "2026-01-01T00:00:00Z",
+                           "2099-01-01T00:00:00Z",
+                           1767225600LL, 4070908800LL,
+                           "unit-test"));
+
+    PinStore_TestReset();
+    PinRecord rec;
+    CHECK(PinStore_GetPin(PIN_ENDPOINT_DOH, "unit-doh", "resolver.example",
+                          443, &rec));
+    CHECK(rec.present);
+    CHECK(memcmp(rec.spki, spki, sizeof spki) == 0);
+    CHECK_EQ_STR(rec.spki_hex, hex);
+    CHECK_EQ_STR(rec.not_after, "2099-01-01T00:00:00Z");
+    CHECK_EQ_STR(rec.last_status, "unit-test");
+    CHECK_EQ_INT(PinStore_IsExpired(&rec), 0);
+    CHECK_EQ_INT(PinStore_ShouldRenew(&rec), 0);
+
+    wchar_t pinsPath[MAX_PATH];
+    _snwprintf_s(pinsPath, MAX_PATH, _TRUNCATE, L"%ls\\Lunar\\pins.dat", tempAppData);
+    CHECK(GetFileAttributesW(pinsPath) != INVALID_FILE_ATTRIBUTES);
+
+    PinStore_TestReset();
+    if (oldLen > 0 && oldLen < MAX_PATH) SetEnvironmentVariableW(L"APPDATA", oldAppData);
+    else SetEnvironmentVariableW(L"APPDATA", NULL);
+    DeleteFileW(pinsPath);
+    wchar_t lunarDir[MAX_PATH];
+    _snwprintf_s(lunarDir, MAX_PATH, _TRUNCATE, L"%ls\\Lunar", tempAppData);
+    RemoveDirectoryW(lunarDir);
+    RemoveDirectoryW(tempAppData);
 }
 
 static void test_dns_build_query(void) {
@@ -2100,6 +2222,47 @@ static void test_dns_cache_clear(void) {
     CHECK(1);
 }
 
+static void test_app_data_path(void) {
+    wchar_t dir[MAX_PATH] = { 0 };
+    wchar_t file[MAX_PATH] = { 0 };
+    wchar_t tiny[4] = { L'x', 0 };
+
+    CHECK_EQ_INT(Lunar_AppDataPathW(NULL, MAX_PATH, L"x.dat"), 0);
+    CHECK_EQ_INT(Lunar_AppDataPathW(tiny, 0, L"x.dat"), 0);
+
+    CHECK_EQ_INT(Lunar_AppDataPathW(dir, MAX_PATH, NULL), 1);
+    CHECK(dir[0] != 0);
+    CHECK(wcsstr(dir, L"\\Lunar") != NULL);
+
+    CHECK_EQ_INT(Lunar_AppDataPathW(file, MAX_PATH, L"unit-test.dat"), 1);
+    CHECK(wcsstr(file, L"\\Lunar\\unit-test.dat") != NULL);
+
+    CHECK_EQ_INT(Lunar_AppDataPathW(tiny, 4, L"unit-test.dat"), 0);
+    CHECK_EQ_INT(tiny[0], 0);
+}
+
+static void test_watchdog_helpers(void) {
+    CHECK_EQ_INT(Watchdog_IsHeartbeatStale(1000, 0), 1);
+    CHECK_EQ_INT(Watchdog_IsHeartbeatStale(2000, 2000), 0);
+    CHECK_EQ_INT(Watchdog_IsHeartbeatStale(2000, 2000 - WATCHDOG_STALE_MS), 0);
+    CHECK_EQ_INT(Watchdog_IsHeartbeatStale(2000, 2000 - WATCHDOG_STALE_MS - 1), 1);
+    CHECK_EQ_INT(Watchdog_IsHeartbeatStale(1000, 2000), 1);
+
+    wchar_t cmd[256];
+    CHECK_EQ_INT(Watchdog_BuildCommandLine(
+        L"C:\\Program Files\\Lunar\\Lunar.exe",
+        L"Local\\LunarWatchdog_unit",
+        cmd, sizeof(cmd) / sizeof(cmd[0])), 1);
+    CHECK(wcscmp(cmd,
+        L"\"C:\\Program Files\\Lunar\\Lunar.exe\" --lunar-watchdog Local\\LunarWatchdog_unit") == 0);
+
+    wchar_t tiny[16];
+    CHECK_EQ_INT(Watchdog_BuildCommandLine(
+        L"C:\\Program Files\\Lunar\\Lunar.exe",
+        L"Local\\LunarWatchdog_unit",
+        tiny, sizeof(tiny) / sizeof(tiny[0])), 0);
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -2115,6 +2278,7 @@ int main(void) {
     test_minute_guard();
     test_ntp_header_validation();
     test_clock_discipline();
+    test_clock_display_fail_closed();
     test_ntp_concur();
     test_siv_rfc5297_appendix_a1();
     test_siv_rfc5297_appendix_a2();
@@ -2146,6 +2310,9 @@ int main(void) {
     test_dns_parse_response();
     test_dns_intersect();
     test_dns_cache_clear();
+    test_pin_store_roundtrip();
+    test_app_data_path();
+    test_watchdog_helpers();
 
     printf("\n%d checks, %d failed\n", g_pass + g_fail, g_fail);
     return g_fail == 0 ? 0 : 1;

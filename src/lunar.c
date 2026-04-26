@@ -20,6 +20,8 @@
 #include <d2d1.h>
 #include <dwrite.h>
 #include <dwmapi.h>
+#include <shellapi.h>
+#include <bcrypt.h>
 
 // Older SDKs may not define these; they exist on Vista+ (thumbnails) and
 // Windows 7+ (live-preview bitmap). We hard-code the message numbers so
@@ -30,13 +32,24 @@
 #ifndef WM_DWMSENDICONICLIVEPREVIEWBITMAP
 #define WM_DWMSENDICONICLIVEPREVIEWBITMAP 0x0326
 #endif
+#ifndef PBT_APMSUSPEND
+#define PBT_APMSUSPEND          0x0004
+#endif
+#ifndef PBT_APMRESUMECRITICAL
+#define PBT_APMRESUMECRITICAL   0x0006
+#endif
+#ifndef PBT_APMRESUMESUSPEND
+#define PBT_APMRESUMESUSPEND    0x0007
+#endif
+#ifndef PBT_APMRESUMEAUTOMATIC
+#define PBT_APMRESUMEAUTOMATIC  0x0012
+#endif
 
 #include <time.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <direct.h>
 #include <string.h>
 #include <ctype.h>
 #include <commctrl.h>
@@ -45,6 +58,7 @@
 #include "clock.h"
 #include "logbuf.h"
 #include "tz.h"
+#include "app_paths.h"
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -55,9 +69,12 @@
 #define DEFAULT_W        600
 #define DEFAULT_H        600
 #define TICK_MS          200           // 5 fps sweep cadence
+#define UI_TIMER_GAP_TRIP_MS 1500      // fail closed after UI/timer stalls
+#define WATCHDOG_TIMER_MS      100     // out-of-process liveness check cadence
+#define WATCHDOG_STALE_MS      900     // cover stale dial before in-process gap trip
 // Poll cadence: aggressive 5 s retry while INOP to minimize outage,
-// and a gentle 60 s when all three sources concur. There is no
-// degraded middle ground -- the trust state is binary.
+// and a gentle 60 s after an NTS-anchored concurrence verdict. There
+// is no degraded middle ground -- the trust state is binary.
 #define NTP_INTERVAL_OK_MS      60000   // 60 s
 #define NTP_INTERVAL_INOP_MS     5000   //  5 s
 
@@ -86,6 +103,15 @@
 #define IDT_SETTINGS_PREVIEW  2
 
 #define IDT_REPAINT       1
+#define IDT_WATCHDOG      1
+
+#define WATCHDOG_MAGIC    0x4C554E4157444731ULL  // "LUNAWDG1"
+#define WATCHDOG_VERSION  1u
+#define WATCHDOG_SHUTDOWN_WAIT_MS 1500
+#define WATCHDOG_RESTART_MIN_MS   2000
+
+#define WATCHDOG_DISPLAY_INOP 0x0001u
+#define WATCHDOG_DISPLAY_DIAL 0x0002u
 
 #ifndef PI
 #define PI 3.14159265358979323846f
@@ -145,6 +171,33 @@ static int                    g_armed[12]    = { 0 };
 static float                  g_prevMins     = -1.0f;
 static char                   g_tzLabel[96]  = "";
 static DWORD                  g_lastNtpKickMs = 0;
+static ULONGLONG              g_lastTickSeenMs = 0;
+
+typedef struct {
+    uint64_t        magic;
+    uint32_t        version;
+    uint32_t        structSize;
+    DWORD           mainPid;
+    volatile LONG64 heartbeatTick;
+    volatile LONG64 watchdogTick;
+    volatile LONG64 hwndValue;
+    volatile LONG   displayFlags;
+    volatile LONG   shutdown;
+} WatchdogShared;
+
+static HANDLE                 g_watchdogMap;
+static WatchdogShared        *g_watchdogShared;
+static HANDLE                 g_watchdogProcess;
+static DWORD                  g_watchdogPid;
+static wchar_t                g_watchdogMapName[128];
+static DWORD                  g_watchdogLastLaunchMs;
+static DWORD                  g_watchdogLastFaultLogMs;
+
+static int  Watchdog_RunIfRequested(HINSTANCE hInst, int *exitCode);
+static int  Watchdog_EnsureRunning(void);
+static int  Watchdog_DisplayGuardOk(void);
+static void Watchdog_PublishHeartbeat(uint32_t displayFlags);
+static void Watchdog_Shutdown(void);
 
 // User-configurable settings (persisted in %APPDATA%\Lunar\settings.dat).
 static int                    g_chimesEnabled      = 1;
@@ -162,15 +215,8 @@ static TzId                   g_tzId               = TZ_ID_UTC;
 // Persistence
 // ---------------------------------------------------------------------------
 
-// Wide-char path so users with non-ASCII profile names (ü, 漢, etc.)
-// don't silently lose their armed state. APPDATA is always set on
-// desktop Windows; we still fall back gracefully if it isn't.
 static void ArmedPathW(wchar_t *out, size_t n) {
-    const wchar_t *appdata = _wgetenv(L"APPDATA");
-    if (!appdata || !*appdata) { out[0] = 0; return; }
-    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar", appdata);
-    _wmkdir(out);
-    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar\\armed.dat", appdata);
+    if (!Lunar_AppDataPathW(out, n, L"armed.dat")) out[0] = 0;
 }
 
 static void LoadArmed(int armed[12]) {
@@ -214,11 +260,7 @@ typedef struct {
 } WindowState;
 
 static void WindowStatePathW(wchar_t *out, size_t n) {
-    const wchar_t *appdata = _wgetenv(L"APPDATA");
-    if (!appdata || !*appdata) { out[0] = 0; return; }
-    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar", appdata);
-    _wmkdir(out);
-    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar\\window.dat", appdata);
+    if (!Lunar_AppDataPathW(out, n, L"window.dat")) out[0] = 0;
 }
 
 static void LoadWindowState(WindowState *ws) {
@@ -278,11 +320,7 @@ static void SaveWindowState(HWND hwnd, int alwaysOnTop) {
 // ---------------------------------------------------------------------------
 
 static void SettingsPathW(wchar_t *out, size_t n) {
-    const wchar_t *appdata = _wgetenv(L"APPDATA");
-    if (!appdata || !*appdata) { out[0] = 0; return; }
-    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar", appdata);
-    _wmkdir(out);
-    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar\\settings.dat", appdata);
+    if (!Lunar_AppDataPathW(out, n, L"settings.dat")) out[0] = 0;
 }
 
 static void LoadSettings(void) {
@@ -350,10 +388,11 @@ static void SaveSettings(void) {
 
 extern float Sysvol_Get(void);
 
-// 0.35 s of 16-bit mono PCM at 44,100 Hz: 15,435 samples * 2 B + 44 B header.
+// 0.25 s of 16-bit mono PCM at 44,100 Hz: 11,025 samples * 2 B + 44 B header.
 #define BEEP_SAMPLE_RATE 44100
-#define BEEP_FRAMES      15435                         // == 44100 * 0.35
+#define BEEP_FRAMES      (BEEP_SAMPLE_RATE / 4)         // == 250 ms
 #define BEEP_FREQ_HZ     880.0f                        // A5; single chime tone
+#define BEEP_TARGET_SPEAKER_AMPLITUDE 0.276f           // ~30% lower perceived loudness than 0.50
 #define BEEP_DATA_BYTES  (BEEP_FRAMES * 2)
 #define BEEP_BUF_BYTES   (44 + BEEP_DATA_BYTES)
 
@@ -405,15 +444,14 @@ static void BuildWav(float freqHz, float amplitude) {
     }
 }
 
-// Play a single 880 Hz / 0.35 s chime. Applies the same volume-
+// Play a single 880 Hz / 250 ms chime. Applies the same volume-
 // compensation: WASAPI scales our output linearly
 // by the system master slider, so we pre-boost to keep perceived
 // loudness roughly constant.
 static void PlayBeep(void) {
     float v = Sysvol_Get();
     if (v <= 0.01f) return;                  // effectively muted
-    const float TARGET = 0.50f;              // desired speaker-level amplitude
-    float amp = TARGET / v;
+    float amp = BEEP_TARGET_SPEAKER_AMPLITUDE / v;
     if (amp > 0.90f) amp = 0.90f;            // stay below clipping
     if (amp < 0.05f) amp = 0.05f;
     BuildWav(BEEP_FREQ_HZ, amp);
@@ -802,6 +840,489 @@ static void DrawInop(float dw, float dh, const Palette *pal) {
         DWRITE_MEASURING_MODE_NATURAL);
 }
 
+static void DrawInopGdi(HDC hdc, const RECT *rc) {
+    if (!hdc || !rc) return;
+
+    HBRUSH bg = CreateSolidBrush(RGB(22, 22, 22));
+    if (bg) {
+        FillRect(hdc, rc, bg);
+        DeleteObject(bg);
+    } else {
+        FillRect(hdc, rc, (HBRUSH)GetStockObject(BLACK_BRUSH));
+    }
+
+    int w = rc->right - rc->left;
+    int h = rc->bottom - rc->top;
+    int s = (w < h) ? w : h;
+    int fs = (int)(s * 0.28f);
+    if (fs < 24) fs = 24;
+
+    HFONT font = CreateFontW(-fs, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                             DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                             DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    HGDIOBJ oldFont = font ? SelectObject(hdc, font) : NULL;
+    SetBkMode(hdc, TRANSPARENT);
+    SetTextColor(hdc, RGB(235, 26, 26));
+    RECT textRc = *rc;
+    DrawTextW(hdc, L"INOP", 4, &textRc,
+              DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    if (oldFont) SelectObject(hdc, oldFont);
+    if (font) DeleteObject(font);
+}
+
+static void PaintInopGdi(HDC hdc) {
+    if (!g_hwnd) return;
+    HDC useDc = hdc ? hdc : GetDC(g_hwnd);
+    if (!useDc) return;
+    RECT rc;
+    GetClientRect(g_hwnd, &rc);
+    DrawInopGdi(useDc, &rc);
+    if (!hdc) ReleaseDC(g_hwnd, useDc);
+}
+
+static HBITMAP RenderInopBitmapGdi(int w, int h) {
+    if (w < 1 || h < 1) return NULL;
+
+    BITMAPINFO bi = { 0 };
+    bi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth       = w;
+    bi.bmiHeader.biHeight      = -h;
+    bi.bmiHeader.biPlanes      = 1;
+    bi.bmiHeader.biBitCount    = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    void *bits = NULL;
+    HBITMAP hbm = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    if (!hbm) return NULL;
+    HDC hdc = CreateCompatibleDC(NULL);
+    if (!hdc) { DeleteObject(hbm); return NULL; }
+    HGDIOBJ old = SelectObject(hdc, hbm);
+
+    RECT rc = { 0, 0, w, h };
+    DrawInopGdi(hdc, &rc);
+
+    SelectObject(hdc, old);
+    DeleteDC(hdc);
+
+    uint32_t *px = (uint32_t*)bits;
+    int n = w * h;
+    for (int i = 0; i < n; i++) px[i] |= 0xFF000000u;
+    return hbm;
+}
+
+// ---------------------------------------------------------------------------
+// Out-of-process display watchdog
+// ---------------------------------------------------------------------------
+
+static int Watchdog_IsHeartbeatStale(uint64_t nowMs, uint64_t heartbeatMs) {
+    return heartbeatMs == 0 || nowMs < heartbeatMs ||
+           nowMs - heartbeatMs > WATCHDOG_STALE_MS;
+}
+
+static int Watchdog_BuildCommandLine(const wchar_t *exe,
+                                     const wchar_t *mapName,
+                                     wchar_t *out,
+                                     size_t outLen) {
+    if (!exe || !*exe || !mapName || !*mapName || !out || outLen == 0) return 0;
+    out[0] = 0;
+    return _snwprintf_s(out, outLen, _TRUNCATE,
+                        L"\"%ls\" --lunar-watchdog %ls", exe, mapName) >= 0;
+}
+
+static void Watchdog_CloseProcessHandle(void) {
+    if (g_watchdogProcess) {
+        CloseHandle(g_watchdogProcess);
+        g_watchdogProcess = NULL;
+    }
+    g_watchdogPid = 0;
+}
+
+static int Watchdog_ProcessAlive(void) {
+    if (!g_watchdogProcess) return 0;
+    DWORD wait = WaitForSingleObject(g_watchdogProcess, 0);
+    if (wait == WAIT_TIMEOUT) return 1;
+    Watchdog_CloseProcessHandle();
+    return 0;
+}
+
+static void Watchdog_LogFaultThrottled(const char *msg, DWORD err) {
+    DWORD now = GetTickCount();
+    if (g_watchdogLastFaultLogMs == 0 ||
+        now - g_watchdogLastFaultLogMs >= 5000) {
+        g_watchdogLastFaultLogMs = now;
+        if (err) Log_Append("watchdog: %s (err=%lu)", msg, (unsigned long)err);
+        else     Log_Append("watchdog: %s", msg);
+    }
+}
+
+static int Watchdog_EnsureMapping(void) {
+    if (g_watchdogShared) return 1;
+
+    uint32_t rnd[4] = { 0 };
+    if (!BCRYPT_SUCCESS(BCryptGenRandom(NULL, (PUCHAR)rnd, sizeof rnd,
+                                        BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
+        LARGE_INTEGER qpc;
+        QueryPerformanceCounter(&qpc);
+        rnd[0] = GetCurrentProcessId();
+        rnd[1] = GetTickCount();
+        rnd[2] = (uint32_t)qpc.LowPart;
+        rnd[3] = (uint32_t)qpc.HighPart;
+    }
+
+    if (_snwprintf_s(g_watchdogMapName,
+                     sizeof(g_watchdogMapName) / sizeof(g_watchdogMapName[0]),
+                     _TRUNCATE,
+                     L"Local\\LunarWatchdog_%lu_%08lX%08lX%08lX%08lX",
+                     (unsigned long)GetCurrentProcessId(),
+                     (unsigned long)rnd[0], (unsigned long)rnd[1],
+                     (unsigned long)rnd[2], (unsigned long)rnd[3]) < 0) {
+        g_watchdogMapName[0] = 0;
+        return 0;
+    }
+
+    g_watchdogMap = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
+                                       PAGE_READWRITE, 0,
+                                       (DWORD)sizeof(WatchdogShared),
+                                       g_watchdogMapName);
+    if (!g_watchdogMap) return 0;
+
+    g_watchdogShared = (WatchdogShared*)MapViewOfFile(
+        g_watchdogMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
+        sizeof(WatchdogShared));
+    if (!g_watchdogShared) {
+        CloseHandle(g_watchdogMap);
+        g_watchdogMap = NULL;
+        return 0;
+    }
+
+    ZeroMemory(g_watchdogShared, sizeof(*g_watchdogShared));
+    g_watchdogShared->magic = WATCHDOG_MAGIC;
+    g_watchdogShared->version = WATCHDOG_VERSION;
+    g_watchdogShared->structSize = sizeof(WatchdogShared);
+    g_watchdogShared->mainPid = GetCurrentProcessId();
+    InterlockedExchange64(&g_watchdogShared->heartbeatTick,
+                          (LONG64)GetTickCount64());
+    InterlockedExchange64(&g_watchdogShared->watchdogTick, 0);
+    InterlockedExchange64(&g_watchdogShared->hwndValue,
+                          (LONG64)(uintptr_t)g_hwnd);
+    InterlockedExchange(&g_watchdogShared->displayFlags,
+                        (LONG)WATCHDOG_DISPLAY_INOP);
+    InterlockedExchange(&g_watchdogShared->shutdown, 0);
+    return 1;
+}
+
+static int Watchdog_EnsureRunning(void) {
+    if (!g_hwnd) return 0;
+    if (Watchdog_ProcessAlive()) return 1;
+
+    DWORD now = GetTickCount();
+    if (g_watchdogLastLaunchMs != 0 &&
+        now - g_watchdogLastLaunchMs < WATCHDOG_RESTART_MIN_MS) {
+        return 0;
+    }
+    g_watchdogLastLaunchMs = now;
+
+    if (!Watchdog_EnsureMapping()) {
+        Watchdog_LogFaultThrottled("shared memory unavailable; display guard inactive",
+                                   GetLastError());
+        return 0;
+    }
+
+    InterlockedExchange(&g_watchdogShared->shutdown, 0);
+    InterlockedExchange64(&g_watchdogShared->hwndValue,
+                          (LONG64)(uintptr_t)g_hwnd);
+    InterlockedExchange64(&g_watchdogShared->heartbeatTick,
+                          (LONG64)GetTickCount64());
+
+    wchar_t exe[MAX_PATH] = { 0 };
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) {
+        Watchdog_LogFaultThrottled("cannot locate executable for watchdog",
+                                   GetLastError());
+        return 0;
+    }
+
+    wchar_t cmd[768];
+    if (!Watchdog_BuildCommandLine(exe, g_watchdogMapName, cmd,
+                                   sizeof(cmd) / sizeof(cmd[0]))) {
+        Watchdog_LogFaultThrottled("cannot build watchdog command line", 0);
+        return 0;
+    }
+
+    STARTUPINFOW si = { 0 };
+    PROCESS_INFORMATION pi = { 0 };
+    si.cb = sizeof(si);
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        Watchdog_LogFaultThrottled("CreateProcess failed; display guard inactive",
+                                   GetLastError());
+        return 0;
+    }
+
+    g_watchdogProcess = pi.hProcess;
+    g_watchdogPid = pi.dwProcessId;
+    if (pi.hThread) CloseHandle(pi.hThread);
+    Log_Append("watchdog: started pid=%lu", (unsigned long)g_watchdogPid);
+    return 1;
+}
+
+static int Watchdog_DisplayGuardOk(void) {
+    if (!g_watchdogShared || !Watchdog_ProcessAlive()) return 0;
+    uint64_t now = GetTickCount64();
+    uint64_t watchdogTick = (uint64_t)InterlockedCompareExchange64(
+        &g_watchdogShared->watchdogTick, 0, 0);
+    return !Watchdog_IsHeartbeatStale(now, watchdogTick);
+}
+
+static void Watchdog_PublishHeartbeat(uint32_t displayFlags) {
+    if (!g_watchdogShared) return;
+    InterlockedExchange64(&g_watchdogShared->hwndValue,
+                          (LONG64)(uintptr_t)g_hwnd);
+    InterlockedExchange(&g_watchdogShared->displayFlags, (LONG)displayFlags);
+    InterlockedExchange64(&g_watchdogShared->heartbeatTick,
+                          (LONG64)GetTickCount64());
+}
+
+static void Watchdog_Shutdown(void) {
+    if (g_watchdogShared) {
+        InterlockedExchange(&g_watchdogShared->shutdown, 1);
+    }
+    if (g_watchdogProcess) {
+        WaitForSingleObject(g_watchdogProcess, WATCHDOG_SHUTDOWN_WAIT_MS);
+    }
+    Watchdog_CloseProcessHandle();
+    if (g_watchdogShared) {
+        UnmapViewOfFile(g_watchdogShared);
+        g_watchdogShared = NULL;
+    }
+    if (g_watchdogMap) {
+        CloseHandle(g_watchdogMap);
+        g_watchdogMap = NULL;
+    }
+    g_watchdogMapName[0] = 0;
+}
+
+typedef struct {
+    WatchdogShared *shared;
+    HANDLE          mapping;
+    HANDLE          parent;
+    HWND            overlay;
+    int             overlayVisible;
+    uint64_t        lastIconicUpdateMs;
+} WatchdogRuntime;
+
+static void Watchdog_SetInopIconicBitmaps(HWND target) {
+    if (!IsWindow(target)) return;
+
+    HBITMAP thumb = RenderInopBitmapGdi(256, 256);
+    if (thumb) {
+        DwmSetIconicThumbnail(target, thumb, 0);
+        DeleteObject(thumb);
+    }
+
+    RECT wr;
+    int w = 320, h = 320;
+    if (GetWindowRect(target, &wr)) {
+        w = wr.right - wr.left;
+        h = wr.bottom - wr.top;
+        if (w < 64) w = 320;
+        if (h < 64) h = 320;
+        if (w > 1200) w = 1200;
+        if (h > 1200) h = 1200;
+    }
+    HBITMAP live = RenderInopBitmapGdi(w, h);
+    if (live) {
+        DwmSetIconicLivePreviewBitmap(target, live, NULL, 0);
+        DeleteObject(live);
+    }
+}
+
+static void Watchdog_HideOverlay(WatchdogRuntime *rt) {
+    if (!rt || !rt->overlayVisible) return;
+    ShowWindow(rt->overlay, SW_HIDE);
+    rt->overlayVisible = 0;
+}
+
+static void Watchdog_ShowOverlay(WatchdogRuntime *rt, HWND target) {
+    if (!rt || !rt->overlay || !IsWindow(target) || !IsWindowVisible(target)) {
+        Watchdog_HideOverlay(rt);
+        return;
+    }
+    if (IsIconic(target)) {
+        Watchdog_HideOverlay(rt);
+        return;
+    }
+
+    RECT wr;
+    if (!GetWindowRect(target, &wr)) {
+        Watchdog_HideOverlay(rt);
+        return;
+    }
+    int w = wr.right - wr.left;
+    int h = wr.bottom - wr.top;
+    if (w < 1 || h < 1) {
+        Watchdog_HideOverlay(rt);
+        return;
+    }
+
+    SetWindowPos(rt->overlay, HWND_TOPMOST, wr.left, wr.top, w, h,
+                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(rt->overlay, NULL, FALSE);
+    rt->overlayVisible = 1;
+}
+
+static void Watchdog_OnTimer(WatchdogRuntime *rt) {
+    if (!rt || !rt->shared) return;
+    uint64_t now = GetTickCount64();
+    InterlockedExchange64(&rt->shared->watchdogTick, (LONG64)now);
+
+    if (InterlockedCompareExchange(&rt->shared->shutdown, 0, 0) != 0) {
+        PostQuitMessage(0);
+        return;
+    }
+    if (rt->parent && WaitForSingleObject(rt->parent, 0) == WAIT_OBJECT_0) {
+        PostQuitMessage(0);
+        return;
+    }
+
+    HWND target = (HWND)(uintptr_t)InterlockedCompareExchange64(
+        &rt->shared->hwndValue, 0, 0);
+    if (!IsWindow(target)) {
+        PostQuitMessage(0);
+        return;
+    }
+
+    uint64_t heartbeat = (uint64_t)InterlockedCompareExchange64(
+        &rt->shared->heartbeatTick, 0, 0);
+    if (!Watchdog_IsHeartbeatStale(now, heartbeat)) {
+        Watchdog_HideOverlay(rt);
+        return;
+    }
+
+    if (IsIconic(target)) {
+        Watchdog_HideOverlay(rt);
+        if (rt->lastIconicUpdateMs == 0 || now - rt->lastIconicUpdateMs > 1000) {
+            rt->lastIconicUpdateMs = now;
+            Watchdog_SetInopIconicBitmaps(target);
+        }
+        return;
+    }
+
+    Watchdog_ShowOverlay(rt, target);
+}
+
+static LRESULT CALLBACK WatchdogWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    WatchdogRuntime *rt = (WatchdogRuntime*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_NCCREATE: {
+        CREATESTRUCTW *cs = (CREATESTRUCTW*)lp;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
+        return TRUE;
+    }
+    case WM_TIMER:
+        if (wp == IDT_WATCHDOG) Watchdog_OnTimer(rt);
+        return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        DrawInopGdi(ps.hdc, &rc);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_CLOSE:
+        return 0;
+    case WM_DESTROY:
+        KillTimer(hwnd, IDT_WATCHDOG);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static int Watchdog_Run(HINSTANCE hInst, const wchar_t *mapName) {
+    if (!mapName || !*mapName) return 2;
+
+    HANDLE mapping = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE,
+                                      FALSE, mapName);
+    if (!mapping) return 3;
+    WatchdogShared *shared = (WatchdogShared*)MapViewOfFile(
+        mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(WatchdogShared));
+    if (!shared) {
+        CloseHandle(mapping);
+        return 4;
+    }
+    if (shared->magic != WATCHDOG_MAGIC ||
+        shared->version != WATCHDOG_VERSION ||
+        shared->structSize != sizeof(WatchdogShared)) {
+        UnmapViewOfFile(shared);
+        CloseHandle(mapping);
+        return 5;
+    }
+
+    WatchdogRuntime rt;
+    ZeroMemory(&rt, sizeof(rt));
+    rt.shared = shared;
+    rt.mapping = mapping;
+    rt.parent = OpenProcess(SYNCHRONIZE, FALSE, shared->mainPid);
+
+    static const wchar_t kWatchdogClass[] = L"LunarWatchdogWin";
+    WNDCLASSEXW wc = { 0 };
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = WatchdogWndProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+    wc.lpszClassName = kWatchdogClass;
+    RegisterClassExW(&wc);
+
+    rt.overlay = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                                 kWatchdogClass, L"Lunar INOP",
+                                 WS_POPUP,
+                                 0, 0, 1, 1,
+                                 NULL, NULL, hInst, &rt);
+    if (!rt.overlay) {
+        if (rt.parent) CloseHandle(rt.parent);
+        UnmapViewOfFile(shared);
+        CloseHandle(mapping);
+        return 6;
+    }
+    SetTimer(rt.overlay, IDT_WATCHDOG, WATCHDOG_TIMER_MS, NULL);
+    InterlockedExchange64(&shared->watchdogTick, (LONG64)GetTickCount64());
+
+    MSG msg;
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    if (rt.overlay && IsWindow(rt.overlay)) DestroyWindow(rt.overlay);
+    if (rt.parent) CloseHandle(rt.parent);
+    UnmapViewOfFile(shared);
+    CloseHandle(mapping);
+    return 0;
+}
+
+static int Watchdog_RunIfRequested(HINSTANCE hInst, int *exitCode) {
+    if (exitCode) *exitCode = 0;
+    int argc = 0;
+    LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (!argv) return 0;
+
+    int handled = 0;
+    for (int i = 1; i + 1 < argc; i++) {
+        if (wcscmp(argv[i], L"--lunar-watchdog") == 0) {
+            if (exitCode) *exitCode = Watchdog_Run(hInst, argv[i + 1]);
+            handled = 1;
+            break;
+        }
+    }
+    LocalFree(argv);
+    return handled;
+}
+
 
 // ---------------------------------------------------------------------------
 // Dial
@@ -872,15 +1393,21 @@ static void DrawDial(float cx, float cy, float S, const Palette *pal,
 // Paint
 // ---------------------------------------------------------------------------
 
-static void Paint(void) {
-    if (FAILED(CreateDeviceResources())) return;
+static void Paint(HDC fallbackDc) {
+    if (FAILED(CreateDeviceResources())) {
+        PaintInopGdi(fallbackDc);
+        Watchdog_PublishHeartbeat(WATCHDOG_DISPLAY_INOP);
+        return;
+    }
 
     // Read the disciplined clockwork time. Clock_NowUtcMs() returns 0
     // if we have not yet successfully synced THIS run -- the Windows
     // system clock is never used as a display source. In that case we
     // paint the INOP indicator and skip dial rendering entirely.
     int64_t displayMs = 0;
-    int haveTime = Clock_NowUtcMs(&displayMs);
+    uint64_t displayGeneration = 0;
+    int haveTime = Clock_ReadDisplayTime(&displayMs, &displayGeneration);
+    if (!Watchdog_DisplayGuardOk()) haveTime = 0;
 
     Palette pal = (g_theme == 1) ? palette_light() : palette_dark();
 
@@ -897,6 +1424,7 @@ static void Paint(void) {
     ID2D1RenderTarget_Clear(g_rt, &pal.bg);
     ID2D1RenderTarget_SetAntialiasMode(g_rt, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
+    int drewDial = 0;
     if (!haveTime) {
         DrawInop(dw, dh, &pal);
     } else {
@@ -907,8 +1435,12 @@ static void Paint(void) {
             // clock is a fault condition: show INOP rather than
             // silently skipping the frame.
             DrawInop(dw, dh, &pal);
+            haveTime = 0;
         } else {
-            if (S > 40.0f) DrawDial(cx, cy, S, &pal, &lt, ms, g_armed);
+            if (S > 40.0f) {
+                DrawDial(cx, cy, S, &pal, &lt, ms, g_armed);
+                drewDial = 1;
+            }
         }
     }
 
@@ -934,9 +1466,27 @@ static void Paint(void) {
         }
     }
 
+    int commitLocked = 0;
+    if (drewDial) {
+        if (Watchdog_DisplayGuardOk() &&
+            Clock_BeginDisplayCommit(displayGeneration)) {
+            commitLocked = 1;
+        } else {
+            ID2D1RenderTarget_Clear(g_rt, &pal.bg);
+            DrawInop(dw, dh, &pal);
+            haveTime = 0;
+        }
+    }
+
     HRESULT hr = ID2D1RenderTarget_EndDraw(g_rt, NULL, NULL);
+    if (commitLocked) Clock_EndDisplayCommit();
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
         DiscardDeviceResources();
+    }
+    if (SUCCEEDED(hr)) {
+        Watchdog_PublishHeartbeat((drewDial && haveTime)
+            ? WATCHDOG_DISPLAY_DIAL
+            : WATCHDOG_DISPLAY_INOP);
     }
 }
 
@@ -969,7 +1519,7 @@ static HBITMAP RenderClockToBitmap(int w, int h) {
             D2D1_FEATURE_LEVEL_DEFAULT
         };
         if (FAILED(ID2D1Factory_CreateDCRenderTarget(g_d2d, &p, &g_dcRt)))
-            return NULL;
+            return RenderInopBitmapGdi(w, h);
     }
 
     BITMAPINFO bi = { 0 };
@@ -1007,7 +1557,9 @@ static HBITMAP RenderClockToBitmap(int w, int h) {
         // thumbnail too -- the taskbar preview must never show a stale
         // or system-clock time.
         int64_t displayMs = 0;
-        int haveTime = Clock_NowUtcMs(&displayMs);
+        uint64_t displayGeneration = 0;
+        int haveTime = Clock_ReadDisplayTime(&displayMs, &displayGeneration);
+        if (!Watchdog_DisplayGuardOk()) haveTime = 0;
 
         Palette pal = (g_theme == 1) ? palette_light() : palette_dark();
         float dw = (float)w, dh = (float)h;
@@ -1018,18 +1570,33 @@ static HBITMAP RenderClockToBitmap(int w, int h) {
         ID2D1RenderTarget_Clear(g_rt, &pal.bg);
         ID2D1RenderTarget_SetAntialiasMode(g_rt, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
+        int drewDial = 0;
         if (!haveTime) {
             DrawInop(dw, dh, &pal);
         } else {
             struct tm lt = {0};
             int ms = 0;
             if (UtcMsToLocalTm(displayMs, &lt, &ms)) {
-                if (S > 40.0f) DrawDial(cx, cy, S, &pal, &lt, ms, g_armed);
+                if (S > 40.0f) {
+                    DrawDial(cx, cy, S, &pal, &lt, ms, g_armed);
+                    drewDial = 1;
+                }
             } else {
                 DrawInop(dw, dh, &pal);
             }
         }
-        ID2D1RenderTarget_EndDraw(g_rt, NULL, NULL);
+        int commitLocked = 0;
+        if (drewDial) {
+            if (Watchdog_DisplayGuardOk() &&
+                Clock_BeginDisplayCommit(displayGeneration)) {
+                commitLocked = 1;
+            } else {
+                ID2D1RenderTarget_Clear(g_rt, &pal.bg);
+                DrawInop(dw, dh, &pal);
+            }
+        }
+        hr = ID2D1RenderTarget_EndDraw(g_rt, NULL, NULL);
+        if (commitLocked) Clock_EndDisplayCommit();
 
         ID2D1SolidColorBrush_Release(g_brush);
     }
@@ -1039,6 +1606,11 @@ static HBITMAP RenderClockToBitmap(int w, int h) {
 
     SelectObject(hdc, old);
     DeleteDC(hdc);
+
+    if (FAILED(hr)) {
+        DeleteObject(hbm);
+        return RenderInopBitmapGdi(w, h);
+    }
 
     // The background is fully opaque but some D2D paths leave alpha=0 in
     // places where BI_RGB DIBs interpret the byte as "undefined". DWM
@@ -1715,13 +2287,41 @@ static void ShowSettings(void) {
                     g_hwnd, SettingsDlgProc, 0);
 }
 
+static void RefreshClockSurface(void) {
+    if (!g_hwnd) return;
+    UpdateTitleBar();
+
+    // We opt into DWM iconic representation, so the taskbar can hold a
+    // cached bitmap even while the real window has already repainted to
+    // INOP. Invalidate that cache on every clock-surface refresh; DWM
+    // will ask for a fresh bitmap only when it needs one.
+    DwmInvalidateIconicBitmaps(g_hwnd);
+
+    if (!IsIconic(g_hwnd)) {
+        InvalidateRect(g_hwnd, NULL, FALSE);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tick handler (fires 10x per second via WM_TIMER)
 // ---------------------------------------------------------------------------
 
 static void Tick(void) {
+    if (!Watchdog_EnsureRunning()) {
+        Clock_TripInop("display watchdog unavailable");
+    }
+
+    ULONGLONG now64 = GetTickCount64();
+    if (g_lastTickSeenMs != 0 &&
+        now64 - g_lastTickSeenMs > UI_TIMER_GAP_TRIP_MS) {
+        Clock_TripInop("UI timer gap or system resume");
+        Ntp_Start();
+        g_lastNtpKickMs = GetTickCount();
+    }
+    g_lastTickSeenMs = now64;
+
     // Periodic NTP re-sync. Binary cadence: 5 s while INOP (to recover
-    // fast), 60 s once all three sources concur.
+    // fast), 60 s once the NTS-anchored concurrence gate is OK.
     DWORD nowMs = GetTickCount();
     DWORD interval = (Clock_Trust() == TRUST_OK)
         ? NTP_INTERVAL_OK_MS
@@ -1737,11 +2337,19 @@ static void Tick(void) {
     int64_t displayMs = 0;
     if (!Clock_NowUtcMs(&displayMs)) {
         g_prevMins = -1.0f;   // reset so we don't cascade beeps on re-sync
+        RefreshClockSurface();
+        SetTimer(g_hwnd, IDT_REPAINT, TICK_MS, NULL);
         return;
     }
     struct tm lt = {0};
     int ms = 0;
-    if (!UtcMsToLocalTm(displayMs, &lt, &ms)) return;
+    if (!UtcMsToLocalTm(displayMs, &lt, &ms)) {
+        Clock_TripInop("local time conversion failed");
+        g_prevMins = -1.0f;
+        RefreshClockSurface();
+        SetTimer(g_hwnd, IDT_REPAINT, TICK_MS, NULL);
+        return;
+    }
     float secs = (float)lt.tm_sec + ms / 1000.0f;
     float mins = (float)lt.tm_min + secs / 60.0f;
 
@@ -1791,17 +2399,7 @@ static void Tick(void) {
     }
     g_prevMins = mins;
 
-    // Refresh the title-bar trust indicator (no-op when unchanged).
-    UpdateTitleBar();
-
-    // When visible, repaint the window. When minimized, tell DWM that
-    // our cached iconic bitmaps are stale; DWM will fire another
-    // WM_DWMSENDICONICTHUMBNAIL the next time the taskbar needs one.
-    if (IsIconic(g_hwnd)) {
-        DwmInvalidateIconicBitmaps(g_hwnd);
-    } else {
-        InvalidateRect(g_hwnd, NULL, FALSE);
-    }
+    RefreshClockSurface();
 
     // Phase-lock the next tick to the wall-clock decisecond boundary.
     // Calling SetTimer with an existing (hwnd,id) resets the interval.
@@ -1853,7 +2451,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
         BeginPaint(hwnd, &ps);
-        Paint();
+        Paint(ps.hdc);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -1873,6 +2471,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         int maxW = HIWORD(lp), maxH = LOWORD(lp);
         int s = (maxW < maxH) ? maxW : maxH;
         HBITMAP hbm = RenderClockToBitmap(s, s);
+        if (!hbm) hbm = RenderInopBitmapGdi(s, s);
         if (hbm) {
             DwmSetIconicThumbnail(hwnd, hbm, 0);
             DeleteObject(hbm);
@@ -1888,12 +2487,27 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (w < 1) w = 1;
         if (h < 1) h = 1;
         HBITMAP hbm = RenderClockToBitmap(w, h);
+        if (!hbm) hbm = RenderInopBitmapGdi(w, h);
         if (hbm) {
             DwmSetIconicLivePreviewBitmap(hwnd, hbm, NULL, 0);
             DeleteObject(hbm);
         }
         return 0;
     }
+
+    case WM_POWERBROADCAST:
+        switch (wp) {
+        case PBT_APMSUSPEND:
+        case PBT_APMRESUMECRITICAL:
+        case PBT_APMRESUMESUSPEND:
+        case PBT_APMRESUMEAUTOMATIC:
+            Clock_TripInop("system suspend/resume");
+            Ntp_Start();
+            g_lastNtpKickMs = GetTickCount();
+            RefreshClockSurface();
+            return TRUE;
+        }
+        break;
 
     case 0x02E0 /* WM_DPICHANGED */: {
         // Windows suggests a new window rect sized for the new DPI.
@@ -1953,6 +2567,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         Log_Append("app: shutting down");
         SaveWindowState(hwnd, g_alwaysOnTop);
+        Watchdog_Shutdown();
+        Ntp_Shutdown();
         Clock_Shutdown();
         DestroyWindow(hwnd);
         return 0;
@@ -1979,6 +2595,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     (void)hPrev;
     (void)cmdLine;
+
+    int watchdogExit = 0;
+    if (Watchdog_RunIfRequested(hInst, &watchdogExit)) {
+        return watchdogExit;
+    }
 
     // Enable Per-Monitor-V2 DPI awareness so the system menu, title bar,
     // and dialogs are rendered at native pixel density instead of being
@@ -2071,10 +2692,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
         NULL, NULL, hInst, NULL);
     if (!hwnd) return 1;
 
-    if (g_alwaysOnTop) ApplyAlwaysOnTop(1);
-
     // Kick off the first NTP sync as soon as the window exists.
     Clock_Init();
+    if (!Watchdog_EnsureRunning()) {
+        Clock_TripInop("display watchdog unavailable");
+    }
     Log_Append("app: Lunar 0.3 started; initiating first NTP sync");
     Ntp_Start();
     g_lastNtpKickMs = GetTickCount();
@@ -2083,6 +2705,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     if (ws.valid && ws.maximized) showCmd = SW_SHOWMAXIMIZED;
     ShowWindow(hwnd, showCmd);
     UpdateWindow(hwnd);
+
+    // Apply topmost AFTER ShowWindow. On a still-hidden window
+    // SetWindowPos with SWP_NOACTIVATE does not reliably commit the
+    // WS_EX_TOPMOST Z-order bit, which is why a previous session's
+    // always-on-top setting appeared "remembered" (menu checkmark
+    // synced from g_alwaysOnTop) but not effective on restart.
+    if (g_alwaysOnTop) ApplyAlwaysOnTop(1);
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0) > 0) {

@@ -5,25 +5,15 @@
 #include <windows.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <direct.h>
 #include <wchar.h>
 
 #include "clock.h"
 #include "logbuf.h"
+#include "app_paths.h"
 
 // NOTE: Log_Append() internally reads Clock_NowUtcMs(), which also
 // takes g_cs. Every Log_Append call site in this file therefore runs
 // AFTER the CS has been released, never while it's held.
-
-// --- Persistence path -----------------------------------------------------
-
-static void DisciplinePathW(wchar_t *out, size_t n) {
-    const wchar_t *appdata = _wgetenv(L"APPDATA");
-    if (!appdata || !*appdata) { out[0] = 0; return; }
-    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar", appdata);
-    _wmkdir(out);
-    _snwprintf_s(out, n, _TRUNCATE, L"%ls\\Lunar\\discipline.dat", appdata);
-}
 
 // --- Shared state ---------------------------------------------------------
 
@@ -42,9 +32,8 @@ static int        g_haveSample   = 0;    // at least one NTP sample THIS run
 static int        g_haveRate     = 0;    // two+ samples: rate is measured
 static int64_t    g_lastSyncUtcMs = 0;   // UTC at last successful sync
 static int64_t    g_lastSyncQpc   = 0;   // QPC at last successful sync
-static int64_t    g_slewStartQpc  = 0;   // while slewing, start of window
-static int64_t    g_slewTotalMs   = 0;   // residual to absorb
-static int64_t    g_slewDurationMs = 0;  // over how long (currently 60000)
+static int64_t    g_displayLeaseUntilQpc = 0; // QPC deadline for dial display
+static uint64_t   g_displayGeneration = 1; // bumps on every display-state change
 
 // Trust state published by ntp.c after each polling cycle. Starts at
 // TRUST_INOP and stays there until the first cycle achieves concurrence.
@@ -58,6 +47,11 @@ static TrustState g_trust         = TRUST_INOP;
 static int        g_consecutiveLocalFaults = 0;
 #define LOCAL_FAULT_ESCAPE_N  3
 
+// A trusted poll grants the UI a short display lease. If that lease is
+// not renewed by another concurrence-valid cycle, Clock_NowUtcMs()
+// fails closed even though the old anchor can still be projected.
+#define CLOCK_DISPLAY_LEASE_MS  90000
+
 // --- Discipline-loop constants --------------------------------------------
 //
 // Rate control is a PI loop where the integral term is the per-cycle
@@ -69,18 +63,13 @@ static int        g_consecutiveLocalFaults = 0;
 //   new_rate_ppm  = clamp(old + delta, ±RATE_CLAMP_PPM)
 //
 // Phase correction is absorbed by re-anchoring the clockwork to the
-// server's reading on every sync (the anchor always represents truth).
-// The visible-slew mechanism in ProjectLocked() is a pure cosmetic
-// decay that keeps the second hand smooth across a re-anchor; it is
-// NOT baked into the anchor and therefore cannot contaminate the next
-// cycle's residual measurement -- a previous design that did bake the
-// slew produced a self-reinforcing limit cycle (see audit 2026-04-23).
+// server's reading on every sync. The display snaps immediately to
+// the accepted anchor; Lunar does not knowingly show a smoothed value
+// that differs from the freshest trusted reading.
 #define RATE_CLAMP_PPM              200    // realistic quartz: ±50 ppm typ
 #define PER_CYCLE_RATE_CLAMP_PPM    20     // max rate swing per single cycle
 #define KI_NUM                      1      // integral gain = 1/8 (gentle)
 #define KI_DEN                      8
-#define SLEW_THRESHOLD_MS           2000   // residual above this snaps instead
-#define SLEW_WINDOW_MS              60000  // cosmetic decay window (~60 s)
 
 int64_t Clock_Qpc(void) {
     LARGE_INTEGER q;
@@ -92,10 +81,35 @@ int64_t Clock_QpcFreq(void) {
     return g_qpcFreq;
 }
 
+static int64_t MsToQpcTicks(int64_t ms) {
+    return (ms * g_qpcFreq + 999LL) / 1000LL;
+}
+
+static void Clock_GrantDisplayLeaseLocked(void) {
+    g_displayLeaseUntilQpc = Clock_Qpc() + MsToQpcTicks(CLOCK_DISPLAY_LEASE_MS);
+    g_displayGeneration++;
+    if (g_displayGeneration == 0) g_displayGeneration = 1;
+}
+
+static void Clock_TripInopLocked(void) {
+    int changed = (g_trust != TRUST_INOP || g_displayLeaseUntilQpc != 0);
+    g_trust = TRUST_INOP;
+    g_displayLeaseUntilQpc = 0;
+    if (changed) {
+        g_displayGeneration++;
+        if (g_displayGeneration == 0) g_displayGeneration = 1;
+    }
+}
+
+static int Clock_DisplayLeaseExpiredLocked(int64_t nowQpc) {
+    return g_haveSample && g_trust != TRUST_INOP &&
+           (g_displayLeaseUntilQpc <= 0 || nowQpc > g_displayLeaseUntilQpc);
+}
+
 static void LoadDiscipline(void) {
     g_loadedRatePpm = 0;
-    wchar_t path[MAX_PATH]; DisciplinePathW(path, MAX_PATH);
-    if (!path[0]) return;
+    wchar_t path[MAX_PATH];
+    if (!Lunar_AppDataPathW(path, MAX_PATH, L"discipline.dat")) return;
     FILE *f = _wfopen(path, L"rb");
     if (!f) return;
     char buf[128] = {0};
@@ -134,6 +148,13 @@ void Clock_Init(void) {
     g_ratePpm    = 0;
     g_haveSample = 0;
     g_haveRate   = 0;
+    g_lastSyncUtcMs = 0;
+    g_lastSyncQpc = 0;
+    g_displayLeaseUntilQpc = 0;
+    g_trust = TRUST_INOP;
+    g_consecutiveLocalFaults = 0;
+    g_displayGeneration++;
+    if (g_displayGeneration == 0) g_displayGeneration = 1;
 
     if (g_loadedRatePpm != 0) {
         Log_Append("clock: persisted rate %+d ppm loaded from disk "
@@ -150,8 +171,8 @@ void Clock_Shutdown(void) {
                    "(only one sample this run)");
         return;
     }
-    wchar_t path[MAX_PATH]; DisciplinePathW(path, MAX_PATH);
-    if (!path[0]) return;
+    wchar_t path[MAX_PATH];
+    if (!Lunar_AppDataPathW(path, MAX_PATH, L"discipline.dat")) return;
     FILE *f = _wfopen(path, L"wb");
     if (!f) return;
     fprintf(f, "%d %lld\n", (int)g_ratePpm, (long long)g_lastSyncUtcMs);
@@ -161,17 +182,9 @@ void Clock_Shutdown(void) {
 }
 
 // Project a QPC tick onto disciplined UTC ms using current anchor + rate.
-//
 // The anchor (g_anchorQpc, g_anchorUtcMs) always represents our best
 // belief of truth at that QPC moment. Between syncs we project forward
-// using g_ratePpm. On top of that we may add a cosmetic VISUAL slew
-// that decays from g_slewTotalMs to zero over g_slewDurationMs: its
-// sole purpose is to smooth the transition when a sync re-anchors to a
-// slightly different UTC than we were projecting, so the second hand
-// does not jump. The cosmetic slew is NEVER baked into the anchor,
-// because the anchor already represents truth -- baking the visual
-// residual back in was the source of a self-reinforcing limit cycle
-// in the pre-2026-04-23 design.
+// using g_ratePpm.
 static int64_t ProjectLocked(int64_t qpc) {
     int64_t dQ = qpc - g_anchorQpc;
     // Base elapsed ms with 64-bit precision and round-to-nearest.
@@ -182,29 +195,6 @@ static int64_t ProjectLocked(int64_t qpc) {
     int64_t rateMs = (dMs_base * (int64_t)g_ratePpm) / 1000000LL;
     int64_t utcMs  = g_anchorUtcMs + dMs_base + rateMs;
 
-    // Cosmetic visual slew: linearly decay the residual from its
-    // initial value to zero over g_slewDurationMs. Initial value is
-    // (displayed_before_reanchor - anchor_utc), so at slew start the
-    // displayed time equals what the user saw immediately before the
-    // re-anchor. It then ramps to the (now-authoritative) anchor-based
-    // projection.
-    if (g_slewTotalMs != 0 && g_slewDurationMs > 0) {
-        int64_t dq2 = qpc - g_slewStartQpc;
-        if (dq2 < 0) dq2 = 0;
-        int64_t sinceMs = (dq2 * 1000LL + g_qpcFreq / 2) / g_qpcFreq;
-        if (sinceMs >= g_slewDurationMs) {
-            // Cosmetic slew has fully decayed to zero: clear state.
-            // Crucially we do NOT modify the anchor here -- the anchor
-            // was already truth when the slew was installed.
-            g_slewTotalMs    = 0;
-            g_slewDurationMs = 0;
-        } else {
-            int64_t remaining =
-                (g_slewTotalMs * (g_slewDurationMs - sinceMs))
-                / g_slewDurationMs;
-            utcMs += remaining;
-        }
-    }
     return utcMs;
 }
 
@@ -218,20 +208,87 @@ int64_t Clock_NowUtcMs_Internal(void) {
     return r;
 }
 
-int Clock_NowUtcMs(int64_t *outMs) {
+int Clock_ReadDisplayTime(int64_t *outMs, uint64_t *outGeneration) {
     if (!g_csInit) return 0;
+    int64_t nowQpc = Clock_Qpc();
+    int expired = 0;
     EnterCriticalSection(&g_cs);
     int ok = 0;
-    // Clock must be anchored AND the last polling cycle must have
-    // concurred (OK or DEGRADED). TRUST_INOP -- even with a stale
-    // anchor -- must not return a time: we have no trusted reading
-    // right now, and the UI must render INOP.
+    int64_t utcMs = 0;
+    uint64_t generation = 0;
+    if (Clock_DisplayLeaseExpiredLocked(nowQpc)) {
+        Clock_TripInopLocked();
+        expired = 1;
+    }
+
+    // Clock must be anchored, the last polling cycle must have
+    // concurred, and the display lease from that cycle must still be
+    // fresh. TRUST_INOP -- even with a projectable old anchor -- must
+    // not return a time: callers must render INOP.
     if (g_haveSample && g_trust != TRUST_INOP) {
-        if (outMs) *outMs = ProjectLocked(Clock_Qpc());
+        utcMs = ProjectLocked(nowQpc);
+        generation = g_displayGeneration;
         ok = 1;
     }
     LeaveCriticalSection(&g_cs);
+    if (ok) {
+        if (outMs) *outMs = utcMs;
+        if (outGeneration) *outGeneration = generation;
+    }
+    if (expired) {
+        Log_Append("clock: trust OK \xe2\x86\x92"
+                   " INOP (trusted display lease expired)");
+    }
     return ok;
+}
+
+int Clock_NowUtcMs(int64_t *outMs) {
+    return Clock_ReadDisplayTime(outMs, NULL);
+}
+
+int Clock_DisplayGenerationIsCurrent(uint64_t generation) {
+    if (!g_csInit || generation == 0) return 0;
+    int64_t nowQpc = Clock_Qpc();
+    int expired = 0;
+    EnterCriticalSection(&g_cs);
+    if (Clock_DisplayLeaseExpiredLocked(nowQpc)) {
+        Clock_TripInopLocked();
+        expired = 1;
+    }
+    int ok = g_haveSample && g_trust != TRUST_INOP &&
+             g_displayGeneration == generation;
+    LeaveCriticalSection(&g_cs);
+    if (expired) {
+        Log_Append("clock: trust OK \xe2\x86\x92"
+                   " INOP (trusted display lease expired)");
+    }
+    return ok;
+}
+
+int Clock_BeginDisplayCommit(uint64_t generation) {
+    if (!g_csInit || generation == 0) return 0;
+    int64_t nowQpc = Clock_Qpc();
+    int expired = 0;
+    EnterCriticalSection(&g_cs);
+    if (Clock_DisplayLeaseExpiredLocked(nowQpc)) {
+        Clock_TripInopLocked();
+        expired = 1;
+    }
+    int ok = g_haveSample && g_trust != TRUST_INOP &&
+             g_displayGeneration == generation;
+    if (!ok) {
+        LeaveCriticalSection(&g_cs);
+        if (expired) {
+            Log_Append("clock: trust OK \xe2\x86\x92"
+                       " INOP (trusted display lease expired)");
+        }
+        return 0;
+    }
+    return 1;
+}
+
+void Clock_EndDisplayCommit(void) {
+    if (g_csInit) LeaveCriticalSection(&g_cs);
 }
 
 int Clock_IsDisciplined(void) { return g_haveSample ? 1 : 0; }
@@ -250,7 +307,6 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
     enum { EV_FIRST, EV_FIRST_STALE, EV_SUBSEQ } ev = EV_SUBSEQ;
     int32_t oldRate = 0, newRate = 0;
     int64_t errorMs = 0;
-    int     didSnap = 0;
     int     rateMeasured = 0;       // did this cycle refresh the rate?
     int64_t staleAgeDays = 0;       // only meaningful when ev==EV_FIRST_STALE
 
@@ -282,14 +338,11 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
         g_haveRate      = (g_loadedRatePpm != 0) ? 1 : 0;
         g_lastSyncUtcMs = ntpUtcMs;
         g_lastSyncQpc   = localQpc;
-        g_slewTotalMs   = 0;
-        g_slewDurationMs = 0;
         newRate = g_ratePpm;
     } else {
         // Subsequent sync. Measure clean drift error relative to the
-        // anchor-only projection (no cosmetic slew component) so the
-        // residual reflects true oscillator drift, not the visual
-        // decay still in flight from the previous cycle.
+        // anchor projection so the residual reflects true oscillator
+        // drift.
         int64_t dQ = localQpc - g_anchorQpc;
         int64_t dMs_base = (dQ >= 0)
             ? (dQ * 1000LL + g_qpcFreq / 2) / g_qpcFreq
@@ -299,11 +352,6 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
         int64_t error          = ntpUtcMs - projectionPure;    // >0: we're behind
         errorMs = error;
         oldRate = g_ratePpm;
-
-        // What the user is currently SEEING (anchor projection plus any
-        // still-decaying cosmetic slew). We use this only to set up the
-        // next cosmetic slew so the transition is seamless.
-        int64_t displayedNow = ProjectLocked(localQpc);
 
         // PI rate update: integral term on residual-rate.
         int64_t dqpc   = localQpc - g_lastSyncQpc;
@@ -333,28 +381,15 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
         // measurements are clean.
         g_anchorQpc   = localQpc;
         g_anchorUtcMs = ntpUtcMs;
-
-        if (error > SLEW_THRESHOLD_MS || error < -SLEW_THRESHOLD_MS) {
-            // Big jump (sleep-wake, user changed clock, bad bootstrap
-            // replaced by first good sync). No cosmetic smoothing --
-            // smoothing a 2+ s error would be worse than the jump.
-            g_slewTotalMs    = 0;
-            g_slewDurationMs = 0;
-            didSnap = 1;
-        } else {
-            // Small error: install a cosmetic visual slew so the display
-            // does not jump at the moment of re-anchor. The slew starts
-            // at (displayedNow - ntpUtcMs) and decays linearly to 0 over
-            // SLEW_WINDOW_MS, bringing the user smoothly to the new truth.
-            g_slewStartQpc   = localQpc;
-            g_slewTotalMs    = displayedNow - ntpUtcMs;
-            g_slewDurationMs = SLEW_WINDOW_MS;
-            didSnap = 0;
-        }
+        // Safety display policy: accepted samples snap immediately.
+        // We do not knowingly display a cosmetically-slewed time that
+        // differs from the freshest trusted anchor.
 
         g_lastSyncUtcMs = ntpUtcMs;
         g_lastSyncQpc   = localQpc;
     }
+
+    Clock_GrantDisplayLeaseLocked();
 
     LeaveCriticalSection(&g_cs);
 
@@ -377,7 +412,7 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
                    (long long)staleAgeDays);
         break;
     case EV_SUBSEQ: {
-        const char *adj = didSnap ? "snap" : "slew over 60s";
+        const char *adj = "snap";
         if (rateMeasured) {
             Log_Append("clock: sync \xe2\x80\x94"
                        " residual %+lldms  adj=%s  rate %+d\xe2\x86\x92"
@@ -399,7 +434,7 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
 
 // Called by ntp.c at the end of every polling cycle. The concurrence
 // verdict has already been computed by the caller; this function just
-// either updates the anchor (OK / DEGRADED) or trips INOP and leaves
+// either updates the anchor (OK) or trips INOP and leaves
 // the anchor alone. One extra safety check: even when the caller
 // believes it has a valid sample, we cross-check against our own
 // running projection. If we already have an anchor and the agreed
@@ -418,7 +453,7 @@ void Clock_OnPollCycle(TrustState state,
     if (state == TRUST_INOP) {
         EnterCriticalSection(&g_cs);
         prev = g_trust;
-        g_trust = TRUST_INOP;
+        Clock_TripInopLocked();
         LeaveCriticalSection(&g_cs);
         if (prev != TRUST_INOP) {
             Log_Append("clock: trust OK \xe2\x86\x92"
@@ -467,7 +502,11 @@ void Clock_OnPollCycle(TrustState state,
 
             EnterCriticalSection(&g_cs);
             prev = g_trust;
-            g_trust = state;
+            if (g_trust != state) {
+                g_trust = state;
+                g_displayGeneration++;
+                if (g_displayGeneration == 0) g_displayGeneration = 1;
+            }
             LeaveCriticalSection(&g_cs);
             if (prev != state && state == TRUST_OK) {
                 Log_Append("clock: trust INOP \xe2\x86\x92"
@@ -478,7 +517,7 @@ void Clock_OnPollCycle(TrustState state,
 
         EnterCriticalSection(&g_cs);
         prev = g_trust;
-        g_trust = TRUST_INOP;
+        Clock_TripInopLocked();
         LeaveCriticalSection(&g_cs);
         Log_Append("clock: local-oscillator fault \xe2\x80\x94"
                    " 3/3 servers concurred but our projection differs "
@@ -496,13 +535,17 @@ void Clock_OnPollCycle(TrustState state,
     g_consecutiveLocalFaults = 0;
     LeaveCriticalSection(&g_cs);
 
-    // Accept the sample: run the normal PLL/slew update.
+    // Accept the sample: run the normal PLL update.
     // (Clock_OnSyncedNtpUtc emits its own log line.)
     Clock_OnSyncedNtpUtc(bestUtcMs, bestQpc);
 
     EnterCriticalSection(&g_cs);
     prev = g_trust;
-    g_trust = state;
+    if (g_trust != state) {
+        g_trust = state;
+        g_displayGeneration++;
+        if (g_displayGeneration == 0) g_displayGeneration = 1;
+    }
     LeaveCriticalSection(&g_cs);
     if (prev != state && state == TRUST_OK) {
         Log_Append("clock: trust INOP \xe2\x86\x92"
@@ -510,10 +553,44 @@ void Clock_OnPollCycle(TrustState state,
     }
 }
 
+void Clock_TripInop(const char *reason) {
+    if (!g_csInit) Clock_Init();
+
+    TrustState prev;
+    EnterCriticalSection(&g_cs);
+    prev = g_trust;
+    Clock_TripInopLocked();
+    LeaveCriticalSection(&g_cs);
+
+    if (prev != TRUST_INOP) {
+        Log_Append("clock: trust OK \xe2\x86\x92 INOP (%s)",
+                   (reason && *reason) ? reason : "display safety trip");
+    }
+}
+
 TrustState Clock_Trust(void) {
     if (!g_csInit) return TRUST_INOP;
+    int64_t nowQpc = Clock_Qpc();
+    int expired = 0;
     EnterCriticalSection(&g_cs);
+    if (Clock_DisplayLeaseExpiredLocked(nowQpc)) {
+        Clock_TripInopLocked();
+        expired = 1;
+    }
     TrustState t = g_trust;
     LeaveCriticalSection(&g_cs);
+    if (expired) {
+        Log_Append("clock: trust OK \xe2\x86\x92"
+                   " INOP (trusted display lease expired)");
+    }
     return t;
 }
+
+#ifdef LUNAR_TESTING
+void Clock_TestExpireDisplayLease(void) {
+    if (!g_csInit) Clock_Init();
+    EnterCriticalSection(&g_cs);
+    g_displayLeaseUntilQpc = Clock_Qpc() - 1;
+    LeaveCriticalSection(&g_cs);
+}
+#endif

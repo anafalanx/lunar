@@ -1,6 +1,6 @@
 # Lunar — Deep Evaluation of the Synchronization and Adjustment Mechanism
 
-**Scope.** This document evaluates, but does not change, Lunar's time-sync pipeline (NTP/NTS query → concurrence gate → PLL/slew clockwork → persisted discipline) from three angles: **security**, **guaranteed correctness**, and **availability**. It closes with a prioritized proposal for improvement.
+**Scope.** This document evaluates, but does not change, Lunar's time-sync pipeline (NTP/NTS query → concurrence gate → PLL clockwork → persisted discipline) from three angles: **security**, **guaranteed correctness**, and **availability**. It closes with a prioritized proposal for improvement.
 
 **Reader aid.** Small-print grey boxes interspersed between sections explain abbreviations and background concepts. They can be skipped by readers already familiar with NTP, NTS, PLLs, and Windows timing primitives.
 
@@ -19,10 +19,8 @@
 
 **Sources, per cycle (fired in parallel):**
 
-- Slot 0 — **NIST** (time.nist.gov, USA) — plain SNTPv4 over UDP/123, no authentication
-- Slot 1 — **PTB** (ptbtime1.ptb.de, Germany) — same
-- Slot 2 — **NICT** (ntp.nict.jp, Japan) — same
-- Slot 3 — **NTS** (rotating) — TLS-1.3 + SPKI-pinned key-establishment, then authenticated SNTP; provider picked randomly per cycle from a small pool
+- Slots 0-3 — four **core SNTPv4** sources over UDP/123, randomly drawn from a curated pool of national-metrology / research-lab servers; each slot gets one same-cycle replacement attempt if its first server fails
+- Slots 4-5 — two **NTS-authenticated** sources, randomly drawn from the NTS provider metadata pool with a preference for distinct operator families; each slot performs TLS-1.3 + ALPN `ntske/1` key establishment, authenticates through a local enrolled SPKI pin or Windows CA enrollment/renewal, and then performs authenticated SNTP, with one same-cycle replacement provider if its first provider fails
 
 <details>
 <summary><sub><i>Primer 1 — NTP, SNTP, NTS, SPKI, KE</i></sub></summary>
@@ -33,26 +31,26 @@
 
 <sub><b>NTS</b> (Network Time Security, RFC 8915). Cryptographic wrapper around NTP. A one-time <b>Key Establishment</b> (KE) handshake over TLS 1.3 gives the client cookies and keys; subsequent UDP time packets are authenticated with AEAD (<i>Authenticated Encryption with Associated Data</i>) so an on-path attacker cannot forge or tamper with them.</sub>
 
-<sub><b>SPKI pinning</b> (Subject Public Key Info). Instead of trusting the full web-PKI certificate chain, we hardcode the expected hash of the server's public key. Catches compromised CAs (Certificate Authorities) and mis-issuance.</sub>
+<sub><b>SPKI pinning</b> (Subject Public Key Info). Lunar stores the SHA-256 hash of an endpoint's certificate public key after Windows CA enrollment/renewal. Ordinary operation uses that local continuity pin; renewal re-enters the Windows/Web PKI.</sub>
 
 <sub><b>UDP port 123</b> is the standard NTP port; firewalls and captive portals frequently block or rewrite it.</sub>
 
 </details>
 
-**Trust gate.** NTS must succeed, AND ≥ 2 of 3 core sources must project to within ±200 ms of the NTS anchor on a common QPC moment. Otherwise `TRUST_INOP` — `Clock_NowUtcMs()` refuses to return a time and the UI renders red INOP.
+**Trust gate.** Both NTS slots must succeed, both must be authenticated by enrolled pins, they must come from different operator families, and they must mutually agree within ±200 ms. At least 3 of 4 core sources must project to within ±200 ms of the NTS midpoint on a common QPC moment. Otherwise `TRUST_INOP` — `Clock_NowUtcMs()` refuses to return a time and the UI renders red INOP.
 
-**Anchor.** On an `OK` cycle: `(qpcAtT4, ntpUtcMs)` taken verbatim from the NTS sample.
+**Anchor.** On an `OK` cycle: the midpoint of the two agreeing operator-diverse NTS samples, projected to the selected QPC moment.
 
-**Rate discipline.** Per-cycle observed ppm over the inter-sync interval, clamped to ±500 ppm (single-cycle target up to ±2000 ppm before clamp), EMA α = 0.25, persisted to `%APPDATA%\Lunar\discipline.dat` at shutdown, reloaded as bootstrap, rejected at > 30 days against *disciplined* UTC.
+**Rate discipline.** PI-style per-cycle rate correction with a ±20 ppm per-cycle delta clamp and ±200 ppm absolute clamp, persisted to `%APPDATA%\Lunar\discipline.dat` at shutdown, reloaded as bootstrap, rejected at > 30 days against *disciplined* UTC.
 
-**Residual handling.** |residual| ≤ 2 s → slew linearly over 60 s; > 2 s → instant snap (anchor rebase).
+**Residual handling.** Accepted residuals snap immediately to the newest trusted anchor. Lunar no longer displays cosmetically-slewed time; if the clock cannot present a freshly trusted value, it renders INOP.
 
 **Cadence.** 60 s on `TRUST_OK`, 5 s on `TRUST_INOP`.
 
 **Safeguards.** SNTP response header validation (LI / VN / mode / stratum 1–15); cross-check that a claimed-OK cycle matches the running projection within 200 ms — else "local-oscillator fault" → INOP.
 
 <details>
-<summary><sub><i>Primer 2 — QPC, UTC, PLL, EMA, ppm, anchor, slew, snap</i></sub></summary>
+<summary><sub><i>Primer 2 — QPC, UTC, PLL, EMA, ppm, anchor, display lease, snap</i></sub></summary>
 
 <sub><b>QPC</b> (<i>QueryPerformanceCounter</i>). Windows' monotonic hardware tick counter. It never moves backwards, it does not change if the user edits the wall clock, it runs at a fixed frequency (typically 10 MHz). Lunar uses QPC for <i>all</i> local timing and only ever uses server replies for <i>UTC</i>.</sub>
 
@@ -66,7 +64,7 @@
 
 <sub><b>Anchor</b>. A pair <code>(qpc, utc)</code> that pins "this QPC moment corresponded to this UTC". Projecting forward uses <code>utc + (qpc_now − qpc_anchor) · (1 + ppm/1e6)</code>.</sub>
 
-<sub><b>Slew</b> vs <b>snap</b>. <i>Slew</i> = apply a small correction gradually over a window so the second hand stays smooth. <i>Snap</i> = rebase the anchor instantly, which makes the clock jump but is the only sane option for large errors (sleep/wake, first good sync after a bad bootstrap).</sub>
+<sub><b>Display lease</b> and <b>snap</b>. A trusted poll grants a short lease during which the dial may render from the disciplined anchor. If the lease expires before another trusted poll renews it, the UI renders INOP. <i>Snap</i> = rebase the anchor instantly to the accepted trusted sample; Lunar favors correctness over smoothing.</sub>
 
 <sub><b>INOP</b> (inoperative). Aviation-inspired term: when the instrument cannot guarantee correct data, it says so instead of guessing. Lunar renders a red "INOP" state rather than display an untrusted time.</sub>
 
@@ -94,10 +92,10 @@ Protected against: passive on-path observer, single-ISP hijack of UDP/123, DNS p
 ### Weaknesses
 
 **S1. NTS is a single point of cryptographic trust — silently.**
-If the NTS slot fails for any reason (KE timeout, pin mismatch, provider outage), the gate goes INOP. Correct fail-safe, but an adversary who can selectively block TLS to *all* NTS providers while letting UDP/123 through keeps the clock indefinitely INOP — a **denial-of-availability attack via the security layer**. There is no "NTS-disabled, degraded-trust fallback" — INOP is permanent until NTS recovers.
+NTS remains the cryptographic trust anchor. The current gate requires two independent NTS slots from different operator families. If an adversary can selectively block TLS to enough NTS providers while letting UDP/123 through, the clock still goes INOP — a **denial-of-availability attack via the security layer**. There is no "NTS-disabled, degraded-trust fallback".
 
-**S2. Core sources use hardcoded hostnames, no DNSSEC.**
-A resolver-level attacker can return any IP. They can't forge agreement with NTS (defeated at the concurrence gate) but they *can* deny a core source (drop / RST) or flood with garbage to consume the slot's socket budget. Combined with mild NTS degradation, this widens the DoS attack surface.
+**S2. Core source resolution depends on pinned DoH availability.**
+Plain DNS is never used, so a UDP/53 resolver-level attacker cannot redirect core SNTP traffic. A network that blocks or degrades all pinned DoH resolvers can still deny source resolution; Lunar fails closed rather than falling back to spoofable DNS.
 
 <details>
 <summary><sub><i>Primer 4 — DNS, DNSSEC, RST, rate-limiting</i></sub></summary>
@@ -116,7 +114,7 @@ A resolver-level attacker can return any IP. They can't forge agreement with NTS
 If one pinned provider serves stale or bad data (compromised or misconfigured), it gets picked ~1/N of cycles. There is no penalty or blacklist for a pin that recently produced an outlier tripping the local-oscillator fault check. One bad provider keeps cycling in.
 
 **S4. The 200 ms local-oscillator fault check is symmetric with the concurrence threshold.**
-This is elegant — but it means an attacker who can induce a ~150 ms NTS offset (within gate) that is *consistent* with two hijacked core sources will succeed. The gate is "≥ 2 core agree with NTS within 200 ms", not "…within a **tighter** bound that would require defeating cryptography". Because NTS is authenticated, in practice the threat is provider compromise; but the gate architecture does not distinguish "all four sources agree to 20 ms" (high confidence) from "scraped agreement at 199 ms" (suspicious).
+This is elegant — but it means an attacker who can induce a ~150 ms authenticated NTS midpoint offset (within gate) that is consistent with the required core quorum can succeed. The current gate is "two operator-diverse NTS sources agree and ≥ 3 of 4 core sources agree with the NTS midpoint within 200 ms". Because NTS is authenticated, in practice the threat is provider compromise; but the gate architecture still does not distinguish "all sources agree to 20 ms" (high confidence) from "scraped agreement at 199 ms" (suspicious).
 
 **S5. Persisted rate file is unauthenticated.**
 `%APPDATA%\Lunar\discipline.dat` is plain ASCII `"<ppm> <lastSyncUtcMs>\n"`. A local attacker (or ransomware) that can write `AppData` can inject ±500 ppm which will be applied as bootstrap until the first sync re-verifies it. Window: up to ~6 seconds of wrong rate on first-anchor acquisition, which then snaps. Low impact, but the invariant "this is a safety clock" argues for at least a MAC or checksum.
@@ -162,7 +160,7 @@ We rely fully on the TLS 1.3 client-hello entropy + NTS cookie for replay protec
 
 </details>
 
-**C1. First-anchor trust escape.** On the very first OK cycle we accept `(ntpUtcMs, qpcAtT4)` verbatim — no consistency cross-check is possible because there is no prior anchor. Combined with a stale persisted rate (up to +57 ppm observed in the live log), the first ~10 seconds of displayed time can be off by "rate × interval since anchor" before the cycle-2 slew corrects it. For a safety-critical clock this is a visible defect: the moment the user opens the app is the moment the clock is least trustworthy.
+**C1. First-anchor trust escape.** On the very first OK cycle we accept `(ntpUtcMs, qpcAtT4)` verbatim — no consistency cross-check is possible because there is no prior anchor. Combined with a stale persisted rate (up to +57 ppm observed in the live log), the displayed time can be off by "rate × interval since anchor" until the next trusted cycle snaps the anchor and re-measures rate. For a safety-critical clock this is a visible defect: the moment the user opens the app is the moment the clock is least trustworthy.
 
 **C2. RTT asymmetry assumption.** `ntpUtcMs = t3 + netRtt/2`. Asymmetric routing makes the error up to netRtt/2 — for NICT (Tokyo, rtt ≈ 300 ms) that is ±150 ms worst case. The 200 ms gate barely covers this; we observe 14 ms spread in happy-path, but on a bad day NICT alone could push us over the gate, forcing INOP.
 
@@ -183,11 +181,11 @@ We rely fully on the TLS 1.3 client-hello entropy + NTS cookie for replay protec
 
 </details>
 
-**C4. Slew is linear; clocks run smooth but non-monotonic.** If a new slew overrides an in-progress slew, the displayed time can briefly go *backward*. Slew-over-slew should either (a) complete the old slew into the anchor first, then start the new one, or (b) superimpose slews. Today neither happens — the old slew is discarded mid-flight, leaving a small residual that the next sync rediscovers.
+**C4. Display snaps instead of slewing.** Lunar now favors fail-closed correctness over smooth hand motion: accepted samples snap immediately, and stale display leases render INOP. The remaining trade-off is visual abruptness, not knowingly displaying a smoothed value that differs from the freshest trusted anchor.
 
-**C5. No sanity bound on anchor jump.** An NTS provider returning 2020 would be accepted without cross-check against the previous anchor. The 200 ms concurrence gate requires *core* agreement, so in practice this is caught — but if 2-of-3 core sources also return 2020 (hypothetical coordinated attack or cached resolver result) we snap to 2020 silently. A monotonic bound "new anchor cannot predate the last OK anchor by more than (elapsed_qpc + 60 s slack)" would catch this class deterministically.
+**C5. No sanity bound on anchor jump.** NTS providers returning 2020 would be accepted without cross-check against the previous anchor if both operator-diverse NTS samples and enough core sources agree. A monotonic bound "new anchor cannot predate the last OK anchor by more than (elapsed_qpc + 60 s slack)" would catch this class deterministically.
 
-**C6. Rate clamp is rectangular.** Real crystal oscillators drift on the order of ±50 ppm; ±500 ppm is 10× observed. A rate target beyond ±100 ppm is almost certainly an error (bad sync pair, sleep-wake with stale QPC, malicious sample). The clamp should be narrower by default and widen only on confirmed sustained drift.
+**C6. Rate clamp is rectangular.** Real crystal oscillators drift on the order of ±50 ppm; Lunar now uses a ±200 ppm absolute clamp and ±20 ppm per-cycle clamp. A rate target beyond ±100 ppm is still suspicious enough that future work could add stateful widening only on confirmed sustained drift.
 
 **C7. No test coverage of the adjustment math under adversarial inputs.** Tests verify the concurrence gate and projection arithmetic, but no test feeds `Clock_OnSyncedNtpUtc` a time series with injected jitter / bias / jumps and asserts stability. For a safety clock this is the single biggest gap.
 
@@ -208,9 +206,9 @@ We rely fully on the TLS 1.3 client-hello entropy + NTS cookie for replay protec
 
 </details>
 
-**A1. Hard dependency on NTS availability.** See S1. Real-world NTS providers (Cloudflare, Netnod, SIDN, PTB, NetTime) have had multi-hour outages; a coincident outage of two providers within our small pool puts us permanently INOP despite three healthy NIST/PTB/NICT sources.
+**A1. Hard dependency on NTS availability.** See S1. Real-world NTS providers (Cloudflare, Netnod, SIDN, PTB, NetTime) have had multi-hour outages; a broad outage across the NTS provider pool puts Lunar INOP despite healthy core SNTP sources.
 
-**A2. Aggregator wait is `WaitForMultipleObjects(..., TRUE, 20000)`.** If ANY worker thread is stuck (e.g. a socket call not honoring its timeout due to a Winsock driver bug) the entire cycle blocks for 20 s before the others are harvested. Core workers already completed in ~300 ms sit idle. Fix: wait with `WAIT_ALL=FALSE` and poll, or wait per-source with individual deadlines.
+**A2. Aggregator wait is bounded and shutdown-aware.** Worker contexts are refcounted, overdue workers can be detached after the cycle budget, and shutdown wakes the aggregator in short slices. Residual risk is now limited to detached workers that the process must reclaim on exit if the platform network stack wedges below the socket timeout layer.
 
 **A3. 5 s cadence during INOP can DoS the providers.** If NIST and NICT are both degraded, we hammer them every 5 s forever. Friendly to us (fast recovery) but hostile to public infrastructure and may earn rate-limiting, prolonging INOP. Recommendation: exponential back-off on INOP (5 → 10 → 20 → 60 s cap), reset to 5 s on first OK.
 
@@ -240,7 +238,7 @@ We rely fully on the TLS 1.3 client-hello entropy + NTS cookie for replay protec
 
 4. **Disk integrity on `discipline.dat`** (S5). Wrap the file in DPAPI (`CryptProtectData`). Reject tampered files, fall back to 0-ppm bootstrap, log.
 
-5. **Slew superposition** (C4). When a new residual arrives during an active slew, fold the remaining residual of the old slew into the anchor first, then start the new slew. Guarantees the displayed clock is monotonic within the slew window.
+5. **Display freshness hardening** (C4). Keep the display lease short, trip INOP on UI timer/resume gaps, and keep render fallbacks that paint INOP if the normal Direct2D path cannot present a fresh dial.
 
 6. **Adversarial-input test suite** (C7). Table-driven tests that feed `Clock_OnSyncedNtpUtc` crafted sequences: steady drift, step change, sleep-wake (QPC gap), alternating-bias attack, slow bias-drift attack. Assert: monotonicity, convergence, bounded rate excursion, no snap-storm.
 

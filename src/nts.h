@@ -1,4 +1,4 @@
-// nts.h -- NTS-KE transport (TLS 1.3 + ALPN + SPKI pinning).
+// nts.h -- NTS-KE transport (TLS 1.3 + ALPN + enrolled SPKI pins).
 //
 // This is the online half of NTS (RFC 8915): it performs the TCP
 // handshake, the TLS 1.3 handshake, the NTS-KE record exchange, and
@@ -6,20 +6,11 @@
 // and the pure AEAD codec (siv.c + nts_ef.c) are composed here, but
 // those modules remain unit-testable in isolation.
 //
-// Authentication model: SPKI pinning.
-//
-//   We do NOT validate the server's certificate chain against a
-//   bundled CA list. Instead every NtsProvider in the shipped pool
-//   has an embedded 32-byte SHA-256 pin of the leaf certificate's
-//   SubjectPublicKeyInfo (DER form). After the TLS handshake
-//   completes, the peer certificate is parsed and the SHA-256 of its
-//   pk_raw is compared to the pinned value in constant time. On
-//   mismatch the connection is torn down and the exchange fails.
-//
-//   A provider whose spki_pin is all zero is considered "not pinned"
-//   and is silently skipped by Nts_PickProvider(). Shipped with all-
-//   zero pins until the operator runs scripts/fetch_nts_spki_pins.py
-//   to populate real values.
+// Authentication model: first-run CA enrollment, then local SPKI pins.
+// Lunar ships endpoint metadata but no provider cryptographic material.
+// On first use / renewal, the endpoint is validated through the Windows
+// Web PKI, its leaf SPKI is captured into the protected local pin store,
+// and ordinary operation uses that local SPKI pin until renewal time.
 
 #ifndef LUNAR_NTS_H
 #define LUNAR_NTS_H
@@ -38,7 +29,7 @@ typedef struct {
     const char *host;              // e.g. "time.cloudflare.com"
     uint16_t    port;              // 0 => 4460 (the IANA NTS-KE port)
     const char *label;             // short log label
-    uint8_t     spki_pin[32];      // SHA-256 of leaf cert's SPKI; zero = disabled
+    const char *operator_family;   // independent operator grouping
 } NtsProvider;
 
 // Result of a completed NTS-KE exchange. Fields are only meaningful
@@ -55,27 +46,22 @@ typedef struct {
     uint16_t ntp_port;                                // 0 => 123
 } NtsKeResult;
 
-// Returns a pointer to the shipped provider pool and its length.
-// Entries whose spki_pin is all zeros are considered disabled and
-// will never be returned by Nts_PickProvider().
+// Returns a pointer to the shipped provider metadata pool and its length.
 const NtsProvider *Nts_Pool(size_t *out_len);
 
-// Random pool selection using BCryptGenRandom for uniform selection
-// among enabled (pinned) providers. Returns NULL if no providers are
-// enabled (i.e. pins haven't been populated yet).
+// Random pool selection using BCryptGenRandom for uniform selection.
 const NtsProvider *Nts_PickProvider(void);
 
-// Pick `n_want` DISTINCT providers at random (uniform over enabled
-// pool). Writes pointers into out[0 .. n-1] and returns the number
-// actually picked; this is min(n_want, pool_size). Providers that
-// have no SPKI pin populated are silently excluded. Returns 0 if no
-// providers are enabled. Intended for multi-slot NTS polling where
-// the caller wants geographic / operator diversity within one cycle.
+// Pick `n_want` DISTINCT providers at random. The picker prefers
+// distinct operator families first, then fills any remaining slots from
+// the rest of the pool. Intended for multi-slot NTS polling where the
+// caller wants operator diversity within one cycle.
 size_t Nts_PickProviders(const NtsProvider **out, size_t n_want);
 
 // Perform a full NTS-KE exchange:
-//   TCP connect -> TLS 1.3 handshake (ALPN "ntske/1") -> SPKI pin
-//   check -> NTS-KE records -> TLS exporter -> graceful close.
+//   TCP connect -> TLS 1.3 handshake (ALPN "ntske/1") -> local SPKI
+//   pin match or Windows CA enrollment -> NTS-KE records -> TLS
+//   exporter -> graceful close.
 //
 // Returns 0 on success (out->ok == 1); non-zero on any failure,
 // including SPKI pin mismatch, ALPN mismatch, server error record,

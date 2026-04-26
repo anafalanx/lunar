@@ -1,13 +1,15 @@
 // ntp.h -- Parallel SNTP + NTS client.
 //
-// Per cycle we query SIX sources in parallel: FOUR unauthenticated
-// stratum-1 SNTP sources drawn at random from a curated pool of
-// national metrology / research-lab time servers, PLUS TWO NTS-
-// authenticated SNTP sources drawn from a pinned NTS provider pool
-// (see src/nts.c). Results are aggregated into a single trust verdict
-// via Ntp_Concur. Both NTS anchors must succeed and mutually agree,
-// and at least 3 of the 4 core sources must concur with them, for the
-// cycle to produce TRUST_OK.
+// Per cycle we fill SIX result slots in parallel: FOUR unauthenticated
+// stratum-1 SNTP slots drawn at random from a curated pool of national
+// metrology / research-lab time servers, PLUS TWO NTS-authenticated
+// SNTP slots drawn from an NTS provider metadata pool (see src/nts.c).
+// If a slot's primary server fails to respond, the worker immediately
+// tries a distinct replacement inside the same cycle. Results are
+// aggregated into a single trust verdict via Ntp_Concur. Both NTS
+// anchors must succeed, come from different operator families, and
+// mutually agree; at least 3 of the 4 core sources must also concur
+// for the cycle to produce TRUST_OK.
 #ifndef LUNAR_NTP_H
 #define LUNAR_NTP_H
 
@@ -28,6 +30,12 @@ extern "C" {
 #define NTP_NTS_COUNT         2
 #define NTP_FIRST_NTS_SLOT    NTP_CORE_COUNT   /* = 4 */
 
+typedef enum {
+    NTP_AUTH_NONE = 0,
+    NTP_AUTH_PLAIN_SNTP = 1,
+    NTP_AUTH_ENROLLED_PIN = 2,
+} NtpAuthMode;
+
 // One source's outcome from the most recent polling cycle. `label` is
 // a short static string ("NIST" / "PTB" / ... / "NTS:<provider>")
 // owned by ntp.c. When ok==0 every other field is meaningless.
@@ -38,14 +46,19 @@ typedef struct {
     int64_t     qpcAtT4;     // QPC tick at t4 (reply received)
     uint32_t    rttMs;       // round-trip time in ms
     const char *label;       // short source name, e.g. "NIST"
+    NtpAuthMode authMode;    // plain SNTP or enrolled NTS pin
+    const char *operatorFamily;
 } NtpSourceResult;
 
 // Kick off one parallel polling cycle against all sources. Safe to call
 // at any time; no-ops if a cycle is already in flight.
 void    Ntp_Start(void);
 
+// Stop accepting new cycles and wait briefly for the current aggregator
+// and any detached workers to finish before process shutdown.
+void    Ntp_Shutdown(void);
+
 // True iff the clockwork has been anchored within the fresh window.
-// Unchanged contract from the 3-source era.
 int     Ntp_IsSynced(void);
 
 // Legacy accessors: the offset and wall-clock UTC of the most recent
@@ -71,19 +84,14 @@ int     Ntp_GetResults(NtpSourceResult out[NTP_SOURCE_COUNT]);
 // Verdict rules (binary; no degraded middle ground). The NTS slots
 // are the trust anchor; the core sources corroborate.
 //
-//   Both NTS slots ok AND they mutually agree to within 200 ms
-//     (projected to a common QPC) AND >= 3 of 4 core sources agree
-//     with the NTS midpoint to within 200 ms        -> TRUST_OK,
+//   Both NTS slots ok, both authenticated by enrolled pins, and they
+//     come from different operator families AND mutually agree to within
+//     200 ms (projected to a common QPC) AND >= 3 of 4 core sources
+//     agree with the NTS midpoint to within 200 ms -> TRUST_OK,
 //     anchor = midpoint of the two NTS samples.
 //
-//   Exactly one NTS slot ok AND ALL FOUR core sources agree with it
-//     to within 200 ms                              -> TRUST_OK,
-//     anchor = the surviving NTS sample. This is a strict fallback
-//     so that a single-NTS-outage cycle can still discipline the
-//     clock, but only when the core trio-plus-one unanimously
-//     corroborates the authenticated reading.
-//
-//   Both NTS slots fail                             -> TRUST_INOP
+//   Fewer than two NTS slots ok                     -> TRUST_INOP
+//   NTS slots use same operator family              -> TRUST_INOP
 //   NTS slots disagree by > 200 ms                  -> TRUST_INOP
 //   Too few core sources concur with the NTS anchor -> TRUST_INOP
 //

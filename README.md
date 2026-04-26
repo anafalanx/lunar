@@ -50,8 +50,11 @@ fully static (libgcc/libstdc++ linked in, mbedTLS archived in).
   rendered with **DirectWrite**.
 - Menus live entirely in the window's system menu (click the icon in
   the title bar, or right-click the title bar).
-- Time is disciplined against NIST/PTB/NICT (SNTPv4) and an NTS anchor
-  (RFC 8915, TLS 1.3, SPKI-pinned), with a 2-of-3 concurrence gate.
+- Time is disciplined by six parallel sources: four plain-SNTP
+  national-metrology / research-lab servers and two NTS-authenticated
+  anchors (RFC 8915, TLS 1.3, local enrolled SPKI pins). The trust gate
+  requires two operator-diverse NTS anchors to agree and at least 3 of 4
+  core sources to concur.
 - Time zones come from an IANA tzdata snapshot embedded at build time;
   the OS time-zone API is never consulted.
 - Runtime dependencies: only OS-shipped DLLs (`d2d1`, `dwrite`,

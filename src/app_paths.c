@@ -1,0 +1,50 @@
+// app_paths.c -- shared application path helpers.
+
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+#include <stdio.h>
+
+#include "app_paths.h"
+
+int Lunar_AppDataPathW(wchar_t *out, size_t out_len,
+                       const wchar_t *leaf_name)
+{
+    if (!out || out_len == 0) return 0;
+    out[0] = 0;
+
+    wchar_t appdata[MAX_PATH] = { 0 };
+    DWORD got = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
+    if (got == 0 || got >= MAX_PATH) return 0;
+
+    wchar_t dir[MAX_PATH] = { 0 };
+    if (_snwprintf_s(dir, MAX_PATH, _TRUNCATE, L"%ls\\Lunar", appdata) < 0) {
+        return 0;
+    }
+
+    DWORD attr = GetFileAttributesW(dir);
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+        if (!CreateDirectoryW(dir, NULL)) {
+            if (GetLastError() != ERROR_ALREADY_EXISTS) return 0;
+            attr = GetFileAttributesW(dir);
+            if (attr == INVALID_FILE_ATTRIBUTES ||
+                (attr & FILE_ATTRIBUTE_DIRECTORY) == 0) return 0;
+        }
+    } else if ((attr & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+        return 0;
+    }
+
+    if (!leaf_name || !*leaf_name) {
+        if (_snwprintf_s(out, out_len, _TRUNCATE, L"%ls", dir) < 0) {
+            out[0] = 0;
+            return 0;
+        }
+        return 1;
+    }
+
+    if (_snwprintf_s(out, out_len, _TRUNCATE, L"%ls\\%ls", dir, leaf_name) < 0) {
+        out[0] = 0;
+        return 0;
+    }
+    return 1;
+}

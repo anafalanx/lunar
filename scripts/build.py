@@ -28,7 +28,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "src"
 BUILD = ROOT / "build"
-UCRT_BIN = Path(r"C:\msys64\ucrt64\bin")
+DEFAULT_MSYS2_DIR = Path(r"C:\msys64")
 
 # Vendored mbedTLS 3.6.6 LTS. Produced from an upstream tarball whose
 # SHA-256 we checked against the release page before committing the
@@ -56,18 +56,42 @@ def run(*args: str | os.PathLike) -> None:
         die(f"command failed (exit {rc}): {cmd[0]}")
 
 
+def _msys2_ucrt_bin(msys2_dir: Path) -> Path:
+    return msys2_dir / "ucrt64" / "bin"
+
+
+def _prepend_path(path: Path) -> None:
+    os.environ["PATH"] = f"{path};{os.environ.get('PATH', '')}"
+
+
 def find_tool(name: str) -> Path:
-    """Locate a tool on PATH or in the MSYS2 UCRT64 bin dir."""
+    """Locate a tool on PATH, MSYS2_DIR, or the default MSYS2 UCRT64 bin dir."""
     found = shutil.which(name)
     if found:
         return Path(found)
-    for ext in (".exe", ""):
-        candidate = UCRT_BIN / f"{name}{ext}"
-        if candidate.is_file():
-            # Prepend UCRT bin so child processes can find it too.
-            os.environ["PATH"] = f"{UCRT_BIN};{os.environ.get('PATH', '')}"
-            return candidate
-    die(f"{name} not found on PATH or in {UCRT_BIN}")
+
+    bins: list[tuple[str, Path]] = []
+    override = os.environ.get("MSYS2_DIR")
+    if override:
+        bins.append(("MSYS2_DIR", _msys2_ucrt_bin(Path(override).expanduser())))
+    bins.append(("default", _msys2_ucrt_bin(DEFAULT_MSYS2_DIR)))
+
+    checked: list[str] = []
+    seen: set[Path] = set()
+    for label, bin_dir in bins:
+        bin_dir = bin_dir.resolve(strict=False)
+        if bin_dir in seen:
+            continue
+        seen.add(bin_dir)
+        checked.append(f"{label} {bin_dir}")
+        for ext in (".exe", ""):
+            candidate = bin_dir / f"{name}{ext}"
+            if candidate.is_file():
+                # Prepend UCRT bin so child processes can find sibling tools too.
+                _prepend_path(bin_dir)
+                return candidate
+
+    die(f"{name} not found on PATH, MSYS2_DIR, or fallback ({'; '.join(checked)})")
     raise SystemExit  # unreachable; keeps type checkers happy
 
 
@@ -260,6 +284,7 @@ def main() -> None:
         "-DMBEDTLS_CONFIG_FILE=<lunar_mbedtls_config.h>",
         "-o", str(exe),
         str(SRC / "lunar.c"),
+        str(SRC / "app_paths.c"),
         str(SRC / "sysvol.c"),
         str(SRC / "ntp.c"),
         str(SRC / "clock.c"),
@@ -270,6 +295,9 @@ def main() -> None:
         str(SRC / "siv.c"),
         str(SRC / "nts_ke.c"),
         str(SRC / "nts_ef.c"),
+        str(SRC / "pinned_tls.c"),
+        str(SRC / "cert_verify_win.c"),
+        str(SRC / "pin_store.c"),
         str(SRC / "nts.c"),
         str(SRC / "dns.c"),
         str(res),
@@ -280,10 +308,11 @@ def main() -> None:
         # Direct2D + DirectWrite for rendering; winmm for PlaySound;
         # ole32 for COM plumbing that sysvol.c and D2D rely on;
         # ws2_32 for SNTP; uxtheme for native title-bar theming;
-        # advapi32 for mbedTLS's entropy source (CryptGenRandom).
+        # advapi32 for mbedTLS's entropy source (CryptGenRandom) and
+        # crypt32 for Windows certificate-chain validation / DPAPI.
         "-ld2d1", "-ldwrite", "-lwinmm",
         "-luser32", "-lkernel32", "-lgdi32", "-lcomctl32", "-lshell32",
-        "-luxtheme", "-lole32", "-lws2_32", "-ldwmapi", "-ladvapi32",
+        "-luxtheme", "-lole32", "-lws2_32", "-ldwmapi", "-ladvapi32", "-lcrypt32",
         "-lbcrypt",
     )
     log(f"{exe}  ({exe.stat().st_size / 1048576:.2f} MB)")

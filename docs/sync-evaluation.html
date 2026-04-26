@@ -244,10 +244,8 @@
 
 <h3>Sources, per cycle (fired in parallel)</h3>
 <ul>
-  <li>Slot 0 — <strong>NIST</strong> (time.nist.gov, USA) — plain SNTPv4 over UDP/123, no authentication</li>
-  <li>Slot 1 — <strong>PTB</strong> (ptbtime1.ptb.de, Germany) — same</li>
-  <li>Slot 2 — <strong>NICT</strong> (ntp.nict.jp, Japan) — same</li>
-  <li>Slot 3 — <strong>NTS</strong> (rotating) — TLS-1.3 + SPKI-pinned key establishment, then authenticated SNTP; provider picked randomly per cycle from a small pool</li>
+  <li>Slots 0-3 — four core SNTPv4 sources over UDP/123, randomly drawn from the curated metrology/research pool; each slot gets one same-cycle replacement attempt if its first server fails</li>
+  <li>Slots 4-5 — two NTS-authenticated sources, randomly drawn from the NTS provider metadata pool with a preference for distinct operator families; each slot uses TLS 1.3 + ALPN <code>ntske/1</code>, authenticates through a local enrolled SPKI pin or Windows CA enrollment/renewal, and then performs authenticated SNTP</li>
 </ul>
 
 <aside class="primer">
@@ -260,17 +258,17 @@
     <dt>NTS (RFC 8915)</dt>
     <dd>Network Time Security. A one-time TLS-1.3 <em>key establishment</em> (KE) gives the client cookies/keys; subsequent UDP time packets are authenticated with AEAD so an on-path attacker cannot forge or tamper with them.</dd>
     <dt>SPKI pinning</dt>
-    <dd>Subject Public Key Info. Instead of trusting the whole web-PKI chain, we hardcode the expected hash of the server's public key. Catches compromised CAs and mis-issuance.</dd>
+    <dd>Subject Public Key Info. Lunar stores the SHA-256 hash of an endpoint's certificate public key after Windows CA enrollment/renewal. Ordinary operation uses that local continuity pin; renewal re-enters the Windows/Web PKI.</dd>
     <dt>UDP port 123</dt>
     <dd>Standard NTP port. Firewalls and captive portals frequently block or rewrite it.</dd>
   </dl>
 </aside>
 
 <h3>Trust gate</h3>
-<p>NTS must succeed, <strong>AND</strong> ≥ 2 of 3 core sources must project to within ±200 ms of the NTS anchor on a common QPC moment. Otherwise the verdict is <code>TRUST_INOP</code>, <code>Clock_NowUtcMs()</code> refuses to return a time, and the UI renders red INOP.</p>
+<p>Both NTS slots must succeed, both must be authenticated by enrolled pins, they must come from different operator families, and they must mutually agree within ±200 ms. At least 3 of 4 core sources must project to within ±200 ms of the NTS midpoint on a common QPC moment. Otherwise the verdict is <code>TRUST_INOP</code>, <code>Clock_NowUtcMs()</code> refuses to return a time, and the UI renders red INOP.</p>
 
 <h3>Anchor</h3>
-<p>On an <code>OK</code> cycle: <code>(qpcAtT4, ntpUtcMs)</code> taken verbatim from the NTS sample.</p>
+<p>On an <code>OK</code> cycle: the midpoint of the two agreeing operator-diverse NTS samples, projected to the selected QPC moment.</p>
 
 <h3>Rate discipline</h3>
 <p>Per-cycle observed ppm over the inter-sync interval, clamped to ±500 ppm (single-cycle target up to ±2000 ppm before clamp), EMA α = 0.25, persisted to <code>%APPDATA%\Lunar\discipline.dat</code> at shutdown, reloaded as bootstrap, rejected at &gt; 30 days against <em>disciplined</em> UTC.</p>
