@@ -233,11 +233,14 @@ int Nts_DoKe(const NtsProvider *p, NtsKeResult *out)
         Log_Append("nts: %s first-run enrollment required for %s:%u",
                    p->label, p->host, (unsigned)port);
     } else if (expired) {
-        Log_Append("nts: %s local pin expired (notAfter=%s); CA revalidation required",
-                   p->label, pin.not_after);
+        Log_Append("nts: %s local pin expired; CA revalidation required (valid=%s..%s nextCa=%s)",
+                   p->label, pin.not_before, pin.not_after,
+                   pin.renewal_due[0] ? pin.renewal_due : "unknown");
     } else if (renew_due) {
-        Log_Append("nts: %s scheduled CA renewal due (notAfter=%s, renewalDue=%lld)",
-                   p->label, pin.not_after, (long long)pin.renewal_due_unix);
+        Log_Append("nts: %s scheduled CA renewal due (valid=%s..%s nextCa=%s nextCaUnix=%lld)",
+                   p->label, pin.not_before, pin.not_after,
+                   pin.renewal_due[0] ? pin.renewal_due : "unknown",
+                   (long long)pin.renewal_due_unix);
     }
 
     PinnedTlsOpenResult openInfo;
@@ -245,8 +248,10 @@ int Nts_DoKe(const NtsProvider *p, NtsKeResult *out)
                                (have_pin && !expired) ? pin.spki : NULL,
                                allow_ca, renew_due && !expired, &openInfo) != 0) {
         if (openInfo.pin_mismatched && !allow_ca) {
-            Log_Append("nts: %s pin mismatch before renewal window; endpoint rejected without CA refresh (peer_spki=%s stored_spki=%s)",
-                       p->label, openInfo.peer_spki_hex, pin.spki_hex);
+            Log_Append("nts: %s pin mismatch before renewal window; endpoint rejected without CA refresh (peer_spki=%s stored_spki=%s stored_valid=%s..%s nextCa=%s)",
+                       p->label, openInfo.peer_spki_hex, pin.spki_hex,
+                       pin.not_before, pin.not_after,
+                       pin.renewal_due[0] ? pin.renewal_due : "unknown");
         } else if (openInfo.ca_attempted) {
             Log_Append("nts: %s CA validation rejected host=%s chain=0x%lx policy=0x%lx revocation=%s subject=\"%s\" issuer=\"%s\" spki=%s",
                        p->label, p->host,
@@ -293,8 +298,10 @@ int Nts_DoKe(const NtsProvider *p, NtsKeResult *out)
                                  status);
             }
         } else if (openInfo.pin_matched) {
-            Log_Append("nts: %s local pin match host=%s spki=%s notAfter=%s",
-                       p->label, p->host, pin.spki_hex, pin.not_after);
+            Log_Append("nts: %s local pin match host=%s spki=%s valid=%s..%s nextCa=%s",
+                       p->label, p->host, pin.spki_hex,
+                       pin.not_before, pin.not_after,
+                       pin.renewal_due[0] ? pin.renewal_due : "unknown");
         }
     }
 

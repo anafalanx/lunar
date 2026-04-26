@@ -2068,6 +2068,7 @@ static void test_pin_store_roundtrip(void) {
     CHECK(memcmp(rec.spki, spki, sizeof spki) == 0);
     CHECK_EQ_STR(rec.spki_hex, hex);
     CHECK_EQ_STR(rec.not_after, "2099-01-01T00:00:00Z");
+    CHECK_EQ_STR(rec.renewal_due, "2098-12-02T00:00:00Z");
     CHECK_EQ_STR(rec.last_status, "unit-test");
     CHECK_EQ_INT(PinStore_IsExpired(&rec), 0);
     CHECK_EQ_INT(PinStore_ShouldRenew(&rec), 0);

@@ -23,6 +23,7 @@ typedef struct {
     int64_t  not_before_unix;
     int64_t  not_after_unix;
     int64_t  renewal_due_unix;
+    char     renewal_due[32];
     char     last_status[96];
 } PinRecord;
 

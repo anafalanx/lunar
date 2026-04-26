@@ -83,6 +83,7 @@ If fewer than two operator-diverse NTS samples are available, Lunar stays INOP.
 Lunar logs the enrollment path in detail:
 
 - missing, expired, matching, mismatching, and renewal-due local pin states
+- loaded, saved, and used pin records with recorded validity windows and the next scheduled CA run
 - Windows CA validation attempts and outcome
 - certificate subject, issuer, `notBefore`, `notAfter`, SPKI digest, chain status, policy status, and revocation status
 - DPAPI decrypt/protect failures

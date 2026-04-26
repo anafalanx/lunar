@@ -106,6 +106,48 @@ static int64_t ComputeRenewalDue(int64_t not_before, int64_t not_after)
     return due;
 }
 
+static void FormatUnixUtc(int64_t unix_seconds, char *out, size_t out_len)
+{
+    if (!out || out_len == 0) return;
+    out[0] = 0;
+    if (unix_seconds <= 0) {
+        _snprintf(out, out_len, "unknown");
+        out[out_len - 1] = 0;
+        return;
+    }
+
+    ULARGE_INTEGER u;
+    u.QuadPart = (uint64_t)unix_seconds * 10000000ULL + 116444736000000000ULL;
+    FILETIME ft;
+    ft.dwLowDateTime = u.LowPart;
+    ft.dwHighDateTime = u.HighPart;
+
+    SYSTEMTIME st;
+    if (!FileTimeToSystemTime(&ft, &st)) {
+        _snprintf(out, out_len, "unknown");
+        out[out_len - 1] = 0;
+        return;
+    }
+
+    _snprintf(out, out_len, "%04u-%02u-%02uT%02u:%02u:%02uZ",
+              (unsigned)st.wYear, (unsigned)st.wMonth, (unsigned)st.wDay,
+              (unsigned)st.wHour, (unsigned)st.wMinute, (unsigned)st.wSecond);
+    out[out_len - 1] = 0;
+}
+
+static void LogPinRecordLocked(const char *event, const PinEntry *e)
+{
+    if (!event || !e || !e->rec.present) return;
+    Log_Append("pinstore: %s %s:%s host=%s port=%u family=%s valid=%s..%s nextCa=%s nextCaUnix=%lld status=%s spki=%s",
+               event,
+               KindName(e->kind), e->label, e->hostname, (unsigned)e->port,
+               e->operator_family,
+               e->rec.not_before, e->rec.not_after,
+               e->rec.renewal_due[0] ? e->rec.renewal_due : "unknown",
+               (long long)e->rec.renewal_due_unix,
+               e->rec.last_status, e->rec.spki_hex);
+}
+
 static int EntryMatches(const PinEntry *e, PinEndpointKind kind,
                         const char *label, const char *hostname,
                         uint16_t port)
@@ -323,6 +365,8 @@ static int ParseLine(char *line)
     e.rec.not_before_unix = _strtoi64(fields[8], NULL, 10);
     e.rec.not_after_unix = _strtoi64(fields[9], NULL, 10);
     e.rec.renewal_due_unix = _strtoi64(fields[10], NULL, 10);
+    FormatUnixUtc(e.rec.renewal_due_unix,
+                  e.rec.renewal_due, sizeof e.rec.renewal_due);
     if (!SafeCopy(e.rec.last_status, sizeof e.rec.last_status, fields[11])) return 0;
     e.rec.present = 1;
 
@@ -437,6 +481,9 @@ int PinStore_Init(void)
     if (ok) {
         Log_Append("pinstore: decrypt/parse success (%u endpoints)",
                    (unsigned)g_entry_count);
+        for (size_t i = 0; i < g_entry_count; i++) {
+            LogPinRecordLocked("loaded", &g_entries[i]);
+        }
     } else {
         g_entry_count = 0;
         Log_Append("pinstore: parse/schema failure; ignoring cache and re-enrolling");
@@ -528,13 +575,11 @@ int PinStore_SavePin(PinEndpointKind kind,
     e->rec.not_before_unix = not_before_unix;
     e->rec.not_after_unix = not_after_unix;
     e->rec.renewal_due_unix = ComputeRenewalDue(not_before_unix, not_after_unix);
+    FormatUnixUtc(e->rec.renewal_due_unix,
+                  e->rec.renewal_due, sizeof e->rec.renewal_due);
     SafeCopy(e->rec.last_status, sizeof e->rec.last_status, status);
 
-    Log_Append("pinstore: save %s:%s host=%s port=%u family=%s notAfter=%s renewalDue=%lld status=%s spki=%s",
-               KindName(kind), e->label, e->hostname, (unsigned)e->port,
-               e->operator_family, e->rec.not_after,
-               (long long)e->rec.renewal_due_unix,
-               e->rec.last_status, e->rec.spki_hex);
+    LogPinRecordLocked("save", e);
     int ok = PersistLocked();
     LeaveCriticalSection(&g_cs);
     return ok;

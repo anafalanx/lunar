@@ -516,11 +516,14 @@ static int doh_query_one(const DnsResolver *r, const char *ip_str,
         Log_Append("dns: %s first-run enrollment required for %s:%u",
                    r->label, r->hostname, 443u);
     } else if (expired) {
-        Log_Append("dns: %s local pin expired (notAfter=%s); CA revalidation required",
-                   r->label, pin.not_after);
+        Log_Append("dns: %s local pin expired; CA revalidation required (valid=%s..%s nextCa=%s)",
+                   r->label, pin.not_before, pin.not_after,
+                   pin.renewal_due[0] ? pin.renewal_due : "unknown");
     } else if (renew_due) {
-        Log_Append("dns: %s scheduled CA renewal due (notAfter=%s, renewalDue=%lld)",
-                   r->label, pin.not_after, (long long)pin.renewal_due_unix);
+        Log_Append("dns: %s scheduled CA renewal due (valid=%s..%s nextCa=%s nextCaUnix=%lld)",
+                   r->label, pin.not_before, pin.not_after,
+                   pin.renewal_due[0] ? pin.renewal_due : "unknown",
+                   (long long)pin.renewal_due_unix);
     }
 
     static const char *alpn_list[] = { "http/1.1", NULL };
@@ -529,8 +532,10 @@ static int doh_query_one(const DnsResolver *r, const char *ip_str,
                                (have_pin && !expired) ? pin.spki : NULL,
                                allow_ca, renew_due && !expired, &openInfo) != 0) {
         if (openInfo.pin_mismatched && !allow_ca) {
-            Log_Append("dns: %s pin mismatch before renewal window; endpoint rejected without CA refresh (peer_spki=%s stored_spki=%s)",
-                       r->label, openInfo.peer_spki_hex, pin.spki_hex);
+            Log_Append("dns: %s pin mismatch before renewal window; endpoint rejected without CA refresh (peer_spki=%s stored_spki=%s stored_valid=%s..%s nextCa=%s)",
+                       r->label, openInfo.peer_spki_hex, pin.spki_hex,
+                       pin.not_before, pin.not_after,
+                       pin.renewal_due[0] ? pin.renewal_due : "unknown");
         } else if (openInfo.ca_attempted) {
             Log_Append("dns: %s CA validation rejected host=%s chain=0x%lx policy=0x%lx revocation=%s subject=\"%s\" issuer=\"%s\" spki=%s",
                        r->label, r->hostname,
@@ -571,8 +576,10 @@ static int doh_query_one(const DnsResolver *r, const char *ip_str,
                              status);
         }
     } else if (openInfo.pin_matched) {
-        Log_Append("dns: %s local pin match host=%s spki=%s notAfter=%s",
-                   r->label, r->hostname, pin.spki_hex, pin.not_after);
+        Log_Append("dns: %s local pin match host=%s spki=%s valid=%s..%s nextCa=%s",
+                   r->label, r->hostname, pin.spki_hex,
+                   pin.not_before, pin.not_after,
+                   pin.renewal_due[0] ? pin.renewal_due : "unknown");
     }
     mbedtls_ssl_context *ssl = PinnedTls_Ssl(&tls);
 
