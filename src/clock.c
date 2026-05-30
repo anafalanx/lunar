@@ -422,109 +422,97 @@ void Clock_OnPollCycle(TrustState state,
     (void)maxPairSpreadMs;   // reserved for future audit-log use
     if (!g_csInit) Clock_Init();
 
-    TrustState prev;
+    // Phase 1 -- classify the cycle under a single lock acquisition,
+    // capturing everything needed for logging into locals. We must not
+    // call Log_Append or Clock_OnSyncedNtpUtc while g_cs is held (both run
+    // their own locking / logging and assume the lock is released -- see
+    // the file header note), so logging and anchor updates are deferred
+    // until after LeaveCriticalSection.
+    enum { CYCLE_GATE_INOP, CYCLE_FAULT_INOP, CYCLE_ESCAPE, CYCLE_ACCEPT } verdict;
+    TrustState prevAtClassify;
     int64_t    faultDiffMs = 0;
+    int        faultCount  = 0;
 
+    EnterCriticalSection(&g_cs);
+    prevAtClassify = g_trust;
     if (state == TRUST_INOP) {
-        EnterCriticalSection(&g_cs);
-        prev = g_trust;
         Clock_TripInopLocked();
-        LeaveCriticalSection(&g_cs);
-        if (prev != TRUST_INOP) {
+        verdict = CYCLE_GATE_INOP;
+    } else if (g_haveSample) {
+        // Cross-check the agreed time against our running projection.
+        // Only meaningful once we already have an anchor from a previous
+        // cycle; the first concurrence-valid cycle is accepted as-is.
+        int64_t predicted = ProjectLocked(bestQpc);
+        int64_t diff      = bestUtcMs - predicted;
+        int64_t absDiff   = diff < 0 ? -diff : diff;
+        if (absDiff > 200) {
+            faultDiffMs = diff;
+            faultCount  = ++g_consecutiveLocalFaults;
+            if (faultCount >= LOCAL_FAULT_ESCAPE_N) {
+                // Escape hatch: N consecutive cycles where all gating
+                // sources concurred but we rejected them means OUR state
+                // (anchor/rate) is the broken party, not the network.
+                // Force-accept this sample as a snap and reset the counter.
+                g_consecutiveLocalFaults = 0;
+                verdict = CYCLE_ESCAPE;
+            } else {
+                Clock_TripInopLocked();
+                verdict = CYCLE_FAULT_INOP;
+            }
+        } else {
+            g_consecutiveLocalFaults = 0;
+            verdict = CYCLE_ACCEPT;
+        }
+    } else {
+        g_consecutiveLocalFaults = 0;
+        verdict = CYCLE_ACCEPT;
+    }
+    LeaveCriticalSection(&g_cs);
+
+    // Phase 2 -- act on the verdict outside the lock.
+    if (verdict == CYCLE_GATE_INOP) {
+        if (prevAtClassify != TRUST_INOP) {
             Log_Append("clock: trust OK \xe2\x86\x92"
                        " INOP (NTP cycle failed concurrence gate)");
         }
         return;
     }
-
-    // Additional guard: cross-check agreed time against projection.
-    // Only meaningful once we already have an anchor from a previous
-    // cycle; the first concurrence-valid cycle is accepted as-is.
-    int localFault = 0;
-    EnterCriticalSection(&g_cs);
-    if (g_haveSample) {
-        int64_t predicted = ProjectLocked(bestQpc);
-        int64_t diff = bestUtcMs - predicted;
-        if (diff < 0) diff = -diff;
-        if (diff > 200) {
-            localFault  = 1;
-            faultDiffMs = bestUtcMs - predicted;
-        }
-    }
-    LeaveCriticalSection(&g_cs);
-
-    if (localFault) {
-        int faultCount;
-        EnterCriticalSection(&g_cs);
-        g_consecutiveLocalFaults++;
-        faultCount = g_consecutiveLocalFaults;
-        LeaveCriticalSection(&g_cs);
-
-        if (faultCount >= LOCAL_FAULT_ESCAPE_N) {
-            // Escape hatch: N consecutive cycles where all gating
-            // sources concurred but we rejected them means OUR state
-            // (anchor/rate) is the broken party, not the network.
-            // Force-accept this sample as a snap to recover without
-            // user intervention, and reset the counter.
-            EnterCriticalSection(&g_cs);
-            g_consecutiveLocalFaults = 0;
-            LeaveCriticalSection(&g_cs);
-            Log_Append("clock: escape hatch \xe2\x80\x94"
-                       " %d consecutive local-oscillator faults "
-                       "(diff %+lldms); forcing snap to recover",
-                       faultCount, (long long)faultDiffMs);
-            Clock_OnSyncedNtpUtc(bestUtcMs, bestQpc);
-
-            EnterCriticalSection(&g_cs);
-            prev = g_trust;
-            if (g_trust != state) {
-                g_trust = state;
-                g_displayGeneration++;
-                if (g_displayGeneration == 0) g_displayGeneration = 1;
-            }
-            LeaveCriticalSection(&g_cs);
-            if (prev != state && state == TRUST_OK) {
-                Log_Append("clock: trust INOP \xe2\x86\x92"
-                           " OK (recovered via escape hatch)");
-            }
-            return;
-        }
-
-        EnterCriticalSection(&g_cs);
-        prev = g_trust;
-        Clock_TripInopLocked();
-        LeaveCriticalSection(&g_cs);
+    if (verdict == CYCLE_FAULT_INOP) {
         Log_Append("clock: local-oscillator fault \xe2\x80\x94"
                    " concurrence gate passed but our projection differs "
                    "by %+lldms (>200ms); tripping INOP [%d/%d before escape]",
                    (long long)faultDiffMs,
                    faultCount, LOCAL_FAULT_ESCAPE_N);
-        if (prev != TRUST_INOP) {
+        if (prevAtClassify != TRUST_INOP) {
             Log_Append("clock: trust OK \xe2\x86\x92 INOP");
         }
         return;
     }
 
-    // Sample accepted (no local fault). Reset fault counter.
-    EnterCriticalSection(&g_cs);
-    g_consecutiveLocalFaults = 0;
-    LeaveCriticalSection(&g_cs);
-
-    // Accept the sample: run the normal PLL update.
-    // (Clock_OnSyncedNtpUtc emits its own log line.)
+    // CYCLE_ESCAPE and CYCLE_ACCEPT both accept the sample. The escape
+    // path logs its recovery banner first; both then run the normal PLL
+    // update (which emits its own per-sync log line) and publish the state.
+    if (verdict == CYCLE_ESCAPE) {
+        Log_Append("clock: escape hatch \xe2\x80\x94"
+                   " %d consecutive local-oscillator faults "
+                   "(diff %+lldms); forcing snap to recover",
+                   faultCount, (long long)faultDiffMs);
+    }
     Clock_OnSyncedNtpUtc(bestUtcMs, bestQpc);
 
+    TrustState prevAtPublish;
     EnterCriticalSection(&g_cs);
-    prev = g_trust;
+    prevAtPublish = g_trust;
     if (g_trust != state) {
         g_trust = state;
         g_displayGeneration++;
         if (g_displayGeneration == 0) g_displayGeneration = 1;
     }
     LeaveCriticalSection(&g_cs);
-    if (prev != state && state == TRUST_OK) {
-        Log_Append("clock: trust INOP \xe2\x86\x92"
-                   " OK (concurrence gate passed)");
+    if (prevAtPublish != state && state == TRUST_OK) {
+        Log_Append((verdict == CYCLE_ESCAPE)
+                   ? "clock: trust INOP \xe2\x86\x92 OK (recovered via escape hatch)"
+                   : "clock: trust INOP \xe2\x86\x92 OK (concurrence gate passed)");
     }
 }
 
