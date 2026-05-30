@@ -1466,11 +1466,15 @@ static void Paint(HDC fallbackDc) {
         }
     }
 
-    int commitLocked = 0;
+    // Validate the trusted-display generation, but do NOT hold the clock
+    // lock across EndDraw: a GPU-flushing present there would stall the
+    // NTP aggregator for the whole submission. Check the generation
+    // immediately before the present, and again immediately after.
+    int presentedDial = 0;
     if (drewDial) {
         if (Watchdog_DisplayGuardOk() &&
-            Clock_BeginDisplayCommit(displayGeneration)) {
-            commitLocked = 1;
+            Clock_DisplayGenerationIsCurrent(displayGeneration)) {
+            presentedDial = 1;
         } else {
             ID2D1RenderTarget_Clear(g_rt, &pal.bg);
             DrawInop(dw, dh, &pal);
@@ -1479,12 +1483,22 @@ static void Paint(HDC fallbackDc) {
     }
 
     HRESULT hr = ID2D1RenderTarget_EndDraw(g_rt, NULL, NULL);
-    if (commitLocked) Clock_EndDisplayCommit();
     if (hr == (HRESULT)D2DERR_RECREATE_TARGET) {
         DiscardDeviceResources();
     }
     if (SUCCEEDED(hr)) {
-        Watchdog_PublishHeartbeat((drewDial && haveTime)
+        // Re-validate after the present. EndDraw can flush the GPU queue
+        // and take long enough for the aggregator to trip INOP; if the
+        // dial we just presented is no longer the current trusted
+        // generation, force an immediate repaint so the stale frame is
+        // replaced within one paint rather than lingering until the next
+        // tick.
+        if (presentedDial &&
+            !Clock_DisplayGenerationIsCurrent(displayGeneration)) {
+            presentedDial = 0;
+            InvalidateRect(g_hwnd, NULL, FALSE);
+        }
+        Watchdog_PublishHeartbeat(presentedDial
             ? WATCHDOG_DISPLAY_DIAL
             : WATCHDOG_DISPLAY_INOP);
     }
@@ -1509,6 +1523,8 @@ static void Paint(HDC fallbackDc) {
 // rendering is on the UI thread.
 static HBITMAP RenderClockToBitmap(int w, int h) {
     if (w < 1 || h < 1) return NULL;
+
+    int dialStale = 0;   // set if the trusted generation changed during EndDraw
 
     if (!g_dcRt) {
         D2D1_RENDER_TARGET_PROPERTIES p = {
@@ -1585,18 +1601,25 @@ static HBITMAP RenderClockToBitmap(int w, int h) {
                 DrawInop(dw, dh, &pal);
             }
         }
-        int commitLocked = 0;
+        int presentedDial = 0;
         if (drewDial) {
             if (Watchdog_DisplayGuardOk() &&
-                Clock_BeginDisplayCommit(displayGeneration)) {
-                commitLocked = 1;
+                Clock_DisplayGenerationIsCurrent(displayGeneration)) {
+                presentedDial = 1;
             } else {
                 ID2D1RenderTarget_Clear(g_rt, &pal.bg);
                 DrawInop(dw, dh, &pal);
             }
         }
         hr = ID2D1RenderTarget_EndDraw(g_rt, NULL, NULL);
-        if (commitLocked) Clock_EndDisplayCommit();
+        // Same no-lock-across-EndDraw rule as Paint(): if the trusted
+        // generation changed while EndDraw flushed, the thumbnail we built
+        // is stale -- flag it so we hand back a fresh INOP bitmap below
+        // instead of a confident-looking dial.
+        if (presentedDial &&
+            !Clock_DisplayGenerationIsCurrent(displayGeneration)) {
+            dialStale = 1;
+        }
 
         ID2D1SolidColorBrush_Release(g_brush);
     }
@@ -1608,6 +1631,15 @@ static HBITMAP RenderClockToBitmap(int w, int h) {
     DeleteDC(hdc);
 
     if (FAILED(hr)) {
+        DeleteObject(hbm);
+        return RenderInopBitmapGdi(w, h);
+    }
+
+    // The dial was committed without holding the clock lock across EndDraw.
+    // If the trusted generation changed during the flush, the thumbnail is
+    // stale -- return a fresh INOP bitmap so the taskbar preview never
+    // shows an untrusted time.
+    if (dialStale) {
         DeleteObject(hbm);
         return RenderInopBitmapGdi(w, h);
     }

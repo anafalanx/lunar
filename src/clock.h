@@ -51,16 +51,14 @@ int     Clock_NowUtcMs(int64_t *outMs);
 int     Clock_ReadDisplayTime(int64_t *outMs, uint64_t *outGeneration);
 
 // True iff `generation` is still the current trusted display generation.
-// Also fails closed if the display lease expired while checking.
+// Also fails closed if the display lease expired while checking. The
+// clock lock is taken and released internally, so the lock is never held
+// across the caller's (potentially slow, GPU-flushing) present. A painter
+// validates the generation immediately BEFORE presenting a dial, and
+// again immediately AFTER the present returns: if the post-present check
+// fails, the dial it just presented is stale and the painter must repaint
+// (the live window) or hand back an INOP bitmap (the taskbar thumbnail).
 int     Clock_DisplayGenerationIsCurrent(uint64_t generation);
-
-// Hold the display generation stable while a painter commits a frame
-// that contains a dial. Returns 1 with the clock lock held iff the
-// generation is still current; caller must then call
-// Clock_EndDisplayCommit() immediately after the presentation call.
-// Returns 0 with no lock held if the dial must be discarded for INOP.
-int     Clock_BeginDisplayCommit(uint64_t generation);
-void    Clock_EndDisplayCommit(void);
 
 // True once we have at least one NTP sample anchoring the clockwork in
 // THIS run. A loaded rate from disk alone does not count.

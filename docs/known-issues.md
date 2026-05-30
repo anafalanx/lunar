@@ -35,30 +35,28 @@ release, and monitor logs for provider certificate rotations.
 
 ---
 
-## 2. `Clock_BeginDisplayCommit` Holds `g_cs` Across `EndDraw`
+## 2. `Clock_BeginDisplayCommit` Held `g_cs` Across `EndDraw` — RESOLVED
 
-**Severity: Medium (latency / correctness risk)**
+**Severity: Medium (latency / correctness risk) — resolved**
 
-`Clock_BeginDisplayCommit()` returns 1 with `g_cs` held. The caller
-(`Paint()` and `RenderClockToBitmap()`) then calls
+Previously, `Clock_BeginDisplayCommit()` returned 1 with `g_cs` held, and the
+caller (`Paint()` and `RenderClockToBitmap()`) called
 `ID2D1RenderTarget_EndDraw()` before releasing the lock via
-`Clock_EndDisplayCommit()`.
+`Clock_EndDisplayCommit()`. Because `EndDraw` may flush the GPU command queue,
+holding a critical section across a GPU submission stalled the NTP aggregator
+thread for the entire duration of that flush whenever it needed `g_cs` inside
+`Clock_OnPollCycle` → `Clock_OnSyncedNtpUtc` — potentially hundreds of
+milliseconds on a slow driver or under GPU load.
 
-`EndDraw` may flush the GPU command queue. Holding a critical section across
-a GPU submission means the NTP aggregator thread stalls for the entire
-duration of that flush whenever it needs `g_cs` inside
-`Clock_OnPollCycle` → `Clock_OnSyncedNtpUtc`. On a slow driver or under GPU
-load this could be hundreds of milliseconds.
-
-The restriction that `Log_Append` must never be called while `g_cs` is held
-(to avoid the `Log → Clock_NowUtcMs → g_cs` re-entrant deadlock) is
-documented but manually enforced — it is invisible to any future caller of
-`Clock_BeginDisplayCommit`.
-
-**Mitigation needed:** Lock the CS, validate the generation, snapshot the
-values needed for painting, then release the CS before calling `EndDraw`.
-Verification at commit time should re-check the generation token after
-release, not hold the lock through the presentation call.
+**Resolution:** The lock-holding `Clock_BeginDisplayCommit` /
+`Clock_EndDisplayCommit` pair was removed. Painters now snapshot the display
+time and generation under the lock (`Clock_ReadDisplayTime`), then validate the
+generation with `Clock_DisplayGenerationIsCurrent()` — which takes and releases
+`g_cs` internally — immediately *before* `EndDraw` and again immediately
+*after*. The lock is never held across the present. If the post-present check
+fails (the aggregator tripped INOP during the flush), the live window forces an
+immediate repaint and the taskbar thumbnail is replaced with a fresh INOP
+bitmap, so a stale dial survives at most one frame.
 
 ---
 

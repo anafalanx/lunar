@@ -40,7 +40,8 @@ static uint64_t   g_displayGeneration = 1; // bumps on every display-state chang
 static TrustState g_trust         = TRUST_INOP;
 
 // Counts consecutive local-oscillator-fault rejections. If the NTP
-// cycle concurs (≥2 core + NTS agree) but our running projection
+// cycle passes the concurrence gate (two operator-diverse NTS anchors
+// agree, plus a core super-majority) but our running projection
 // disagrees by >200 ms for several cycles in a row, our anchor/rate
 // are clearly wrong -- an automatic escape hatch forces a snap after
 // LOCAL_FAULT_ESCAPE_N faults to recover without user intervention.
@@ -263,32 +264,6 @@ int Clock_DisplayGenerationIsCurrent(uint64_t generation) {
                    " INOP (trusted display lease expired)");
     }
     return ok;
-}
-
-int Clock_BeginDisplayCommit(uint64_t generation) {
-    if (!g_csInit || generation == 0) return 0;
-    int64_t nowQpc = Clock_Qpc();
-    int expired = 0;
-    EnterCriticalSection(&g_cs);
-    if (Clock_DisplayLeaseExpiredLocked(nowQpc)) {
-        Clock_TripInopLocked();
-        expired = 1;
-    }
-    int ok = g_haveSample && g_trust != TRUST_INOP &&
-             g_displayGeneration == generation;
-    if (!ok) {
-        LeaveCriticalSection(&g_cs);
-        if (expired) {
-            Log_Append("clock: trust OK \xe2\x86\x92"
-                       " INOP (trusted display lease expired)");
-        }
-        return 0;
-    }
-    return 1;
-}
-
-void Clock_EndDisplayCommit(void) {
-    if (g_csInit) LeaveCriticalSection(&g_cs);
 }
 
 int Clock_IsDisciplined(void) { return g_haveSample ? 1 : 0; }
@@ -520,7 +495,7 @@ void Clock_OnPollCycle(TrustState state,
         Clock_TripInopLocked();
         LeaveCriticalSection(&g_cs);
         Log_Append("clock: local-oscillator fault \xe2\x80\x94"
-                   " 3/3 servers concurred but our projection differs "
+                   " concurrence gate passed but our projection differs "
                    "by %+lldms (>200ms); tripping INOP [%d/%d before escape]",
                    (long long)faultDiffMs,
                    faultCount, LOCAL_FAULT_ESCAPE_N);
@@ -549,7 +524,7 @@ void Clock_OnPollCycle(TrustState state,
     LeaveCriticalSection(&g_cs);
     if (prev != state && state == TRUST_OK) {
         Log_Append("clock: trust INOP \xe2\x86\x92"
-                   " OK (3/3 sources concurred)");
+                   " OK (concurrence gate passed)");
     }
 }
 

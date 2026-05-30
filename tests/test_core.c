@@ -538,12 +538,9 @@ static void test_clock_display_fail_closed(void) {
     CHECK(gen2 != gen1);
     CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen1), 0);
     CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen2), 1);
-    CHECK_EQ_INT(Clock_BeginDisplayCommit(gen2), 1);
-    Clock_EndDisplayCommit();
 
     Clock_TestExpireDisplayLease();
     CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen2), 0);
-    CHECK_EQ_INT(Clock_BeginDisplayCommit(gen2), 0);
     CHECK_EQ_INT(Clock_NowUtcMs(&display), 0);
     CHECK_EQ_INT(Clock_Trust(), TRUST_INOP);
 
@@ -555,7 +552,6 @@ static void test_clock_display_fail_closed(void) {
     CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen3), 1);
     Clock_TripInop("unit test");
     CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen3), 0);
-    CHECK_EQ_INT(Clock_BeginDisplayCommit(gen3), 0);
     CHECK_EQ_INT(Clock_NowUtcMs(&display), 0);
     CHECK_EQ_INT(Clock_Trust(), TRUST_INOP);
 }
