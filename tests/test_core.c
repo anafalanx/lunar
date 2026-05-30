@@ -557,6 +557,209 @@ static void test_clock_display_fail_closed(void) {
 }
 
 // ---------------------------------------------------------------------------
+// Adversarial discipline-loop tests (sync-evaluation.md C7)
+// ---------------------------------------------------------------------------
+//
+// Feed Clock_OnSyncedNtpUtc / Clock_OnPollCycle crafted (utc, qpc) series
+// and assert the PLL stays bounded and converges. The rate/anchor math is
+// driven entirely by the qpc/utc values we pass in, so these are
+// deterministic regardless of wall-clock or real QPC. (The display lease
+// uses real QPC, but every test completes well inside the 90 s lease.)
+//
+// RATE_CLAMP_PPM (200) and PER_CYCLE_RATE_CLAMP_PPM (20) are file-local to
+// clock.c, so the literals are repeated here with naming comments.
+
+// Point APPDATA at a scratch dir and delete any persisted discipline.dat so
+// each test starts from a known rate=0 bootstrap.
+static void clock_test_reset_appdata(void) {
+    wchar_t scratchW[MAX_PATH + 32];
+    wchar_t cwd[MAX_PATH]; GetCurrentDirectoryW(MAX_PATH, cwd);
+    _snwprintf(scratchW, MAX_PATH + 32, L"%ls\\build\\test_scratch", cwd);
+    _wmkdir(scratchW);
+    wchar_t envsetW[MAX_PATH + 48];
+    _snwprintf(envsetW, MAX_PATH + 48, L"APPDATA=%ls", scratchW);
+    _wputenv(envsetW);
+    wchar_t discPath[MAX_PATH];
+    _snwprintf(discPath, MAX_PATH, L"%ls\\Lunar\\discipline.dat", scratchW);
+    _wremove(discPath);
+}
+
+static int64_t clock_test_qpc_freq(void) {
+    LARGE_INTEGER f; QueryPerformanceFrequency(&f);
+    return f.QuadPart ? f.QuadPart : 1;
+}
+
+// A steady frequency error must be learned by the PI loop and must
+// converge -- not oscillate or run away. Per-cycle and absolute clamps
+// must hold at every step.
+static void test_clock_drift_convergence(void) {
+    clock_test_reset_appdata();
+    Clock_Init();
+    int64_t f   = clock_test_qpc_freq();
+    int64_t utc = make_utc_ms(2026, 5, 1, 0, 0, 0);
+    int64_t qpc = Clock_Qpc();
+    Clock_OnSyncedNtpUtc(utc, qpc);            // first anchor, rate still 0
+
+    const int driftPpm = 45;
+    int32_t prev = Clock_RatePpm();
+    for (int k = 0; k < 80; k++) {
+        int64_t dQ   = f * 3600;               // 1 h of QPC ticks
+        int64_t real = dQ * 1000 / f;          // == 3 600 000 ms
+        int64_t srv  = real + (real * driftPpm) / 1000000;
+        qpc += dQ;
+        utc += srv;
+        Clock_OnSyncedNtpUtc(utc, qpc);
+        int32_t r = Clock_RatePpm();
+        CHECK(r - prev <= 20 && prev - r <= 20);   // per-cycle change clamp
+        CHECK(r <= 200 && r >= -200);              // absolute clamp
+        prev = r;
+    }
+    // Integer truncation of the I-step stalls within ~8 ppm of target; the
+    // rate must have climbed most of the way to +45 without overshooting.
+    int32_t fin = Clock_RatePpm();
+    CHECK(fin >= driftPpm - 9 && fin <= driftPpm + 1);
+}
+
+// A single gate-passing cycle must never swing the rate by more than the
+// per-cycle clamp, and sustained extreme error must saturate at the
+// absolute clamp, never beyond -- in both directions (S7 "pulse" defense).
+static void test_clock_rate_clamps(void) {
+    int64_t f = clock_test_qpc_freq();
+
+    // Positive saturation: server runs 5 s ahead every 60 s cycle.
+    clock_test_reset_appdata();
+    Clock_Init();
+    int64_t utc = make_utc_ms(2026, 5, 2, 0, 0, 0);
+    int64_t qpc = Clock_Qpc();
+    Clock_OnSyncedNtpUtc(utc, qpc);
+    int32_t prev = Clock_RatePpm();
+    for (int k = 0; k < 15; k++) {
+        qpc += f * 60;                  // 60 s
+        utc += 60000 + 5000;            // +5 s of error per cycle
+        Clock_OnSyncedNtpUtc(utc, qpc);
+        int32_t r = Clock_RatePpm();
+        CHECK(r - prev <= 20);          // per-cycle change clamp
+        CHECK(r <= 200);                // absolute clamp, never exceeded
+        prev = r;
+    }
+    CHECK_EQ_INT(Clock_RatePpm(), 200); // fully saturated after >=10 cycles
+
+    // Negative saturation: server falls 5 s behind every 60 s cycle.
+    clock_test_reset_appdata();
+    Clock_Init();
+    utc = make_utc_ms(2026, 5, 3, 0, 0, 0);
+    qpc = Clock_Qpc();
+    Clock_OnSyncedNtpUtc(utc, qpc);
+    prev = Clock_RatePpm();
+    for (int k = 0; k < 15; k++) {
+        qpc += f * 60;
+        utc += 60000 - 5000;            // -5 s of error per cycle
+        Clock_OnSyncedNtpUtc(utc, qpc);
+        int32_t r = Clock_RatePpm();
+        CHECK(prev - r <= 20);
+        CHECK(r >= -200);
+        prev = r;
+    }
+    CHECK_EQ_INT(Clock_RatePpm(), -200);
+}
+
+// Symmetric round-trip jitter must not accumulate into a runaway rate
+// (sync-evaluation.md C3): zero true drift with +/-100 ms alternating error
+// over hourly cycles must leave the rate near zero, far from saturation.
+static void test_clock_jitter_rejection(void) {
+    clock_test_reset_appdata();
+    Clock_Init();
+    int64_t f   = clock_test_qpc_freq();
+    int64_t utc = make_utc_ms(2026, 5, 4, 0, 0, 0);
+    int64_t qpc = Clock_Qpc();
+    Clock_OnSyncedNtpUtc(utc, qpc);
+    int32_t worst = 0;
+    for (int k = 0; k < 40; k++) {
+        qpc += f * 3600;
+        int64_t jitter = (k & 1) ? 100 : -100;
+        utc += 3600000 + jitter;        // zero-mean drift, +/-100 ms noise
+        Clock_OnSyncedNtpUtc(utc, qpc);
+        int32_t r = Clock_RatePpm();
+        int32_t a = r < 0 ? -r : r;
+        if (a > worst) worst = a;
+    }
+    CHECK(worst <= 30);                 // bounded, nowhere near +/-200
+}
+
+// The local-oscillator-fault gate trips INOP when an otherwise-concurring
+// cycle disagrees with our projection by >200 ms, and the escape hatch
+// force-snaps after LOCAL_FAULT_ESCAPE_N consecutive faults (known-issues
+// #3 / S4). Drives Clock_OnPollCycle -- the full verdict path.
+static void test_clock_fault_gate_and_escape(void) {
+    clock_test_reset_appdata();
+    Clock_Init();
+    int64_t utc = make_utc_ms(2026, 5, 5, 0, 0, 0);
+    int64_t qpc = Clock_Qpc();
+
+    // First concurrence-valid cycle: accepted as-is (no prior anchor).
+    Clock_OnPollCycle(TRUST_OK, utc, qpc, 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_OK);
+    CHECK_EQ_INT(Clock_IsDisciplined(), 1);
+
+    // Cycles at the SAME qpc (zero elapsed -> projection == anchor utc)
+    // whose agreed time is +500 ms off: each is a local-oscillator fault.
+    int64_t bad = utc + 500;
+    Clock_OnPollCycle(TRUST_OK, bad, qpc, 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_INOP);            // fault 1/3
+    Clock_OnPollCycle(TRUST_OK, bad, qpc, 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_INOP);            // fault 2/3
+    Clock_OnPollCycle(TRUST_OK, bad, qpc, 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_OK);              // escape-hatch snap
+
+    // After the snap the anchor moved to `bad`; a matching cycle agrees.
+    Clock_OnPollCycle(TRUST_OK, bad, qpc, 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_OK);
+}
+
+// A sync shorter than the 30 s minimum interval must not update the rate
+// (guards against a huge corr from a tiny denominator).
+static void test_clock_short_interval_guard(void) {
+    clock_test_reset_appdata();
+    Clock_Init();
+    int64_t f   = clock_test_qpc_freq();
+    int64_t utc = make_utc_ms(2026, 5, 6, 0, 0, 0);
+    int64_t qpc = Clock_Qpc();
+    Clock_OnSyncedNtpUtc(utc, qpc);
+
+    // One long cycle establishes a measured rate.
+    qpc += f * 3600;
+    utc += 3600000 + 1000;              // +1 s error over 1 h
+    Clock_OnSyncedNtpUtc(utc, qpc);
+    int32_t established = Clock_RatePpm();
+    CHECK(established > 0);
+
+    // A 10 s cycle with a big error must leave the rate untouched.
+    qpc += f * 10;
+    utc += 10000 + 2000;
+    Clock_OnSyncedNtpUtc(utc, qpc);
+    CHECK_EQ_INT(Clock_RatePpm(), established);
+}
+
+// A normal suspend/resume where QPC tracked real time (utc and qpc advance
+// together) must NOT false-trip INOP -- the projection still matches.
+static void test_clock_resume_consistent(void) {
+    clock_test_reset_appdata();
+    Clock_Init();
+    int64_t f   = clock_test_qpc_freq();
+    int64_t utc = make_utc_ms(2026, 5, 7, 0, 0, 0);
+    int64_t qpc = Clock_Qpc();
+    Clock_OnPollCycle(TRUST_OK, utc, qpc, 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_OK);
+
+    int64_t dt = 7200;                  // "sleep" 2 h, QPC counted through it
+    qpc += f * dt;
+    utc += dt * 1000;
+    Clock_OnPollCycle(TRUST_OK, utc, qpc, 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_OK);          // no false INOP
+    CHECK_EQ_INT(Clock_IsDisciplined(), 1);
+}
+
+// ---------------------------------------------------------------------------
 // Ntp_Concur -- the pure trust-verdict evaluator (NTS-anchored)
 // ---------------------------------------------------------------------------
 //
@@ -1376,6 +1579,7 @@ static void test_nts_ef_tamper(void) {
 #include "../src/logbuf.h"
 
 static void test_logbuf_basic(void) {
+    Log_Reset();   // isolate from prior tests' log volume
     Log_Append("alpha=%d", 1);
     Log_Append("beta %s", "two");
 
@@ -1863,6 +2067,7 @@ static void test_settings_invalid_tz(void) {
     fputs("chimes=1\nunmin=0\nconfirm=0\ntz=Atlantis/Capital\n", f);
     fclose(f);
 
+    Log_Reset();   // isolate this test's log assertions from prior volume
     g_tzIana[0] = 0;
     LoadSettings();
     CHECK_EQ_STR(g_tzIana, "Atlantis/Capital");
@@ -2276,6 +2481,12 @@ int main(void) {
     test_ntp_header_validation();
     test_clock_discipline();
     test_clock_display_fail_closed();
+    test_clock_drift_convergence();
+    test_clock_rate_clamps();
+    test_clock_jitter_rejection();
+    test_clock_fault_gate_and_escape();
+    test_clock_short_interval_guard();
+    test_clock_resume_consistent();
     test_ntp_concur();
     test_siv_rfc5297_appendix_a1();
     test_siv_rfc5297_appendix_a2();

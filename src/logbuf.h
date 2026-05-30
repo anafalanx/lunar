@@ -56,6 +56,12 @@ void Log_Append(const char *fmt, ...);
 // Safe to call with out=NULL / out_cap=0 to query the required size.
 size_t Log_Snapshot(char *out, size_t out_cap);
 
+#ifdef LUNAR_TESTING
+// Test-only: drop all buffered entries so a test can assert on log
+// content in isolation from whatever logging ran before it.
+void Log_Reset(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

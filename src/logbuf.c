@@ -246,3 +246,15 @@ size_t Log_Snapshot(char *out, size_t out_cap) {
     }
     return written;
 }
+
+#ifdef LUNAR_TESTING
+// Test-only: drop all buffered entries so a test can assert on log
+// content in isolation from whatever logging ran before it.
+void Log_Reset(void) {
+    EnsureInit();
+    EnterCriticalSection(&g_cs);
+    g_head  = 0;
+    g_count = 0;
+    LeaveCriticalSection(&g_cs);
+}
+#endif
