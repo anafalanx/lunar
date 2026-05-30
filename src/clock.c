@@ -407,14 +407,23 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
     }
 }
 
+static const char *TrustName(TrustState t) {
+    switch (t) {
+    case TRUST_OK:       return "OK";
+    case TRUST_DEGRADED: return "DEGRADED";
+    default:             return "INOP";
+    }
+}
+
 // Called by ntp.c at the end of every polling cycle. The concurrence
-// verdict has already been computed by the caller; this function just
-// either updates the anchor (OK) or trips INOP and leaves
-// the anchor alone. One extra safety check: even when the caller
-// believes it has a valid sample, we cross-check against our own
-// running projection. If we already have an anchor and the agreed
-// time disagrees with our projection by > 200 ms, that is a local
-// oscillator fault: trip INOP rather than accept the sample.
+// verdict has already been computed by the caller. TRUST_OK re-anchors
+// from (bestUtcMs, bestQpc); TRUST_DEGRADED holds the existing anchor and
+// rate, using (bestUtcMs, bestQpc) only to cross-check the held projection
+// against the core consensus; TRUST_INOP leaves the anchor alone. In every
+// non-INOP case we additionally cross-check the agreed time against our own
+// running projection: a disagreement of more than 200 ms is a
+// local-oscillator fault and trips INOP (the OK path adds an escape hatch
+// after LOCAL_FAULT_ESCAPE_N consecutive faults).
 void Clock_OnPollCycle(TrustState state,
                        int64_t bestUtcMs,
                        int64_t bestQpc,
@@ -428,7 +437,14 @@ void Clock_OnPollCycle(TrustState state,
     // their own locking / logging and assume the lock is released -- see
     // the file header note), so logging and anchor updates are deferred
     // until after LeaveCriticalSection.
-    enum { CYCLE_GATE_INOP, CYCLE_FAULT_INOP, CYCLE_ESCAPE, CYCLE_ACCEPT } verdict;
+    enum {
+        CYCLE_GATE_INOP,      // gate failed -> INOP
+        CYCLE_FAULT_INOP,     // OK verdict but our projection drifted -> INOP
+        CYCLE_ESCAPE,         // Nth consecutive OK-fault -> force snap to OK
+        CYCLE_ACCEPT,         // OK verdict -> re-anchor, publish OK
+        CYCLE_DEGRADED_HOLD,  // DEGRADED verdict, projection still agrees
+        CYCLE_DEGRADED_INOP,  // DEGRADED verdict but no anchor / drift -> INOP
+    } verdict;
     TrustState prevAtClassify;
     int64_t    faultDiffMs = 0;
     int        faultCount  = 0;
@@ -438,10 +454,31 @@ void Clock_OnPollCycle(TrustState state,
     if (state == TRUST_INOP) {
         Clock_TripInopLocked();
         verdict = CYCLE_GATE_INOP;
+    } else if (state == TRUST_DEGRADED) {
+        // NTS unavailable; core sources corroborate. We never re-anchor or
+        // update the rate from unauthenticated sources -- we only verify
+        // that our held (last-OK) projection still agrees with the core
+        // consensus, then keep displaying with an UNAUTHENTICATED badge.
+        if (!g_haveSample) {
+            Clock_TripInopLocked();
+            verdict = CYCLE_DEGRADED_INOP;
+        } else {
+            int64_t predicted = ProjectLocked(bestQpc);
+            int64_t diff      = bestUtcMs - predicted;
+            int64_t absDiff   = diff < 0 ? -diff : diff;
+            if (absDiff > 200) {
+                faultDiffMs = diff;
+                Clock_TripInopLocked();
+                verdict = CYCLE_DEGRADED_INOP;
+            } else {
+                g_consecutiveLocalFaults = 0;
+                Clock_GrantDisplayLeaseLocked();   // keep the dial alive
+                verdict = CYCLE_DEGRADED_HOLD;
+            }
+        }
     } else if (g_haveSample) {
-        // Cross-check the agreed time against our running projection.
-        // Only meaningful once we already have an anchor from a previous
-        // cycle; the first concurrence-valid cycle is accepted as-is.
+        // TRUST_OK with an existing anchor: cross-check the agreed time
+        // against our running projection before accepting it.
         int64_t predicted = ProjectLocked(bestQpc);
         int64_t diff      = bestUtcMs - predicted;
         int64_t absDiff   = diff < 0 ? -diff : diff;
@@ -464,6 +501,7 @@ void Clock_OnPollCycle(TrustState state,
             verdict = CYCLE_ACCEPT;
         }
     } else {
+        // First concurrence-valid cycle: no prior anchor to cross-check.
         g_consecutiveLocalFaults = 0;
         verdict = CYCLE_ACCEPT;
     }
@@ -472,8 +510,22 @@ void Clock_OnPollCycle(TrustState state,
     // Phase 2 -- act on the verdict outside the lock.
     if (verdict == CYCLE_GATE_INOP) {
         if (prevAtClassify != TRUST_INOP) {
-            Log_Append("clock: trust OK \xe2\x86\x92"
-                       " INOP (NTP cycle failed concurrence gate)");
+            Log_Append("clock: trust %s \xe2\x86\x92"
+                       " INOP (NTP cycle failed concurrence gate)",
+                       TrustName(prevAtClassify));
+        }
+        return;
+    }
+    if (verdict == CYCLE_DEGRADED_INOP) {
+        if (faultDiffMs != 0) {
+            Log_Append("clock: degraded projection drift \xe2\x80\x94"
+                       " core sources corroborate but our held anchor differs "
+                       "by %+lldms (>200ms); tripping INOP",
+                       (long long)faultDiffMs);
+        }
+        if (prevAtClassify != TRUST_INOP) {
+            Log_Append("clock: trust %s \xe2\x86\x92 INOP",
+                       TrustName(prevAtClassify));
         }
         return;
     }
@@ -484,14 +536,36 @@ void Clock_OnPollCycle(TrustState state,
                    (long long)faultDiffMs,
                    faultCount, LOCAL_FAULT_ESCAPE_N);
         if (prevAtClassify != TRUST_INOP) {
-            Log_Append("clock: trust OK \xe2\x86\x92 INOP");
+            Log_Append("clock: trust %s \xe2\x86\x92 INOP",
+                       TrustName(prevAtClassify));
+        }
+        return;
+    }
+    if (verdict == CYCLE_DEGRADED_HOLD) {
+        // Anchor and rate held; only the trust state and the display lease
+        // (granted above) change. Publish DEGRADED.
+        TrustState prevPub;
+        EnterCriticalSection(&g_cs);
+        prevPub = g_trust;
+        if (g_trust != TRUST_DEGRADED) {
+            g_trust = TRUST_DEGRADED;
+            g_displayGeneration++;
+            if (g_displayGeneration == 0) g_displayGeneration = 1;
+        }
+        LeaveCriticalSection(&g_cs);
+        if (prevPub != TRUST_DEGRADED) {
+            Log_Append("clock: trust %s \xe2\x86\x92"
+                       " DEGRADED (NTS unavailable; core sources corroborate "
+                       "the held anchor, running unauthenticated)",
+                       TrustName(prevPub));
         }
         return;
     }
 
-    // CYCLE_ESCAPE and CYCLE_ACCEPT both accept the sample. The escape
-    // path logs its recovery banner first; both then run the normal PLL
-    // update (which emits its own per-sync log line) and publish the state.
+    // CYCLE_ESCAPE and CYCLE_ACCEPT both accept the sample and re-anchor.
+    // The escape path logs its recovery banner first; both then run the
+    // normal PLL update (which emits its own per-sync log line) and
+    // publish the state.
     if (verdict == CYCLE_ESCAPE) {
         Log_Append("clock: escape hatch \xe2\x80\x94"
                    " %d consecutive local-oscillator faults "
@@ -511,8 +585,9 @@ void Clock_OnPollCycle(TrustState state,
     LeaveCriticalSection(&g_cs);
     if (prevAtPublish != state && state == TRUST_OK) {
         Log_Append((verdict == CYCLE_ESCAPE)
-                   ? "clock: trust INOP \xe2\x86\x92 OK (recovered via escape hatch)"
-                   : "clock: trust INOP \xe2\x86\x92 OK (concurrence gate passed)");
+                   ? "clock: trust %s \xe2\x86\x92 OK (recovered via escape hatch)"
+                   : "clock: trust %s \xe2\x86\x92 OK (concurrence gate passed)",
+                   TrustName(prevAtPublish));
     }
 }
 

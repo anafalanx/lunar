@@ -79,26 +79,44 @@ void    Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc);
 // --- Trust state machine -------------------------------------------------
 //
 // After each parallel NTP polling cycle, ntp.c calls Clock_OnPollCycle()
-// with the binary concurrence verdict computed by Ntp_Concur:
-//   TRUST_OK   -- authenticated NTS anchor(s) and the required core
-//                 SNTP super-majority concur within 200 ms.
-//   TRUST_INOP -- the cycle failed the NTP concurrence gate, or the
-//                 agreed time disagrees with our running projection by
-//                 more than 200 ms (suggests local oscillator fault).
+// with the concurrence verdict computed by Ntp_Concur:
+//   TRUST_OK       -- two operator-diverse NTS anchors and the required
+//                     core SNTP super-majority concur within 200 ms. The
+//                     anchor and rate are updated from this cycle.
+//   TRUST_DEGRADED -- NTS is unavailable, but >= 3 core sources still
+//                     corroborate our existing projection within the
+//                     tighter 100 ms gate AND the last TRUST_OK cycle was
+//                     less than two hours ago. The clock keeps displaying
+//                     the last authenticated anchor with the rate frozen
+//                     (unauthenticated core sources never steer it); the
+//                     UI marks the time UNAUTHENTICATED.
+//   TRUST_INOP     -- anything else: the gate failed, NTS is present but
+//                     conflicting, the degraded window lapsed, or our
+//                     projection disagrees with the corroborating sources
+//                     by more than 200 ms (local-oscillator fault).
 //
-// While in TRUST_INOP, Clock_NowUtcMs() returns 0 even if a valid anchor
-// was previously established: higher layers must render INOP. Only
-// a successful NTS-anchored concurrence verdict counts as trusted;
-// there is no degraded middle ground.
+// In TRUST_INOP, Clock_NowUtcMs() returns 0 even if a valid anchor was
+// previously established: higher layers must render INOP. TRUST_OK and
+// TRUST_DEGRADED both return a time; callers distinguish them via
+// Clock_Trust() to badge the degraded (unauthenticated) state. The enum
+// values are ordered by confidence so "trust != TRUST_INOP" means
+// "displayable".
 typedef enum {
-    TRUST_INOP = 0,
-    TRUST_OK   = 1,
+    TRUST_INOP     = 0,
+    TRUST_DEGRADED = 1,
+    TRUST_OK       = 2,
 } TrustState;
 
-// Called by ntp.c at the end of every polling cycle. If state is OK,
-// bestUtcMs / bestQpc are used to update the anchor (same semantics
-// as Clock_OnSyncedNtpUtc). If state is INOP, the anchor is NOT
-// updated and Clock_NowUtcMs() will refuse to return a time.
+// Called by ntp.c at the end of every polling cycle.
+//   TRUST_OK       -- bestUtcMs / bestQpc update the anchor (same
+//                     semantics as Clock_OnSyncedNtpUtc).
+//   TRUST_DEGRADED -- bestUtcMs / bestQpc carry the core-only consensus;
+//                     they are NOT used to re-anchor (the rate and anchor
+//                     are held) but only to cross-check that our existing
+//                     projection still agrees within 200 ms. If it does,
+//                     the clock keeps displaying; if not, it trips INOP.
+//   TRUST_INOP     -- the anchor is NOT updated and Clock_NowUtcMs() will
+//                     refuse to return a time.
 // maxPairSpreadMs is the largest pairwise offset difference from the
 // cycle (used for audit / UI).
 void    Clock_OnPollCycle(TrustState state,

@@ -9,7 +9,10 @@
 // aggregated into a single trust verdict via Ntp_Concur. Both NTS
 // anchors must succeed, come from different operator families, and
 // mutually agree; at least 3 of the 4 core sources must also concur
-// for the cycle to produce TRUST_OK.
+// for the cycle to produce TRUST_OK. If NTS is unavailable but >= 3 core
+// sources still agree within a tighter 100 ms gate and a full OK occurred
+// within the last two hours, the cycle produces the unauthenticated
+// TRUST_DEGRADED state instead (see clock.h).
 #ifndef LUNAR_NTP_H
 #define LUNAR_NTP_H
 
@@ -75,27 +78,30 @@ int64_t Ntp_LastSpreadMs(void);
 // Returns the number of sources that ok'd in that cycle (0..NTP_SOURCE_COUNT).
 int     Ntp_GetResults(NtpSourceResult out[NTP_SOURCE_COUNT]);
 
-// Pure concurrence evaluator. Given a set of per-source results,
-// returns the trust verdict and, when the verdict is TRUST_OK, the
-// best utcMs and its matching QPC tick. maxSpreadMs receives the
-// largest absolute deviation of a core source from the NTS anchor
-// (0 if fewer than one core succeeded).
+// Pure concurrence evaluator. Given a set of per-source results, returns
+// the trust verdict and, on TRUST_OK / TRUST_DEGRADED, the consensus
+// utcMs and its matching QPC tick. maxSpreadMs receives the largest
+// absolute deviation of a corroborating source from the consensus.
 //
-// Verdict rules (binary; no degraded middle ground). The NTS slots
-// are the trust anchor; the core sources corroborate.
+// The NTS slots are the authenticated trust anchor; the core sources
+// corroborate. Two paths:
 //
-//   Both NTS slots ok, both authenticated by enrolled pins, and they
-//     come from different operator families AND mutually agree to within
-//     200 ms (projected to a common QPC) AND >= 3 of 4 core sources
-//     agree with the NTS midpoint to within 200 ms -> TRUST_OK,
-//     anchor = midpoint of the two NTS samples.
+//   Path 1 -- both NTS slots ok (enrolled pins): the cycle must reach a
+//     full OK or hard-fail. TRUST_OK requires different operator families
+//     AND mutual agreement within 200 ms (projected to a common QPC) AND
+//     >= 3 of 4 core sources within 200 ms of the NTS midpoint; the anchor
+//     is that midpoint. A same-family, disagreeing, or under-corroborated
+//     NTS pair returns TRUST_INOP -- a conflicting authenticated layer is
+//     never downgraded to DEGRADED.
 //
-//   Fewer than two NTS slots ok                     -> TRUST_INOP
-//   NTS slots use same operator family              -> TRUST_INOP
-//   NTS slots disagree by > 200 ms                  -> TRUST_INOP
-//   Too few core sources concur with the NTS anchor -> TRUST_INOP
+//   Path 2 -- fewer than two ok NTS slots (NTS unavailable): if >= 3 of 4
+//     core sources mutually agree within the tighter 100 ms gate, returns
+//     TRUST_DEGRADED with the core consensus in the out-params. The caller
+//     gates this on the last TRUST_OK being recent and uses the consensus
+//     only to cross-check the held anchor. Otherwise TRUST_INOP.
 //
-// This function is pure: no globals, no I/O. Exposed here so the test
+// This function is pure: no globals, no I/O. The freshness window for
+// DEGRADED is applied by the caller, not here. Exposed so the test
 // harness can exercise the math directly.
 TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
                       int64_t *outBestUtcMs,

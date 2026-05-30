@@ -224,13 +224,15 @@ We rely fully on the TLS 1.3 client-hello entropy + NTS cookie for replay protec
 
 ### Tier 1 — security & correctness (ship first)
 
-1. **Tiered trust with graceful degradation** (addresses S1, A1).
+1. **Tiered trust with graceful degradation** (addresses S1, A1). **— Implemented.**
    Three tiers:
-   - `TRUST_OK` — NTS + ≥ 2 core concur within 200 ms (today's behavior).
+   - `TRUST_OK` — two operator-diverse NTS anchors agree within 200 ms and ≥ 3 of 4 core sources concur (today's full-OK behavior).
    - `TRUST_DEGRADED` — NTS unavailable, but ≥ 3 core sources concur within 100 ms (tighter) AND last NTS-OK is < 2 hours old. Clock continues to run disciplined; UI shows amber "UNAUTHENTICATED" badge; rate is **read-only** (no EMA update from degraded cycles).
    - `TRUST_INOP` — nothing else.
 
    Availability rises; security stance is explicit (degradation is user-visible, not silent); PLL is protected from being poisoned by unauthenticated samples.
+
+   *As built:* the degraded tier **holds** the last authenticated anchor and freezes the rate rather than re-anchoring — unauthenticated core sources can only corroborate the held projection (and trip INOP on a > 200 ms disagreement), never steer the displayed time. A conflicting *present* NTS pair (both reply but disagree, or share an operator family) is treated as more alarming than absent NTS and hard-fails to INOP rather than degrading. See `clock.h` / `ntp.h` and `test_clock_degraded` / `test_ntp_concur_degraded`.
 
 2. **Anchor monotonicity guard** (C5, S6). Reject any new anchor where `ntpUtcMs < previousAnchorUtcMs + elapsedQpcMs − slack` (slack ≈ 60 s). Hard reject: INOP, log `clock: anchor rejected — retrograde time (Δ=…)`.
 

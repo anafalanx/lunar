@@ -759,6 +759,54 @@ static void test_clock_resume_consistent(void) {
     CHECK_EQ_INT(Clock_IsDisciplined(), 1);
 }
 
+// TRUST_DEGRADED holds the last authenticated anchor with the rate frozen
+// (core sources corroborate but never steer), keeps displaying, and trips
+// INOP if the held projection drifts from the core consensus by >200ms.
+static void test_clock_degraded(void) {
+    clock_test_reset_appdata();
+    Clock_Init();
+    int64_t f   = clock_test_qpc_freq();
+    int64_t utc = make_utc_ms(2026, 5, 8, 0, 0, 0);
+    int64_t qpc = Clock_Qpc();
+
+    // Establish an authenticated anchor.
+    Clock_OnPollCycle(TRUST_OK, utc, qpc, 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_OK);
+    int32_t rateOk = Clock_RatePpm();
+
+    // DEGRADED cycle whose core consensus matches our projection: hold the
+    // anchor (no re-anchor), freeze the rate, publish DEGRADED, keep
+    // displaying.
+    int64_t dt   = 120;                       // 2 min later
+    int64_t qpc2 = qpc + f * dt;
+    int64_t proj = utc + dt * 1000;           // rate 0 -> exact projection
+    Clock_OnPollCycle(TRUST_DEGRADED, proj, qpc2, 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_DEGRADED);
+    CHECK_EQ_INT(Clock_RatePpm(), rateOk);    // rate frozen
+    int64_t disp = 0;
+    CHECK_EQ_INT(Clock_NowUtcMs(&disp), 1);   // still displays a time
+
+    // DEGRADED cycle whose consensus disagrees with the held projection by
+    // >200ms -> trip INOP (we never re-anchor to unauthenticated sources).
+    int64_t qpc3  = qpc2 + f * dt;
+    int64_t proj3 = utc + (2 * dt) * 1000;
+    Clock_OnPollCycle(TRUST_DEGRADED, proj3 + 500, qpc3, 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_INOP);
+    CHECK_EQ_INT(Clock_NowUtcMs(&disp), 0);
+
+    // A real OK cycle re-anchors and restores full trust.
+    Clock_OnPollCycle(TRUST_OK, proj3, qpc3, 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_OK);
+
+    // DEGRADED with no prior anchor this run -> INOP (nothing to hold).
+    clock_test_reset_appdata();
+    Clock_Init();
+    int64_t q = Clock_Qpc();
+    Clock_OnPollCycle(TRUST_DEGRADED, make_utc_ms(2026, 5, 8, 1, 0, 0), q, 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_INOP);
+    CHECK_EQ_INT(Clock_IsDisciplined(), 0);
+}
+
 // ---------------------------------------------------------------------------
 // Ntp_Concur -- the pure trust-verdict evaluator (NTS-anchored)
 // ---------------------------------------------------------------------------
@@ -883,34 +931,37 @@ static void test_ntp_concur(void) {
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
     CHECK_EQ_INT(best, 1000);
 
-    // ---- Path B: no single-NTS fallback ----
+    // ---- Path B: NTS unavailable (< 2 ok) -> core-only DEGRADED ----
 
-    // 8) Only NTS1 ok, ALL 4 cores agree -> INOP.
+    // 8) Only NTS1 ok (can't reach OK), all 4 cores agree within 100ms
+    // -> core-only DEGRADED, consensus = 1000.
     s[0] = MkSrc(1, 1000, Q, "A");
     s[1] = MkSrc(1, 1000, Q, "B");
     s[2] = MkSrc(1, 1000, Q, "C");
     s[3] = MkSrc(1, 1000, Q, "D");
     s[4] = MkSrc(1, 1000, Q, "NTS1");
     s[5] = MkSrc(0,    0, 0, "NTS2");
-    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_DEGRADED);
+    CHECK_EQ_INT(best, 1000);
 
-    // 9) Only NTS2 ok, 3 of 4 cores agree -> INOP.
+    // 9) Only NTS2 ok, 3 of 4 cores agree within 100ms (1 outlier)
+    // -> core-only DEGRADED.
     s[0] = MkSrc(1, 1000, Q, "A");
     s[1] = MkSrc(1, 1000, Q, "B");
     s[2] = MkSrc(1, 1000, Q, "C");
     s[3] = MkSrc(1, 1500, Q, "D");     // one outlier
     s[4] = MkSrc(0,    0, 0, "NTS1");
     s[5] = MkSrc(1, 1000, Q, "NTS2");
-    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_DEGRADED);
 
-    // 10) Only NTS1 ok, 3 cores ok 1 failed -> INOP.
+    // 10) Only NTS1 ok, 3 cores ok within 100ms (1 failed) -> DEGRADED.
     s[0] = MkSrc(1, 1000, Q, "A");
     s[1] = MkSrc(1, 1000, Q, "B");
     s[2] = MkSrc(1, 1000, Q, "C");
     s[3] = MkSrc(0,    0, 0, "D");
     s[4] = MkSrc(1, 1000, Q, "NTS1");
     s[5] = MkSrc(0,    0, 0, "NTS2");
-    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_DEGRADED);
 
     // ---- Path C: no NTS at all ----
 
@@ -924,14 +975,15 @@ static void test_ntp_concur(void) {
     s[5].operatorFamily = "family-a";
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
 
-    // 12) Both NTS fail, cores agree -> INOP (no anchor).
+    // 12) Both NTS fail, all 4 cores agree within 100ms -> core-only
+    // DEGRADED (the aggregator still gates this on a recent NTS-OK).
     s[0] = MkSrc(1, 1000, Q, "A");
     s[1] = MkSrc(1, 1000, Q, "B");
     s[2] = MkSrc(1, 1000, Q, "C");
     s[3] = MkSrc(1, 1000, Q, "D");
     s[4] = MkSrc(0,    0, 0, "NTS1");
     s[5] = MkSrc(0,    0, 0, "NTS2");
-    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_DEGRADED);
 
     // 13) Everything fails -> INOP.
     for (int i = 0; i < NTP_SOURCE_COUNT; i++) s[i] = MkSrc(0, 0, 0, "x");
@@ -939,7 +991,7 @@ static void test_ntp_concur(void) {
 
     // ---- NULL out-parameters ----
 
-    // 14) NULL outs tolerated on both OK and INOP paths.
+    // 14) NULL outs tolerated on OK and DEGRADED paths.
     s[0] = MkSrc(1, 1000, Q, "A");
     s[1] = MkSrc(1, 1000, Q, "B");
     s[2] = MkSrc(1, 1000, Q, "C");
@@ -949,7 +1001,7 @@ static void test_ntp_concur(void) {
     CHECK_EQ_INT(Ntp_Concur(s, NULL, NULL, NULL), TRUST_OK);
     s[4] = MkSrc(0, 0, 0, "NTS1");
     s[5] = MkSrc(0, 0, 0, "NTS2");
-    CHECK_EQ_INT(Ntp_Concur(s, NULL, NULL, NULL), TRUST_INOP);
+    CHECK_EQ_INT(Ntp_Concur(s, NULL, NULL, NULL), TRUST_DEGRADED);
 
     // ---- Negative UTCs (pre-1970) ----
 
@@ -1009,6 +1061,84 @@ static void test_ntp_concur(void) {
     // Midpoint projection: NTS2 projected onto NTS1's qpc = 1000,
     // so midpoint = 1000.
     CHECK_EQ_INT(best, 1000);
+}
+
+// ---------------------------------------------------------------------------
+// Ntp_Concur -- core-only DEGRADED tier (NTS unavailable)
+// ---------------------------------------------------------------------------
+//
+// When fewer than two NTS anchors are available, Ntp_Concur returns
+// TRUST_DEGRADED iff >= 3 core sources cluster within 100 ms of a common
+// center (after QPC projection). The aggregator separately gates this on a
+// recent NTS-OK; that freshness check is not exercised here.
+static void test_ntp_concur_degraded(void) {
+    NtpSourceResult s[NTP_SOURCE_COUNT];
+    int64_t best = 0, qpc = 0, spread = 0;
+    const int64_t Q = 1000;
+
+    // D1) Both NTS fail; 3 of 4 cores agree within 100ms (1 outlier)
+    // -> DEGRADED, consensus = 1000.
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1000, Q, "C");
+    s[3] = MkSrc(1, 1500, Q, "D");
+    s[4] = MkSrc(0,    0, 0, "NTS1");
+    s[5] = MkSrc(0,    0, 0, "NTS2");
+    best = qpc = -1;
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_DEGRADED);
+    CHECK_EQ_INT(best, 1000);
+    CHECK_EQ_INT(qpc, Q);
+
+    // D2) Both NTS fail; cores split 2/2 -> no quorum -> INOP.
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1500, Q, "C");
+    s[3] = MkSrc(1, 1500, Q, "D");
+    s[4] = MkSrc(0,    0, 0, "NTS1");
+    s[5] = MkSrc(0,    0, 0, "NTS2");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+
+    // D3) Both NTS fail; 3 cores ok but each >100ms from the others
+    // -> no 3-cluster -> INOP.
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1150, Q, "B");
+    s[2] = MkSrc(1, 1300, Q, "C");
+    s[3] = MkSrc(0,    0, 0, "D");
+    s[4] = MkSrc(0,    0, 0, "NTS1");
+    s[5] = MkSrc(0,    0, 0, "NTS2");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+
+    // D4) Boundary: third core exactly 100ms from the center is included
+    // (<=) -> DEGRADED.
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1100, Q, "C");
+    s[3] = MkSrc(0,    0, 0, "D");
+    s[4] = MkSrc(0,    0, 0, "NTS1");
+    s[5] = MkSrc(0,    0, 0, "NTS2");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_DEGRADED);
+
+    // D5) One NTS up is still < 2 needed for OK; 4 cores agree -> DEGRADED.
+    s[0] = MkSrc(1, 2000, Q, "A");
+    s[1] = MkSrc(1, 2000, Q, "B");
+    s[2] = MkSrc(1, 2000, Q, "C");
+    s[3] = MkSrc(1, 2000, Q, "D");
+    s[4] = MkSrc(1, 2000, Q, "NTS1");
+    s[5] = MkSrc(0,    0, 0, "NTS2");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_DEGRADED);
+    CHECK_EQ_INT(best, 2000);
+
+    // D6) Core consensus survives QPC projection: staggered captures whose
+    // UTCs compensate all project together -> DEGRADED.
+    int64_t freq = Clock_QpcFreq();
+    int64_t t100 = freq / 10;
+    s[0] = MkSrc(1, 1000 - 100, Q - t100, "A");
+    s[1] = MkSrc(1, 1000,       Q,        "B");
+    s[2] = MkSrc(1, 1000 + 100, Q + t100, "C");
+    s[3] = MkSrc(0,    0, 0, "D");
+    s[4] = MkSrc(0,    0, 0, "NTS1");
+    s[5] = MkSrc(0,    0, 0, "NTS2");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_DEGRADED);
 }
 
 // ---------------------------------------------------------------------------
@@ -2487,7 +2617,9 @@ int main(void) {
     test_clock_fault_gate_and_escape();
     test_clock_short_interval_guard();
     test_clock_resume_consistent();
+    test_clock_degraded();
     test_ntp_concur();
+    test_ntp_concur_degraded();
     test_siv_rfc5297_appendix_a1();
     test_siv_rfc5297_appendix_a2();
     test_siv_edge_cases();

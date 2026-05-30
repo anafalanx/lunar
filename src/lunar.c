@@ -1466,6 +1466,31 @@ static void Paint(HDC fallbackDc) {
         }
     }
 
+    // Amber "UNAUTHENTICATED" badge while running on the degraded tier
+    // (NTS unavailable; core sources corroborate a held anchor). The dial
+    // stays readable; the badge marks the time as unauthenticated. This is
+    // mutually exclusive with "SYS" -- degraded implies a recent NTS-OK so
+    // Ntp_IsSynced() is still true.
+    if (drewDial && Clock_Trust() == TRUST_DEGRADED) {
+        int fs = (int)(S * 0.05f);
+        if (fs < 11) fs = 11;
+        EnsureTextFormat(fs);
+        if (g_txtSys) {
+            IDWriteTextFormat_SetTextAlignment(g_txtSys,
+                DWRITE_TEXT_ALIGNMENT_CENTER);
+            IDWriteTextFormat_SetParagraphAlignment(g_txtSys,
+                DWRITE_PARAGRAPH_ALIGNMENT_FAR);
+            float pad = fs * 0.7f;
+            D2D1_RECT_F rect = { 0, 0, dw, dh - pad };
+            D2D1_COLOR_F amber = { 0.95f, 0.62f, 0.05f, 1.0f };
+            SetBrush(amber);
+            ID2D1RenderTarget_DrawText(g_rt, L"UNAUTHENTICATED", 15,
+                g_txtSys, &rect, (ID2D1Brush*)g_brush,
+                D2D1_DRAW_TEXT_OPTIONS_NONE,
+                DWRITE_MEASURING_MODE_NATURAL);
+        }
+    }
+
     // Validate the trusted-display generation, but do NOT hold the clock
     // lock across EndDraw: a GPU-flushing present there would stall the
     // NTP aggregator for the whole submission. Check the generation
