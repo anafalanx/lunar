@@ -1,6 +1,28 @@
 #include <winver.h>
 #include <windows.h>
 
+// -------------------------------------------------------------------
+// Version macros.
+//
+// scripts/build.py reads the top-level VERSION file and passes these
+// via windres -D, so VERSION is the single source of truth.  The
+// fallbacks below only exist so a bare `windres lunar.rc` still
+// compiles; keep them in sync with VERSION.
+// -------------------------------------------------------------------
+
+#ifndef LUNAR_VERSION_STR
+#define LUNAR_VERSION_STR "0.4.0"
+#endif
+#ifndef LUNAR_VERSION_MAJOR
+#define LUNAR_VERSION_MAJOR 0
+#endif
+#ifndef LUNAR_VERSION_MINOR
+#define LUNAR_VERSION_MINOR 4
+#endif
+#ifndef LUNAR_VERSION_PATCH
+#define LUNAR_VERSION_PATCH 0
+#endif
+
 1 ICON "..\\assets\\icon.ico"
 
 // Embed the application manifest (v6 comctl32 + PerMonitorV2 DPI).
@@ -66,7 +88,7 @@ FONT 9, "Segoe UI", 400, 0, 0x1
 BEGIN
     ICON            "",                               2001,    52,  11,  28,  28
     LTEXT           "Lunar",                          2002,    90,  12, 100,  18
-    LTEXT           "Version 0.3.0",                  2003,    90,  30, 100,  10
+    LTEXT           "Version " LUNAR_VERSION_STR,     2003,    90,  30, 100,  10
     LTEXT           "A minimalist analog clock.",     2004,    12,  52, 176,  10, SS_CENTER
     LTEXT           "Native Win32 with Direct2D rendering.",
                                                       2005,    12,  64, 176,  10, SS_CENTER
@@ -77,8 +99,8 @@ BEGIN
 END
 
 1 VERSIONINFO
- FILEVERSION 0,3,0,0
- PRODUCTVERSION 0,3,0,0
+ FILEVERSION LUNAR_VERSION_MAJOR,LUNAR_VERSION_MINOR,LUNAR_VERSION_PATCH,0
+ PRODUCTVERSION LUNAR_VERSION_MAJOR,LUNAR_VERSION_MINOR,LUNAR_VERSION_PATCH,0
  FILEOS VOS__WINDOWS32
  FILETYPE VFT_APP
 BEGIN
@@ -88,11 +110,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "Lunar"
             VALUE "FileDescription", "Lunar - analog clock"
-            VALUE "FileVersion", "0.3.0"
+            VALUE "FileVersion", LUNAR_VERSION_STR
             VALUE "InternalName", "Lunar"
             VALUE "OriginalFilename", "Lunar.exe"
             VALUE "ProductName", "Lunar"
-            VALUE "ProductVersion", "0.3.0"
+            VALUE "ProductVersion", LUNAR_VERSION_STR
         END
     END
     BLOCK "VarFileInfo"

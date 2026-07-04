@@ -19,4 +19,8 @@ __pycache__/
 # Vendored sources (fetched on demand)
 vendor/
 
+# Local scratch / experiments (not part of the project)
+.drenn/
+drenn.exe
+experiments/
 

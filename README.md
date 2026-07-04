@@ -1,23 +1,26 @@
 # Lunar
 
-Minimalist analog clock for Windows. Version 0.2.0, native C + Direct2D.
+Minimalist analog clock for Windows. Native C + Direct2D.
+
+Current version: **0.4.0** — single-sourced from the top-level
+[`VERSION`](VERSION) file (the build injects it into the exe's version
+resource and `build/version.h`).
 
 ## Build
 
-Requires:
+Requires **MSYS2 UCRT64** with `gcc`, `windres`, and Python:
 
-- **MSYS2 UCRT64** with `gcc` and `windres`:
-
-      pacman -S mingw-w64-ucrt-x86_64-gcc
-
-- **Python 3.12+** (for the build tooling). A local virtual environment is
-  expected at `.venv/`:
-
-      py -3 -m venv .venv
+    pacman -S mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-python
 
 From the project root:
 
-    .venv\Scripts\python.exe scripts/build.py
+    C:\msys64\ucrt64\bin\python.exe scripts/build.py
+
+Any Python 3.12+ works for the build tooling; a local virtual
+environment (`py -3 -m venv .venv`, then
+`.venv\Scripts\python.exe scripts/build.py`) is fine too, but the
+MSYS2 UCRT64 interpreter is the recommended default since MSYS2 is
+required anyway for the toolchain.
 
 Options:
 
@@ -38,9 +41,10 @@ fully static (libgcc/libstdc++ linked in, mbedTLS archived in).
     src/         # C source (Win32 shell + Direct2D renderer)
     assets/      # icons, fonts
     scripts/     # Python build tooling (build.py, gen_tz_embed.py)
-    third_party/ # vendored mbedTLS + tzdata
+    third_party/ # vendored mbedTLS + IANA tzdata zoneinfo subset
+                 # (see third_party/tzdata/README.md)
     tests/       # C unit tests + Python smoke tests
-    .venv/       # local Python environment (git-ignored)
+    .venv/       # optional local Python environment (git-ignored)
 
 ## Architecture
 
@@ -65,3 +69,9 @@ fully static (libgcc/libstdc++ linked in, mbedTLS archived in).
 - Runtime dependencies: only OS-shipped DLLs (`d2d1`, `dwrite`,
   `user32`, `gdi32`, `comctl32`, `winmm`, `kernel32`, `ws2_32`,
   `bcrypt`, `ole32`, `uxtheme`, `dwmapi`, `advapi32`, `shell32`).
+
+## License
+
+MIT — see [LICENSE](LICENSE). Vendored third-party components keep
+their own licenses (see `third_party/README.md` and
+`third_party/tzdata/README.md`).

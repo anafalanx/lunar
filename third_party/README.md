@@ -10,6 +10,16 @@ The full source is committed to the repo so that:
 
 ----------------------------------------------------------------------
 
+## tzdata/
+
+A version-pinned subset of the compiled IANA time zone database
+(zoneinfo). It is the hermetic default input to
+`scripts/gen_tz_embed.py`, which produces the tzdata snapshot embedded
+in `Lunar.exe` (`src/tz_embed.c`). Version, contents, and the refresh
+procedure are documented in `tzdata/README.md`.
+
+----------------------------------------------------------------------
+
 ## mbedtls-3.6.6/
 
 Mbed TLS 3.6.6 LTS. Used for TLS 1.3 client handshakes during

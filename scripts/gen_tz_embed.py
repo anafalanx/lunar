@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """Generate src/tz_embed.c: an IANA tzdata blob and canonical zone index.
 
-Input : a zoneinfo directory (TZif files) such as MSYS2's
-        C:\\msys64\\usr\\share\\zoneinfo, plus its `zone1970.tab` file.
+Input : a zoneinfo directory (TZif files) plus its `zone1970.tab` file.
+        Defaults to the vendored tree at third_party/tzdata/zoneinfo so
+        the build is hermetic (two machines building the same commit see
+        identical inputs); see third_party/tzdata/README.md for the
+        refresh procedure.  A system tree such as MSYS2's
+        C:\\msys64\\usr\\share\\zoneinfo can be passed via --zoneinfo,
+        but the output then depends on whatever tzdata that machine has
+        installed.
 
 Output: src/tz_embed.c -- a C translation unit that publishes
 
@@ -34,16 +40,26 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_ZI = Path(r"C:\msys64\usr\share\zoneinfo")
+# Vendored, version-pinned zoneinfo tree -- the hermetic default.
+# Refresh procedure: third_party/tzdata/README.md.
+DEFAULT_ZI = (Path(__file__).resolve().parents[1]
+              / "third_party" / "tzdata" / "zoneinfo")
+
+# Fallback for machines without the repo checkout layout: MSYS2's
+# system tree.  Non-hermetic (output depends on the installed tzdata
+# package), so it must be requested explicitly:
+#     py scripts/gen_tz_embed.py --zoneinfo C:\msys64\usr\share\zoneinfo
+MSYS2_ZI = Path(r"C:\msys64\usr\share\zoneinfo")
 
 # Lunar only displays "now".  Everything strictly before this cutoff
 # gets discarded from each zone's transition table -- the saved space
 # is substantial (raw tzdata is ~200 KB of mostly pre-WWII history).
 # Any time >= CUTOFF resolves correctly via the trimmed table + POSIX
-# footer.  Regenerate yearly (or whenever tzdata updates) to advance
-# the cutoff.
-CUTOFF_EPOCH = int(_dt.datetime(2026, 1, 1,
-                                tzinfo=_dt.timezone.utc).timestamp())
+# footer.  Derived at generation time as Jan 1 (UTC) of the current
+# year, so regenerating yearly (or whenever tzdata updates) advances
+# the cutoff automatically.
+CUTOFF_EPOCH = int(_dt.datetime(_dt.datetime.now(_dt.timezone.utc).year,
+                                1, 1, tzinfo=_dt.timezone.utc).timestamp())
 
 
 def _u32(b: bytes, o: int) -> int: return struct.unpack(">I", b[o:o + 4])[0]
@@ -346,7 +362,10 @@ def build(zi: Path, out_path: Path) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--zoneinfo", type=Path, default=DEFAULT_ZI,
-                    help=f"Path to the zoneinfo dir (default: {DEFAULT_ZI})")
+                    help="Path to the zoneinfo dir (default: the vendored "
+                         f"tree at {DEFAULT_ZI}; a system tree such as "
+                         f"{MSYS2_ZI} may be given instead, at the cost "
+                         "of hermeticity)")
     ap.add_argument("--out", type=Path,
                     default=Path(__file__).resolve().parents[1] / "src" / "tz_embed.c",
                     help="Output .c path (default: src/tz_embed.c)")
