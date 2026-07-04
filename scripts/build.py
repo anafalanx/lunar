@@ -115,6 +115,29 @@ def read_version() -> str:
     return v
 
 
+def check_manifest_version(version: str) -> None:
+    """Fail the build if src/lunar.manifest has drifted from VERSION.
+
+    lunar.rc embeds src/lunar.manifest verbatim as RT_MANIFEST, so unlike
+    the .rc version fields (overridden by windres -D) the manifest's
+    assemblyIdentity version is NOT templated by the build. This guard
+    locks its four-part identity (X.Y.Z.0) to VERSION so it can never
+    silently ship stale again.
+    """
+    manifest = SRC / "lunar.manifest"
+    want = f"{version}.0"
+    try:
+        text = manifest.read_text(encoding="utf-8")
+    except OSError as e:
+        die(f"cannot read {manifest}: {e}")
+    m = re.search(r'name="Lunar"\s+version="([0-9.]+)"', text)
+    if not m:
+        die(f"{manifest}: cannot find the Lunar assemblyIdentity version")
+    if m.group(1) != want:
+        die(f"{manifest}: assemblyIdentity version {m.group(1)!r} != "
+            f"{want!r} (VERSION is {version}); bump the manifest to match")
+
+
 def write_version_header(build_dir: Path = BUILD,
                          version: str | None = None) -> Path:
     """Generate <build_dir>/version.h from the VERSION file.
@@ -309,6 +332,7 @@ def main() -> None:
 
     version = read_version()
     v_major, v_minor, v_patch = version.split(".")
+    check_manifest_version(version)
     write_version_header(BUILD, version)
     log(f"Version {version} (from VERSION)")
 
@@ -321,7 +345,7 @@ def main() -> None:
         windres,
         # The backslash-escaped quotes survive windres's preprocessor
         # invocation, so lunar.rc sees a proper C string literal. A bare
-        # -DLUNAR_VERSION_STR="0.4.0" loses its quotes on the way to
+        # -DLUNAR_VERSION_STR="X.Y.Z" loses its quotes on the way to
         # the preprocessor and breaks the .rc parse.
         f'-DLUNAR_VERSION_STR=\\"{version}\\"',
         f"-DLUNAR_VERSION_MAJOR={v_major}",

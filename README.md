@@ -49,7 +49,8 @@ fully static (libgcc/libstdc++ linked in, mbedTLS archived in).
     assets/      # icons, fonts
     scripts/     # Python build tooling (build.py, gen_tz_embed.py)
     third_party/ # vendored mbedTLS + IANA tzdata zoneinfo subset
-                 # (see third_party/tzdata/README.md)
+                 # + CLDR windowsZones (build-time only; see the
+                 # per-directory READMEs under third_party/)
     tests/       # C unit tests + Python smoke tests
     .venv/       # optional local Python environment (git-ignored)
 
@@ -97,5 +98,7 @@ fully static (libgcc/libstdc++ linked in, mbedTLS archived in).
 ## License
 
 MIT — see [LICENSE](LICENSE). Vendored third-party components keep
-their own licenses (see `third_party/README.md` and
-`third_party/tzdata/README.md`).
+their own licenses: mbedTLS (Apache-2.0,
+`third_party/mbedtls-3.6.6/LICENSE`), IANA tzdata (public domain,
+`third_party/tzdata/README.md`), and CLDR windowsZones (Unicode License
+v3, `third_party/cldr/LICENSE`). Overview in `third_party/README.md`.

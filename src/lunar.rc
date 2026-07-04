@@ -11,13 +11,13 @@
 // -------------------------------------------------------------------
 
 #ifndef LUNAR_VERSION_STR
-#define LUNAR_VERSION_STR "0.4.0"
+#define LUNAR_VERSION_STR "0.20.0"
 #endif
 #ifndef LUNAR_VERSION_MAJOR
 #define LUNAR_VERSION_MAJOR 0
 #endif
 #ifndef LUNAR_VERSION_MINOR
-#define LUNAR_VERSION_MINOR 4
+#define LUNAR_VERSION_MINOR 20
 #endif
 #ifndef LUNAR_VERSION_PATCH
 #define LUNAR_VERSION_PATCH 0

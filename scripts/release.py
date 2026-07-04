@@ -53,12 +53,13 @@ def sign_exe(exe: Path) -> None:
 
     LUNAR_SIGN_CMD is a full command line; the literal placeholder {exe}
     is replaced with the path of the exe to sign (the path is appended if
-    the placeholder is absent). Example:
+    the placeholder is absent). Example (Certum via SimplySign, what we
+    use -- connect SimplySign Desktop first so /a finds the cloud cert):
 
-        set LUNAR_SIGN_CMD=signtool sign /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib ... {exe}
+        set LUNAR_SIGN_CMD=signtool sign /a /tr http://time.certum.pl /td sha256 /fd sha256 /v {exe}
 
-    See docs/distribution.md for concrete setups (Azure Trusted Signing,
-    OV certificate).
+    See docs/distribution.md for the full Certum Open Source Code Signing
+    setup.
     """
     template = os.environ.get("LUNAR_SIGN_CMD", "").strip()
     if not template:

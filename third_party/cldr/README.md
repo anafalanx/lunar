@@ -9,7 +9,9 @@
 - `typeVersion` in the file: `2021a` — this is CLDR's own internal tag
   and lags the actual content; the pinned commit above shows the mapping
   was maintained through TZDB 2025b.
-- Licence:     Unicode License v3 (CLDR)
+- Licence:     Unicode License v3 (CLDR) — full text bundled alongside
+  this file in [`LICENSE`](LICENSE); the notice must accompany any
+  redistribution of the data.
 
 ## Why this exists
 

@@ -1558,8 +1558,8 @@ static INT_PTR CALLBACK AboutDlgProc(HWND hdlg, UINT msg,
         return TRUE;
     }
     case WM_CTLCOLORSTATIC: {
-        // Subdued gray for the "Version 0.3.0" and tz lines; default
-        // for everything else.  Dialog background is COLOR_BTNFACE.
+        // Subdued gray for the "Version" and tz lines; default for
+        // everything else.  Dialog background is COLOR_BTNFACE.
         HDC hdc = (HDC)wp;
         int ctlId = GetDlgCtrlID((HWND)lp);
         SetBkMode(hdc, TRANSPARENT);

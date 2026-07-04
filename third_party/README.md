@@ -81,3 +81,18 @@ key writing, weak curves, weak hashes, and deprecated APIs.
 5. Build. The cache-key hash of the archive will change, triggering
    a full recompile of the vendored tree. Run tests and smoke.
 6. Commit as a single commit titled "Bump mbedTLS to X.Y.Z".
+
+----------------------------------------------------------------------
+
+## cldr/
+
+The CLDR `windowsZones.xml` mapping (Windows time-zone key → IANA name).
+Used at **build time only** by `scripts/gen_win_tzmap.dr` to generate
+`src/tz_winmap_gen.c`, so a fresh install can open on the user's likely
+zone instead of UTC. The XML itself is **not** linked into `Lunar.exe`.
+Pinned commit, provenance, and the refresh procedure are in
+`cldr/README.md`.
+
+- Upstream:  unicode-org/cldr, `common/supplemental/windowsZones.xml`
+- Licence:   Unicode License v3 — full text in `cldr/LICENSE`; the
+  copyright/permission notice must accompany redistribution of the data.

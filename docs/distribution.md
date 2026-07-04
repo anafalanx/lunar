@@ -6,55 +6,59 @@ SmartScreen scaring them off. Audience: whoever cuts releases.
 ## 1. Code signing (Authenticode)
 
 Unsigned exes get the red "Windows protected your PC" interstitial and
-poor winget/Defender treatment. Two realistic options for an indie/OSS
-Windows product in 2026:
+poor winget/Defender treatment (an unsigned build here has tripped
+Defender's `Wacatac` ML heuristic mid-link). Every published Lunar
+binary is Authenticode-signed and RFC-3161 timestamped.
 
-### Option A (recommended): Azure Trusted Signing
+### Certum Open Source Code Signing (what we use)
 
-- ~$9.99/month (Basic tier), no hardware token, no cert files to guard.
-- Certs are short-lived and auto-rotated; identity validation is done
-  once against you/your org.
-- Integrates directly with `signtool` via a dlib, so it slots into
-  `LUNAR_SIGN_CMD` unchanged.
-- Microsoft-operated, so SmartScreen reputation accrues noticeably
-  faster than with third-party OV certs.
+Lunar is signed with a **Certum Open Source Code Signing** certificate
+through **SimplySign** — the same cloud-key setup used for the author's
+other tools (`els`, `drang`). No hardware dongle: the private key lives
+in Certum's cloud HSM and is exposed to `signtool` through SimplySign
+Desktop.
 
-Setup once: create a Trusted Signing account + certificate profile in
-Azure, install the client tools (`Azure.CodeSigning.Dlib.dll`, comes with
-the "Trusted Signing Client Tools" / `Microsoft.Trusted.Signing.Client`
-NuGet package), write `metadata.json` with your `Endpoint`,
-`CodeSigningAccountName`, `CertificateProfileName`, and authenticate
-(e.g. `az login` or the `AZURE_TENANT_ID`/`AZURE_CLIENT_ID`/
-`AZURE_CLIENT_SECRET` env vars).
+Publisher on the signature reads
+`Open Source Developer Vincent Vercauteren`.
 
-Then:
+Steps to sign a release:
 
-```
-set LUNAR_SIGN_CMD=signtool sign /v /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib "C:\tools\Azure.CodeSigning.Dlib.dll" /dmdf "C:\tools\metadata.json" {exe}
-```
+1. **Connect SimplySign Desktop** and log in (phone OTP). While the
+   session is active, the code-signing certificate appears in
+   `Cert:\CurrentUser\My` and `signtool /a` will auto-select it.
+2. Sign the staged exe:
 
-### Option B: classic OV code-signing certificate
+   ```
+   signtool sign /a /tr http://time.certum.pl /td sha256 /fd sha256 /v Lunar.exe
+   ```
 
-- ~$200-400/year from Certum, Sectigo, SSL.com, etc.
-- Since the 2023 CA/B rules, the private key must live on a FIPS token
-  or cloud HSM — expect a USB dongle (blocks headless CI) or the CA's
-  cloud-signing service.
-- SmartScreen reputation builds slowly per-cert; expect warnings on the
-  first weeks/downloads of each new cert.
+   The `/tr … /td sha256` RFC-3161 timestamp is mandatory so the
+   signature outlives the certificate.
+3. Verify before publishing:
 
-```
-set LUNAR_SIGN_CMD=signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /sha1 <CERT_THUMBPRINT> {exe}
-```
+   ```
+   signtool verify /pa /all /v Lunar.exe
+   ```
 
-### How the hook works
+   Confirm the chain terminates at `Certum Trusted Network CA` and the
+   output says `The signature is timestamped:`.
+
+> SmartScreen reputation for an OV/open-source cert accrues per-cert and
+> per-file; expect a warning on the first downloads of a new cert until
+> reputation builds. Keeping the same cert and always timestamping is
+> what makes that reputation stick.
+
+### The `LUNAR_SIGN_CMD` hook
 
 `scripts/release.py` runs `LUNAR_SIGN_CMD` (with `{exe}` replaced by the
-staged exe path) after the build and before hashing/zipping, then
-verifies with `signtool verify /pa` if signtool is on PATH. If
-`LUNAR_SIGN_CMD` is unset it prints a prominent UNSIGNED warning and
-continues — dev dry-runs stay friction-free, real releases must set it.
-Always use an RFC 3161 timestamp (`/tr ... /td SHA256`) so signatures
-outlive the cert.
+staged exe path) after the build and before hashing, then verifies with
+`signtool verify /pa`. If `LUNAR_SIGN_CMD` is unset it prints a prominent
+UNSIGNED warning and continues — dev dry-runs stay friction-free, real
+releases must set it:
+
+```
+set LUNAR_SIGN_CMD=signtool sign /a /tr http://time.certum.pl /td sha256 /fd sha256 /v {exe}
+```
 
 ## 2. Release checklist
 
@@ -66,22 +70,34 @@ outlive the cert.
    `python tests/test_smoke.py` (launches a real window; needs a desktop
    session). Both must be green — CI must also be green on the release
    commit.
-5. **Sign + zip**: set `LUNAR_SIGN_CMD` (above), then
-   `python scripts/release.py`. Confirm the log shows "Signature
-   verified" and "Copied LICENSE", and note the printed SHA-256.
-6. **GitHub Release**: tag `vX.Y.Z`, upload
-   `dist/Lunar-X.Y.Z-win-x64.zip`, paste the exe SHA-256 into the notes.
-7. **winget PR**: instantiate `packaging/winget/` templates with the
-   version and the **zip's** SHA-256, validate, and PR to
-   microsoft/winget-pkgs (see `packaging/winget/README.md`).
+5. **Sign + verify**: connect SimplySign, then sign the built
+   `build/Lunar.exe` with the command in §1 and verify it. Note the
+   printed SHA-256 of the signed exe.
+6. **GitHub Release**: tag `vX.Y` (or `vX.Y.Z`), upload the signed
+   `Lunar.exe` as the release asset, and paste its SHA-256 into the
+   notes. Lunar ships as a single self-contained exe — the exe *is* the
+   artifact, no installer or archive required.
+7. **Round-trip**: download the published asset, re-run
+   `signtool verify /pa /all /v` and compare SHA-256 against the notes.
+8. **winget PR** (optional): instantiate `packaging/winget/` templates
+   with the version, the signed exe's `InstallerUrl`, and its SHA-256,
+   validate, and PR to microsoft/winget-pkgs (see
+   `packaging/winget/README.md`). The `portable` install type points
+   directly at the signed exe.
 
-## 3. Deliberately deferred to the Rust rewrite
+## 3. Updates and deferred scope
 
-- **Auto-update client.** Update checking/downloading/swapping is a
-  security-critical subsystem (TLS pinning, signature verification of
-  updates, rollback protection) that we do not want to build twice in C.
-  Until then: users update via winget or by replacing the exe; each
-  release's SHA-256 is published in README.txt and the release notes.
-- **MSI/MSIX installer.** The single-file portable exe plus winget's
-  `portable` type covers current needs; an installer only earns its keep
-  once auto-update or per-machine installs exist.
+- **Passive update check (shipped).** Lunar notices when a newer release
+  exists by querying the GitHub Releases API over its *own* hardened,
+  CA-validated stack (pinned DoH + mbedTLS, no external process) and
+  surfaces a notice that links to the release page. It downloads and
+  installs nothing — see `src/update_check.c`.
+- **Auto-download/swap (deferred).** Fetching, verifying, and swapping
+  the binary in place is a security-critical subsystem (signature
+  verification of the update, rollback protection) not yet built. Until
+  then, users update via winget or by replacing the exe; every release's
+  SHA-256 is published in the release notes and the binary is signed, so
+  a replacement can be verified before it runs.
+- **MSI/MSIX installer (deferred).** The single-file portable exe plus
+  winget's `portable` type covers current needs; an installer only earns
+  its keep once per-machine installs or auto-update exist.
