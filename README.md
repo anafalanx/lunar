@@ -58,12 +58,19 @@ fully static (libgcc/libstdc++ linked in, mbedTLS archived in).
   national-metrology / research-lab servers and two NTS-authenticated
   anchors (RFC 8915, TLS 1.3, local enrolled SPKI pins). The trust gate
   requires two operator-diverse NTS anchors to agree and at least 3 of 4
-  core sources to concur. If NTS is unavailable but at least 3 core
-  sources still corroborate the held anchor within a tighter 100 ms gate
-  and the last authenticated sync was under two hours ago, the clock keeps
-  running in a degraded, rate-frozen state and badges the time
-  UNAUTHENTICATED rather than going dark; anything weaker renders the red
-  INOP state.
+  core sources to concur.
+- The display policy is **fail-honest**: the clock never silently lies,
+  but it also never goes dark just because the network did. In
+  descending confidence: full trust; **UNAUTHENTICATED** (NTS down, but
+  3+ core sources corroborate the held anchor within 100 ms, allowed
+  for up to 8 h after the last authenticated cycle); **UNSYNCED
+  holdover** (no live consensus at all — the dial keeps running on the
+  disciplined oscillator with an honest, growing worst-case error bound
+  badge, ~12 ms/min); **REACQUIRING** (suspend/resume or session
+  handoff broke timing continuity — the face shows the last verified
+  time, greyed and frozen with its age, until an authenticated cycle
+  re-anchors). The red INOP face is reserved for genuinely unrenderable
+  states: no sync yet this run, or a local fault.
 - Time zones come from an IANA tzdata snapshot embedded at build time;
   the OS time-zone API is never consulted.
 - Runtime dependencies: only OS-shipped DLLs (`d2d1`, `dwrite`,

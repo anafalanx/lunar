@@ -3,6 +3,23 @@
 Seven open problems identified during the April 2026 hardening audit.
 Ranked roughly by time-urgency / severity.
 
+> **Status update (July 2026, M1 "survivable in the field" branch):**
+> the display policy moved from fail-closed to fail-honest (see
+> README "Architecture"), which resolved or restated several entries:
+> **#3** the escape hatch is now the ordinary, visible recovery path —
+> the first two disagreeing cycles display as holdover with the bound
+> inflated to cover the disagreement, and the third snaps with a
+> prominent `*** TIME STEP ***` event-log entry. **#4** the
+> out-of-process watchdog and its overlay were removed entirely (the
+> reciprocal display gate blanked healthy clocks when EDR blocked the
+> self-re-exec; in-process generation-token checks around EndDraw
+> remain). **#5** `WM_WTSSESSION_CHANGE` is now handled: session
+> reconnect/unlock breaks timing continuity the same way resume does
+> and the face shows the last verified time until re-anchored.
+> **#6** all persistence now uses atomic tmp+rename writes (the MAC
+> question stands, accepted as out-of-scope for same-user attackers).
+> **#1** and **#7** remain open and tracked below.
+
 ---
 
 ## 1. SPKI Pin Expiry — Runtime Enrollment Needed
