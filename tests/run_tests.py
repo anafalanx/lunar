@@ -50,6 +50,7 @@ def main() -> int:
         TESTS / "test_core.c",   # #includes ../src/lunar.c with LUNAR_NO_MAIN
         SRC  / "app_paths.c",
         SRC  / "sysvol.c",
+        SRC  / "netutil.c",
         SRC  / "ntp.c",
         SRC  / "clock.c",
         SRC  / "logbuf.c",

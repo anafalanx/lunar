@@ -42,6 +42,7 @@
 #include "nts_ef.h"
 #include "clock.h"
 #include "dns.h"
+#include "netutil.h"
 #include "logbuf.h"
 #include "pinned_tls.h"
 #include "pin_store.h"
@@ -161,47 +162,26 @@ size_t Nts_PickProviders(const NtsProvider **out, size_t n_want)
 
 static SOCKET tcp_connect(const char *host, uint16_t port)
 {
-    // Resolve via DoH (pinned, randomized resolver failover). No getaddrinfo
-    // fallback: an attacker able to forge plain DNS could redirect
-    // our NTS-KE TLS session to a host whose leaf they control.
-    // SPKI pinning would still refuse that session, but failing
-    // BEFORE we connect is both cheaper and clearer in logs.
-    char ip[16];
-    if (Dns_Resolve(host, ip) != 0) return INVALID_SOCKET;
-
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port   = htons(port);
-    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) return INVALID_SOCKET;
-
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return INVALID_SOCKET;
-
-    // Non-blocking connect with select() for a hard timeout.
-    u_long nb = 1;
-    ioctlsocket(s, FIONBIO, &nb);
-    int cr = connect(s, (struct sockaddr *)&sa, (int)sizeof sa);
-    if (cr != 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
-        closesocket(s); return INVALID_SOCKET;
+    // Resolve via pinned DoH first (dual-stack A/AAAA). If every pinned
+    // resolver is blocked -- common on corporate networks that force
+    // their own DNS and firewall 443 to public resolvers -- fall back
+    // to the OS resolver. That fallback is safe HERE and only here: the
+    // NTS-KE session below is authenticated by a locally enrolled SPKI
+    // pin, so a forged system-DNS answer cannot redirect us to a host
+    // whose leaf an attacker controls -- it fails at TLS. (Core SNTP,
+    // which is unauthenticated, must never do this.)
+    char ip[NET_IP_STRLEN];
+    int  fam = AF_UNSPEC;
+    if (Dns_ResolveEx(host, ip, &fam) != 0) {
+        if (Dns_ResolveSystem(host, ip, &fam) != 0) return INVALID_SOCKET;
     }
 
-    fd_set wfd; FD_ZERO(&wfd); FD_SET(s, &wfd);
-    struct timeval tv;
-    tv.tv_sec  =  NTS_CONNECT_TIMEOUT_MS / 1000;
-    tv.tv_usec = (NTS_CONNECT_TIMEOUT_MS % 1000) * 1000;
-    int sel = select(0, NULL, &wfd, NULL, &tv);
-    if (sel <= 0) { closesocket(s); return INVALID_SOCKET; }
+    struct sockaddr_storage sa;
+    int salen = 0;
+    if (Net_ParseIp(ip, port, &sa, &salen) == AF_UNSPEC) return INVALID_SOCKET;
 
-    int err = 0; int errlen = sizeof err;
-    getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen);
-    if (err != 0) { closesocket(s); return INVALID_SOCKET; }
-
-    nb = 0; ioctlsocket(s, FIONBIO, &nb);
-    DWORD tmo = NTS_IO_TIMEOUT_MS;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof tmo);
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tmo, sizeof tmo);
-    return s;
+    return Net_ConnectStream(&sa, salen,
+                             NTS_CONNECT_TIMEOUT_MS, NTS_IO_TIMEOUT_MS);
 }
 
 // ---------------------------------------------------------------------------
@@ -521,30 +501,29 @@ int Nts_FetchSampleEx(const NtsProvider *p,
     int           rc = 0;
     SOCKET        s  = INVALID_SOCKET;
 
-    // DoH resolution: same no-fallback policy as tcp_connect above.
-    // The host here is either the NTS-KE host or an override the
-    // server sent via NTSKE_REC_NTPV4_SERVER. Either way, we MUST NOT
-    // trust OS DNS to tell us where to send our authenticated SNTP
-    // packet.
-    char ip[16];
-    if (Dns_Resolve(host, ip) != 0) goto udp_done;
+    // Dual-stack DoH, with the same NTS-only system-DNS fallback as
+    // tcp_connect. The host here is the NTS-KE host or an override the
+    // server sent via NTSKE_REC_NTPV4_SERVER; either way the SNTP
+    // exchange is AEAD-authenticated with c2s/s2c keys, so a forged DNS
+    // answer that redirects us cannot forge a valid sample -- the
+    // authenticator check drops it. Safe to fall back to OS DNS when
+    // pinned DoH is blocked.
+    char ip[NET_IP_STRLEN];
+    int  fam = AF_UNSPEC;
+    if (Dns_ResolveEx(host, ip, &fam) != 0) {
+        if (Dns_ResolveSystem(host, ip, &fam) != 0) goto udp_done;
+    }
 
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port   = htons(port);
-    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) goto udp_done;
+    struct sockaddr_storage sa;
+    int salen = 0;
+    if (Net_ParseIp(ip, port, &sa, &salen) == AF_UNSPEC) goto udp_done;
 
-    s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    s = Net_DgramSocket(fam, NTS_UDP_TIMEOUT_MS);
     if (s == INVALID_SOCKET) goto udp_done;
-
-    DWORD tmo = NTS_UDP_TIMEOUT_MS;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof tmo);
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tmo, sizeof tmo);
 
     int64_t qpcT1 = Clock_Qpc();
     int sent = sendto(s, (const char *)pkt, (int)pkt_len, 0,
-                      (struct sockaddr *)&sa, (int)sizeof sa);
+                      (struct sockaddr *)&sa, salen);
     if (sent != (int)pkt_len) goto udp_done;
 
     uint8_t reply[NTS_UDP_MAX_PKT];

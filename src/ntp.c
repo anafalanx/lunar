@@ -52,6 +52,7 @@
 #include "clock.h"
 #include "nts.h"
 #include "dns.h"
+#include "netutil.h"
 #include "logbuf.h"
 #include "app_paths.h"
 #include "pin_store.h"
@@ -258,27 +259,24 @@ static int NtpQueryHost(const char *host,
     // Resolve via pinned DoH with randomized resolver failover so an
     // on-path attacker cannot redirect this SNTP packet to a fake UDP
     // listener by forging a plain-DNS reply. See src/dns.h for the
-    // design rationale. No fallback to getaddrinfo: if all pinned DoH
-    // resolvers fail, this source fails and the cycle goes INOP.
-    char ip[16];
-    if (Dns_Resolve(host, ip) != 0) return 0;
+    // design rationale. Dual-stack (A or AAAA), but NO fallback to
+    // getaddrinfo: core SNTP is unauthenticated, so system DNS would be
+    // a spoofing hole. If all pinned DoH resolvers fail, this source
+    // fails and the cycle degrades.
+    char ip[NET_IP_STRLEN];
+    int  fam = AF_UNSPEC;
+    if (Dns_ResolveEx(host, ip, &fam) != 0) return 0;
 
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port   = htons(NTP_PORT_NUM);
-    if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) return 0;
+    struct sockaddr_storage sa;
+    int salen = 0;
+    if (Net_ParseIp(ip, NTP_PORT_NUM, &sa, &salen) == AF_UNSPEC) return 0;
 
-    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    SOCKET s = Net_DgramSocket(fam, NTP_TIMEOUT_MS);
     if (s == INVALID_SOCKET) return 0;
-
-    DWORD tmo = NTP_TIMEOUT_MS;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof(tmo));
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tmo, sizeof(tmo));
 
     int64_t qpcT1 = Clock_Qpc();
     int sent = sendto(s, (const char *)pkt, (int)sizeof(pkt), 0,
-                      (struct sockaddr *)&sa, (int)sizeof sa);
+                      (struct sockaddr *)&sa, salen);
     if (sent != (int)sizeof(pkt)) { closesocket(s); return 0; }
 
     int recvd = recv(s, (char *)pkt, (int)sizeof(pkt), 0);

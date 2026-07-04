@@ -354,6 +354,7 @@ def main() -> None:
         str(SRC / "lunar.c"),
         str(SRC / "app_paths.c"),
         str(SRC / "sysvol.c"),
+        str(SRC / "netutil.c"),
         str(SRC / "ntp.c"),
         str(SRC / "clock.c"),
         str(SRC / "logbuf.c"),

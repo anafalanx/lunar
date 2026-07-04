@@ -9,6 +9,7 @@
 #include "../src/lunar.c"
 #include "../src/tzif.h"
 #include "../src/dns.h"
+#include "../src/netutil.h"
 #include "../src/pin_store.h"
 #include "../src/cert_verify_win.h"
 
@@ -2985,6 +2986,72 @@ static void test_dns_parse_response(void) {
                                     ips, 8, &n_ips, &min_ttl), -2);
 }
 
+// Net_ParseIp: IPv4 and IPv6 literals -> the right family + sockaddr len.
+static void test_net_parseip(void) {
+    struct sockaddr_storage ss;
+    int len = 0;
+
+    CHECK_EQ_INT(Net_ParseIp("93.184.216.34", 123, &ss, &len), AF_INET);
+    CHECK_EQ_INT(len, (int)sizeof(struct sockaddr_in));
+    CHECK_EQ_INT(((struct sockaddr_in *)&ss)->sin_port, htons(123));
+
+    CHECK_EQ_INT(Net_ParseIp("2606:4700:4700::1111", 4460, &ss, &len),
+                 AF_INET6);
+    CHECK_EQ_INT(len, (int)sizeof(struct sockaddr_in6));
+    CHECK_EQ_INT(((struct sockaddr_in6 *)&ss)->sin6_port, htons(4460));
+
+    // Compressed and full v6 forms both parse.
+    CHECK_EQ_INT(Net_ParseIp("::1", 1, &ss, &len), AF_INET6);
+    CHECK_EQ_INT(Net_ParseIp("2001:db8:0:0:0:0:0:1", 1, &ss, &len), AF_INET6);
+
+    // Garbage -> AF_UNSPEC.
+    CHECK_EQ_INT(Net_ParseIp("not-an-ip", 1, &ss, &len), AF_UNSPEC);
+    CHECK_EQ_INT(Net_ParseIp("999.1.1.1", 1, &ss, &len), AF_UNSPEC);
+}
+
+// Dns_ParseResponse for AAAA: a crafted response yields the formatted
+// IPv6 string, and the general parser agrees with the A-only one on A.
+static void test_dns_parse_aaaa(void) {
+    // id=0x1234, QR/RD/RA, QDCOUNT=1, ANCOUNT=1; question example.com/AAAA;
+    // one AAAA record 2001:db8::1 (TTL 200) via a 0xC00C name pointer.
+    uint8_t r[512];
+    size_t  pos = 0;
+    r[pos++] = 0x12; r[pos++] = 0x34;
+    r[pos++] = 0x81; r[pos++] = 0x80;
+    r[pos++] = 0x00; r[pos++] = 0x01;
+    r[pos++] = 0x00; r[pos++] = 0x01;
+    r[pos++] = 0x00; r[pos++] = 0x00;
+    r[pos++] = 0x00; r[pos++] = 0x00;
+    r[pos++] = 7; memcpy(r + pos, "example", 7); pos += 7;
+    r[pos++] = 3; memcpy(r + pos, "com",     3); pos += 3;
+    r[pos++] = 0;
+    r[pos++] = 0; r[pos++] = 28;              // type AAAA
+    r[pos++] = 0; r[pos++] = 1;               // class IN
+    r[pos++] = 0xc0; r[pos++] = 0x0c;         // name ptr
+    r[pos++] = 0; r[pos++] = 28;              // AAAA
+    r[pos++] = 0; r[pos++] = 1;               // IN
+    r[pos++] = 0; r[pos++] = 0; r[pos++] = 0; r[pos++] = 200;  // TTL
+    r[pos++] = 0; r[pos++] = 16;              // rdlen
+    // 2001:0db8:0000:...:0001
+    uint8_t v6[16] = { 0x20,0x01,0x0d,0xb8,0,0,0,0,0,0,0,0,0,0,0,1 };
+    memcpy(r + pos, v6, 16); pos += 16;
+
+    char ips[8][46];
+    size_t n = 0;
+    uint32_t ttl = 0;
+    CHECK_EQ_INT(Dns_ParseResponse(r, pos, 0x1234, "example.com",
+                                   28 /*AAAA*/, ips, 8, &n, &ttl), 0);
+    CHECK_EQ_INT(n, 1);
+    CHECK_EQ_STR(ips[0], "2001:db8::1");
+    CHECK_EQ_INT(ttl, 200);
+
+    // Asking for A against a response to an AAAA question is a question
+    // mismatch (-1): the parser insists the question type matches.
+    n = 0;
+    CHECK_EQ_INT(Dns_ParseResponse(r, pos, 0x1234, "example.com",
+                                   1 /*A*/, ips, 8, &n, &ttl), -1);
+}
+
 static void test_dns_intersect(void) {
     char a[4][16] = { "1.2.3.4", "5.6.7.8", "9.10.11.12", "" };
     char b[4][16] = { "99.0.0.1", "5.6.7.8", "1.2.3.4", "" };
@@ -3089,6 +3156,8 @@ int main(void) {
     test_dns_pick_resolvers();
     test_dns_build_query();
     test_dns_parse_response();
+    test_net_parseip();
+    test_dns_parse_aaaa();
     test_dns_intersect();
     test_dns_cache_clear();
     test_pin_store_roundtrip();

@@ -16,6 +16,7 @@
 #include <assert.h>
 
 #include "dns.h"
+#include "netutil.h"
 #include "logbuf.h"
 #include "clock.h"
 #include "pinned_tls.h"
@@ -37,6 +38,8 @@ static const DnsResolver kResolvers[] = {
         .hostname = "cloudflare-dns.com",
         .ip_primary = "1.1.1.1",
         .ip_secondary = "1.0.0.1",
+        .ip6_primary = "2606:4700:4700::1111",
+        .ip6_secondary = "2606:4700:4700::1001",
         .label = "cloudflare",
         .operator_family = "cloudflare",
     },
@@ -45,6 +48,8 @@ static const DnsResolver kResolvers[] = {
         .hostname = "dns.quad9.net",
         .ip_primary = "9.9.9.9",
         .ip_secondary = "149.112.112.112",
+        .ip6_primary = "2620:fe::fe",
+        .ip6_secondary = "2620:fe::9",
         .label = "quad9",
         .operator_family = "quad9",
     },
@@ -53,6 +58,8 @@ static const DnsResolver kResolvers[] = {
         .hostname = "dns.google",
         .ip_primary = "8.8.8.8",
         .ip_secondary = "8.8.4.4",
+        .ip6_primary = "2001:4860:4860::8888",
+        .ip6_secondary = "2001:4860:4860::8844",
         .label = "google",
         .operator_family = "google",
     },
@@ -61,6 +68,8 @@ static const DnsResolver kResolvers[] = {
         .hostname = "dns.nextdns.io",
         .ip_primary = "45.90.28.0",
         .ip_secondary = NULL,
+        .ip6_primary = "2a07:a8c0::",
+        .ip6_secondary = NULL,
         .label = "nextdns",
         .operator_family = "nextdns",
     },
@@ -69,6 +78,8 @@ static const DnsResolver kResolvers[] = {
         .hostname = "dns.mullvad.net",
         .ip_primary = "194.242.2.2",
         .ip_secondary = NULL,
+        .ip6_primary = "2a07:e340::2",
+        .ip6_secondary = NULL,
         .label = "mullvad",
         .operator_family = "mullvad",
     },
@@ -114,9 +125,18 @@ size_t Dns_PickResolvers(const DnsResolver **out, size_t n_want)
 
 #define DNS_TYPE_A      1
 #define DNS_TYPE_CNAME  5
+#define DNS_TYPE_AAAA   28
 #define DNS_CLASS_IN    1
 #define DNS_HDR_LEN     12
 #define DNS_MAX_NAME    255
+
+// The outbound family that most recently reached a DoH resolver -- a
+// cheap "which family does this network route?" signal. AF_INET until a
+// bootstrap connects (so IPv4/dual-stack networks keep IPv4-first
+// behavior); flips to AF_INET6 only on an IPv6-only network where the
+// v4 anycast addresses are unreachable. Read/written with plain int
+// access -- it is a preference hint, never a correctness gate.
+static volatile LONG g_preferred_family = AF_INET;
 
 // Encode a hostname as a length-prefixed label sequence into buf.
 // Returns bytes written (including the terminating 0), or 0 on error.
@@ -164,8 +184,9 @@ static size_t encode_qname(const char *host, uint8_t *buf, size_t cap)
     return out;
 }
 
-int Dns_BuildQueryA(const char *host, uint16_t id,
-                    uint8_t *out, size_t out_cap, size_t *out_len)
+// Build a DNS query for host/<qtype>. Shared by the A and AAAA paths.
+static int dns_build_query(const char *host, uint16_t id, uint16_t qtype,
+                           uint8_t *out, size_t out_cap, size_t *out_len)
 {
     if (!host || !out || !out_len) return -1;
     if (out_cap < DNS_HDR_LEN + 5) return -1;
@@ -185,11 +206,17 @@ int Dns_BuildQueryA(const char *host, uint16_t id,
     if (qn == 0) return -1;
 
     size_t p = DNS_HDR_LEN + qn;
-    out[p++] = 0x00; out[p++] = DNS_TYPE_A;
+    out[p++] = 0x00; out[p++] = (uint8_t)qtype;
     out[p++] = 0x00; out[p++] = DNS_CLASS_IN;
 
     *out_len = p;
     return 0;
+}
+
+int Dns_BuildQueryA(const char *host, uint16_t id,
+                    uint8_t *out, size_t out_cap, size_t *out_len)
+{
+    return dns_build_query(host, id, DNS_TYPE_A, out, out_cap, out_len);
 }
 
 // Decode a (possibly compressed) domain name starting at `off` into
@@ -341,6 +368,78 @@ int Dns_ParseResponseA(const uint8_t *in, size_t in_len,
     return 0;
 }
 
+// General A/AAAA parser: same wire walk as Dns_ParseResponseA, but for
+// either record type, formatting addresses (via inet_ntop) into
+// NET_IP_STRLEN-wide buffers. want_qtype is DNS_TYPE_A or DNS_TYPE_AAAA;
+// the question's qtype must match. Return codes match Dns_ParseResponseA
+// (0 ok, -1 malformed, -2 rcode!=0, -3 id/question mismatch).
+int Dns_ParseResponse(const uint8_t *in, size_t in_len,
+                      uint16_t expect_id, const char *expect_host,
+                      uint16_t want_qtype,
+                      char (*out_ips)[NET_IP_STRLEN], size_t ips_cap,
+                      size_t *out_count, uint32_t *out_min_ttl)
+{
+    if (!in || !out_ips || !out_count || !expect_host) return -1;
+    if (want_qtype != DNS_TYPE_A && want_qtype != DNS_TYPE_AAAA) return -1;
+    if (in_len < DNS_HDR_LEN) return -1;
+
+    const size_t want_rdlen = (want_qtype == DNS_TYPE_AAAA) ? 16 : 4;
+    const int    want_af    = (want_qtype == DNS_TYPE_AAAA) ? AF_INET6 : AF_INET;
+
+    uint16_t id      = ((uint16_t)in[0] << 8) | in[1];
+    uint16_t flags   = ((uint16_t)in[2] << 8) | in[3];
+    uint16_t qdcount = ((uint16_t)in[4] << 8) | in[5];
+    uint16_t ancount = ((uint16_t)in[6] << 8) | in[7];
+
+    if (id != expect_id)  return -3;
+    if ((flags & 0x8000) == 0) return -1;
+    int rcode = flags & 0x000F;
+    if (rcode != 0) return -2;
+    if (qdcount != 1) return -1;
+
+    char   qname[DNS_MAX_NAME + 1];
+    size_t off = DNS_HDR_LEN;
+    size_t after_name = decode_name(in, in_len, off, qname, sizeof qname);
+    if (after_name == 0) return -1;
+    if (after_name + 4 > in_len) return -1;
+    uint16_t qtype  = ((uint16_t)in[after_name] << 8) | in[after_name + 1];
+    uint16_t qclass = ((uint16_t)in[after_name + 2] << 8) | in[after_name + 3];
+    if (qtype != want_qtype || qclass != DNS_CLASS_IN) return -1;
+    if (!domain_equal_ci(qname, expect_host)) return -3;
+    off = after_name + 4;
+
+    size_t   n = 0;
+    uint32_t min_ttl = UINT32_MAX;
+    for (uint16_t i = 0; i < ancount && n < ips_cap; i++) {
+        char rname[DNS_MAX_NAME + 1];
+        size_t after_rname = decode_name(in, in_len, off, rname, sizeof rname);
+        if (after_rname == 0) return -1;
+        if (after_rname + 10 > in_len) return -1;
+        uint16_t rtype  = ((uint16_t)in[after_rname]     << 8) | in[after_rname + 1];
+        uint16_t rclass = ((uint16_t)in[after_rname + 2] << 8) | in[after_rname + 3];
+        uint32_t ttl    = ((uint32_t)in[after_rname + 4] << 24)
+                        | ((uint32_t)in[after_rname + 5] << 16)
+                        | ((uint32_t)in[after_rname + 6] << 8)
+                        |  (uint32_t)in[after_rname + 7];
+        uint16_t rdlen  = ((uint16_t)in[after_rname + 8] << 8) | in[after_rname + 9];
+        size_t   rdoff  = after_rname + 10;
+        if (rdoff + rdlen > in_len) return -1;
+
+        if (rtype == want_qtype && rclass == DNS_CLASS_IN && rdlen == want_rdlen) {
+            if (inet_ntop(want_af, (void *)(in + rdoff),
+                          out_ips[n], NET_IP_STRLEN) != NULL) {
+                if (ttl < min_ttl) min_ttl = ttl;
+                n++;
+            }
+        }
+        off = rdoff + rdlen;
+    }
+
+    *out_count = n;
+    if (out_min_ttl) *out_min_ttl = (min_ttl == UINT32_MAX) ? 0 : min_ttl;
+    return 0;
+}
+
 int Dns_Intersect(const char (*set_a)[16], size_t n_a,
                   const char (*set_b)[16], size_t n_b,
                   char out_ip[16])
@@ -370,7 +469,8 @@ int Dns_Intersect(const char (*set_a)[16], size_t n_a,
 
 typedef struct {
     char     host[256];
-    char     ip[16];
+    char     ip[NET_IP_STRLEN];
+    int      family;                // AF_INET / AF_INET6
     uint64_t expires_ms_tickcount;  // GetTickCount64 basis
 } DnsCacheEntry;
 
@@ -387,7 +487,7 @@ static void cache_cs_ensure(void)
     while (g_cache_cs_ready != 2) { Sleep(0); }
 }
 
-static int cache_lookup(const char *host, char out_ip[16])
+static int cache_lookup(const char *host, char *out_ip, int *out_family)
 {
     cache_cs_ensure();
     EnterCriticalSection(&g_cache_cs);
@@ -401,7 +501,8 @@ static int cache_lookup(const char *host, char out_ip[16])
             continue;
         }
         if (strcmp(g_cache[i].host, host) == 0) {
-            _snprintf(out_ip, 16, "%s", g_cache[i].ip);
+            _snprintf(out_ip, NET_IP_STRLEN, "%s", g_cache[i].ip);
+            if (out_family) *out_family = g_cache[i].family;
             found = 1;
             break;
         }
@@ -410,7 +511,8 @@ static int cache_lookup(const char *host, char out_ip[16])
     return found;
 }
 
-static void cache_insert(const char *host, const char *ip, uint32_t ttl)
+static void cache_insert(const char *host, const char *ip, int family,
+                         uint32_t ttl)
 {
     if (ttl < DNS_TTL_FLOOR) ttl = DNS_TTL_FLOOR;
     if (ttl > DNS_TTL_CEIL)  ttl = DNS_TTL_CEIL;
@@ -419,12 +521,11 @@ static void cache_insert(const char *host, const char *ip, uint32_t ttl)
     EnterCriticalSection(&g_cache_cs);
     uint64_t now = GetTickCount64();
     int slot = -1;
-    int updated = 0;
     uint64_t oldest = UINT64_MAX;
     int oldest_slot = 0;
     for (int i = 0; i < DNS_CACHE_N; i++) {
         if (g_cache[i].host[0] && strcmp(g_cache[i].host, host) == 0) {
-            slot = i; updated = 1; break;
+            slot = i; break;
         }
         uint64_t exp = g_cache[i].host[0] ? g_cache[i].expires_ms_tickcount : 0;
         if (exp < oldest) { oldest = exp; oldest_slot = i; }
@@ -432,8 +533,8 @@ static void cache_insert(const char *host, const char *ip, uint32_t ttl)
     if (slot < 0) slot = oldest_slot;
     _snprintf(g_cache[slot].host, sizeof g_cache[slot].host, "%s", host);
     _snprintf(g_cache[slot].ip,   sizeof g_cache[slot].ip,   "%s", ip);
+    g_cache[slot].family = family;
     g_cache[slot].expires_ms_tickcount = now + (uint64_t)ttl * 1000ULL;
-    (void)updated;
     LeaveCriticalSection(&g_cache_cs);
 }
 
@@ -453,39 +554,22 @@ void Dns_CacheClear(void)
 #define DOH_IO_TIMEOUT_MS        5000
 #define DOH_MAX_REPLY_BYTES      65536
 
-// TCP connect to a literal IPv4:port with a hard timeout. DoH
-// bootstrap needs this so we never depend on the OS resolver.
+// TCP connect to a literal IPv4 or IPv6 address:port with a hard
+// timeout. DoH bootstrap needs this so we never depend on the OS
+// resolver. On success, remembers the family that connected as the
+// network's preferred outbound family.
 static SOCKET tcp_connect_ip(const char *ip_str, uint16_t port)
 {
-    struct sockaddr_in sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sin_family = AF_INET;
-    sa.sin_port   = htons(port);
-    if (inet_pton(AF_INET, ip_str, &sa.sin_addr) != 1) return INVALID_SOCKET;
+    struct sockaddr_storage sa;
+    int salen = 0;
+    int fam = Net_ParseIp(ip_str, port, &sa, &salen);
+    if (fam == AF_UNSPEC) return INVALID_SOCKET;
 
-    SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (s == INVALID_SOCKET) return INVALID_SOCKET;
-
-    u_long nb = 1;
-    ioctlsocket(s, FIONBIO, &nb);
-    int cr = connect(s, (struct sockaddr *)&sa, (int)sizeof sa);
-    if (cr != 0 && WSAGetLastError() != WSAEWOULDBLOCK) {
-        closesocket(s); return INVALID_SOCKET;
+    SOCKET s = Net_ConnectStream(&sa, salen,
+                                 DOH_CONNECT_TIMEOUT_MS, DOH_IO_TIMEOUT_MS);
+    if (s != INVALID_SOCKET) {
+        InterlockedExchange(&g_preferred_family, fam);
     }
-    fd_set wfd; FD_ZERO(&wfd); FD_SET(s, &wfd);
-    struct timeval tv;
-    tv.tv_sec  =  DOH_CONNECT_TIMEOUT_MS / 1000;
-    tv.tv_usec = (DOH_CONNECT_TIMEOUT_MS % 1000) * 1000;
-    int sel = select(0, NULL, &wfd, NULL, &tv);
-    if (sel <= 0) { closesocket(s); return INVALID_SOCKET; }
-    int err = 0; int errlen = sizeof err;
-    getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &errlen);
-    if (err != 0) { closesocket(s); return INVALID_SOCKET; }
-
-    nb = 0; ioctlsocket(s, FIONBIO, &nb);
-    DWORD tmo = DOH_IO_TIMEOUT_MS;
-    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tmo, sizeof tmo);
-    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tmo, sizeof tmo);
     return s;
 }
 
@@ -494,8 +578,8 @@ static SOCKET tcp_connect_ip(const char *ip_str, uint16_t port)
 // the smallest TTL in out_min_ttl. On any failure (connect, TLS, pin
 // mismatch, HTTP error, DNS error), returns -1.
 static int doh_query_one(const DnsResolver *r, const char *ip_str,
-                         const char *host, uint16_t qid,
-                         char (*out_ips)[16], size_t ips_cap,
+                         const char *host, uint16_t qid, uint16_t qtype,
+                         char (*out_ips)[NET_IP_STRLEN], size_t ips_cap,
                          size_t *out_count, uint32_t *out_min_ttl)
 {
     int      rc = -1;
@@ -583,10 +667,11 @@ static int doh_query_one(const DnsResolver *r, const char *ip_str,
     }
     mbedtls_ssl_context *ssl = PinnedTls_Ssl(&tls);
 
-    // Build DNS query.
+    // Build DNS query (A or AAAA).
     uint8_t dns_q[512];
     size_t  dns_q_len = 0;
-    if (Dns_BuildQueryA(host, qid, dns_q, sizeof dns_q, &dns_q_len) != 0) goto cleanup;
+    if (dns_build_query(host, qid, qtype, dns_q, sizeof dns_q, &dns_q_len) != 0)
+        goto cleanup;
 
     // HTTP POST /dns-query HTTP/1.1
     char req_hdr[512];
@@ -658,8 +743,8 @@ static int doh_query_one(const DnsResolver *r, const char *ip_str,
 
     size_t   n = 0;
     uint32_t min_ttl = 0;
-    int pr = Dns_ParseResponseA(body, body_len, qid, host,
-                                out_ips, ips_cap, &n, &min_ttl);
+    int pr = Dns_ParseResponse(body, body_len, qid, host, qtype,
+                               out_ips, ips_cap, &n, &min_ttl);
     if (pr != 0 || n == 0) goto cleanup;
 
     *out_count   = n;
@@ -674,22 +759,35 @@ cleanup:
     return rc;
 }
 
-// Try the resolver's primary IP; on failure, try its secondary (if
-// any). Same SPKI pin covers both IPs because they share the same
-// leaf cert (anycast).
+// Try the resolver's bootstrap IPs in turn until one answers. Both
+// IPv4 and IPv6 anycast addresses are tried; the family that most
+// recently worked is tried first (so an IPv6-only network doesn't eat
+// a connect timeout on every IPv4 address first, and a v4/dual-stack
+// network keeps trying IPv4 first). The same SPKI pin covers every
+// address -- they share one anycast leaf cert.
 static int doh_query_resolver(const DnsResolver *r, const char *host,
-                              uint16_t qid,
-                              char (*out_ips)[16], size_t ips_cap,
+                              uint16_t qid, uint16_t qtype,
+                              char (*out_ips)[NET_IP_STRLEN], size_t ips_cap,
                               size_t *out_count, uint32_t *out_min_ttl)
 {
-    if (doh_query_one(r, r->ip_primary, host, qid,
-                      out_ips, ips_cap, out_count, out_min_ttl) == 0) {
-        return 0;
-    }
-    if (r->ip_secondary &&
-        doh_query_one(r, r->ip_secondary, host, qid,
-                      out_ips, ips_cap, out_count, out_min_ttl) == 0) {
-        return 0;
+    const char *v4[] = { r->ip_primary, r->ip_secondary };
+    const char *v6[] = { r->ip6_primary, r->ip6_secondary };
+    int prefer6 = (InterlockedCompareExchange(&g_preferred_family, 0, 0)
+                   == AF_INET6);
+
+    const char **order[2];
+    order[0] = prefer6 ? v6 : v4;
+    order[1] = prefer6 ? v4 : v6;
+
+    for (int grp = 0; grp < 2; grp++) {
+        for (int i = 0; i < 2; i++) {
+            const char *ip = order[grp][i];
+            if (!ip) continue;
+            if (doh_query_one(r, ip, host, qid, qtype,
+                              out_ips, ips_cap, out_count, out_min_ttl) == 0) {
+                return 0;
+            }
+        }
     }
     return -1;
 }
@@ -700,21 +798,12 @@ static int doh_query_resolver(const DnsResolver *r, const char *host,
 
 #define DNS_ANSWERS_MAX 16
 
-int Dns_Resolve(const char *host, char out_ip[16])
+// One family's worth of DoH resolution: shuffle the pinned pool and try
+// each resolver until one returns a record of `qtype`. Writes the first
+// address to out_ip and its TTL to *out_ttl. Returns 0 / -1.
+static int doh_resolve_qtype(const char *host, uint16_t qtype,
+                             char *out_ip, uint32_t *out_ttl)
 {
-    if (!host || !out_ip) return -1;
-    size_t hlen = strlen(host);
-    if (hlen == 0 || hlen > 255) return -1;
-
-    if (cache_lookup(host, out_ip)) return 0;
-
-    // Shuffle the enabled pinned resolver pool and try it in that
-    // random order. We still never fall back to plain DNS. If one
-    // pinned DoH resolver is down, blocked, or has a transient
-    // TLS/pin/query failure, we fall through to the next pinned
-    // resolver in the shuffled list. A resolver that returns a
-    // syntactically valid but malicious A set is still handled by the
-    // downstream NTS SPKI pins, AEAD SNTP, and NTP concurrence gate.
     const DnsResolver *picked[DNS_POOL_SIZE] = { NULL };
     size_t got = Dns_PickResolvers(picked, DNS_POOL_SIZE);
     if (got < 1) {
@@ -722,37 +811,121 @@ int Dns_Resolve(const char *host, char out_ip[16])
         return -1;
     }
 
-    char     ips[DNS_ANSWERS_MAX][16];
+    char ips[DNS_ANSWERS_MAX][NET_IP_STRLEN];
     for (size_t i = 0; i < got; i++) {
         // Fresh QID per DoH query. DoH doesn't require it (the TLS
         // channel already defeats off-path spoofing) but it costs
-        // nothing and lets us reject cross-wired responses from a
-        // buggy resolver.
+        // nothing and lets us reject cross-wired responses.
         uint16_t qid = 0;
         BCryptGenRandom(NULL, (PUCHAR)&qid, sizeof qid,
                         BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 
         size_t   n_ips = 0;
         uint32_t ttl   = 0;
-        if (doh_query_resolver(picked[i], host, qid,
+        if (doh_query_resolver(picked[i], host, qid, qtype,
                                ips, DNS_ANSWERS_MAX, &n_ips, &ttl) == 0 &&
             n_ips > 0) {
-            // Take the first A record. Order is resolver-defined; for
-            // geo-DNS it's typically already latency-sorted for our
-            // vantage.
-            _snprintf(out_ip, 16, "%s", ips[0]);
-            cache_insert(host, ips[0], ttl);
-            Log_Append("dns: resolve %s -> %s  (via %s, ttl=%us)",
-                       host, ips[0], picked[i]->label, (unsigned)ttl);
+            _snprintf(out_ip, NET_IP_STRLEN, "%s", ips[0]);
+            if (out_ttl) *out_ttl = ttl;
             return 0;
         }
+    }
+    return -1;
+}
 
-        Log_Append("dns: resolve %s failed via %s%s",
-                   host, picked[i]->label,
-                   (i + 1 < got) ? "; trying next pinned DoH resolver" : "");
+int Dns_ResolveEx(const char *host, char *out_ip, int *out_family)
+{
+    if (!host || !out_ip) return -1;
+    size_t hlen = strlen(host);
+    if (hlen == 0 || hlen > 255) return -1;
+
+    int cached_fam = AF_UNSPEC;
+    if (cache_lookup(host, out_ip, &cached_fam)) {
+        if (out_family) *out_family = cached_fam;
+        return 0;
     }
 
-    Log_Append("dns: resolve %s FAIL (all %u pinned DoH resolvers failed)",
-               host, (unsigned)got);
+    // Query the family that the local network is known to route first
+    // (the one that last reached a resolver), the other as fallback.
+    // A/AAAA are both fetched securely over DoH; the downstream trust
+    // gate (NTS pins, AEAD SNTP, concurrence) still guards the result.
+    int prefer6 = (InterlockedCompareExchange(&g_preferred_family, 0, 0)
+                   == AF_INET6);
+    uint16_t first_qt = prefer6 ? DNS_TYPE_AAAA : DNS_TYPE_A;
+    int      first_af = prefer6 ? AF_INET6      : AF_INET;
+    uint16_t next_qt  = prefer6 ? DNS_TYPE_A    : DNS_TYPE_AAAA;
+    int      next_af  = prefer6 ? AF_INET       : AF_INET6;
+
+    uint32_t ttl = 0;
+    if (doh_resolve_qtype(host, first_qt, out_ip, &ttl) == 0) {
+        cache_insert(host, out_ip, first_af, ttl);
+        if (out_family) *out_family = first_af;
+        Log_Append("dns: resolve %s -> %s  (%s, ttl=%us)",
+                   host, out_ip, first_af == AF_INET6 ? "AAAA" : "A",
+                   (unsigned)ttl);
+        return 0;
+    }
+    if (doh_resolve_qtype(host, next_qt, out_ip, &ttl) == 0) {
+        cache_insert(host, out_ip, next_af, ttl);
+        if (out_family) *out_family = next_af;
+        Log_Append("dns: resolve %s -> %s  (%s, ttl=%us)",
+                   host, out_ip, next_af == AF_INET6 ? "AAAA" : "A",
+                   (unsigned)ttl);
+        return 0;
+    }
+
+    Log_Append("dns: resolve %s FAIL (no A/AAAA via any pinned DoH resolver)",
+               host);
     return -1;
+}
+
+int Dns_Resolve(const char *host, char out_ip[16])
+{
+    char   ip[NET_IP_STRLEN];
+    int    fam = AF_UNSPEC;
+    if (Dns_ResolveEx(host, ip, &fam) != 0) return -1;
+    if (fam != AF_INET) return -1;    // legacy IPv4-only contract
+    _snprintf(out_ip, 16, "%s", ip);
+    return 0;
+}
+
+int Dns_ResolveSystem(const char *host, char *out_ip, int *out_family)
+{
+    if (!host || !out_ip) return -1;
+
+    // getaddrinfo -- the OS resolver. For NTS hostnames ONLY: the NTS-KE
+    // TLS session is pinned, so a forged answer is caught at TLS, not
+    // used. Never call this for unauthenticated core SNTP.
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family   = AF_UNSPEC;    // v4 or v6
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo *res = NULL;
+    if (getaddrinfo(host, NULL, &hints, &res) != 0 || !res) return -1;
+
+    int rc = -1;
+    // Prefer the family the network is known to route.
+    int prefer6 = (InterlockedCompareExchange(&g_preferred_family, 0, 0)
+                   == AF_INET6);
+    int want = prefer6 ? AF_INET6 : AF_INET;
+    for (int pass = 0; pass < 2 && rc != 0; pass++) {
+        for (struct addrinfo *a = res; a; a = a->ai_next) {
+            if (a->ai_family != want) continue;
+            void *addr = (a->ai_family == AF_INET6)
+                ? (void *)&((struct sockaddr_in6 *)a->ai_addr)->sin6_addr
+                : (void *)&((struct sockaddr_in  *)a->ai_addr)->sin_addr;
+            if (inet_ntop(a->ai_family, addr, out_ip, NET_IP_STRLEN)) {
+                if (out_family) *out_family = a->ai_family;
+                rc = 0;
+                break;
+            }
+        }
+        want = (want == AF_INET6) ? AF_INET : AF_INET6;   // other family
+    }
+    freeaddrinfo(res);
+    if (rc == 0) {
+        Log_Append("dns: system-DNS fallback resolved %s -> %s", host, out_ip);
+    }
+    return rc;
 }

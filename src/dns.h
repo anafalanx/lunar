@@ -66,8 +66,13 @@
 //    reachability). The cache is protected by its own critical
 //    section; concurrent worker threads may call Dns_Resolve freely.
 //
-// 5. IPv4 only in this cut. AAAA can follow. All upstream call sites
-//    currently use AF_INET or AF_UNSPEC with IPv4 fallbacks that work.
+// 5. Dual-stack. Each resolver carries IPv6 anycast bootstrap addresses
+//    alongside its IPv4 ones, so DoH is reachable on an IPv6-only
+//    network. Resolution queries both A and AAAA; the address family
+//    that most recently reached a DoH resolver is preferred (a working
+//    signal for the local network), with the other family as fallback.
+//    Every upstream socket path (SNTP, NTS-KE, NTS-NTP) connects via the
+//    family-agnostic helpers in netutil.h.
 //
 // =============================================================================
 // Threat model
@@ -110,19 +115,29 @@ extern "C" {
 // --- Public API --------------------------------------------------------------
 
 // Resolve `host` to an IPv4 dotted-quad string in `out_ip` (buffer
-// must be at least 16 bytes: "255.255.255.255\0"). On success returns
-// 0 and writes a NUL-terminated dotted-quad. On any failure returns
-// -1 and the contents of out_ip are unspecified.
-//
-// Failure modes:
-//   * No enabled DoH resolvers (pool wiped).
-//   * Every enabled pinned DoH resolver failed to complete the DoH
-//     query on its bootstrap IPs.
-//   * Hostname is syntactically invalid or too long.
-//
-// Thread-safe. May block for several seconds on a cache miss while
-// trying the shuffled pinned resolver list.
+// must be at least 16 bytes). Legacy IPv4-only wrapper over
+// Dns_ResolveEx: succeeds only if an A record is available. Returns 0
+// on success, -1 otherwise.
 int Dns_Resolve(const char *host, char out_ip[16]);
+
+// Resolve `host` via pinned DoH to an IPv4 or IPv6 literal in `out_ip`
+// (buffer must be at least NET_IP_STRLEN bytes, see netutil.h), writing
+// the address family (AF_INET / AF_INET6) to *out_family. Queries both
+// A and AAAA, preferring the family that most recently reached a DoH
+// resolver. Returns 0 on success, -1 on failure (no resolver reachable,
+// no records, or a bad host).
+//
+// Thread-safe. May block for several seconds on a cache miss.
+int Dns_ResolveEx(const char *host, char *out_ip, int *out_family);
+
+// System-DNS (getaddrinfo) resolution, dual-stack. This is the ONLY
+// path that bypasses pinned DoH, and it is for NTS hostnames ONLY: an
+// NTS-KE session is authenticated by a locally enrolled SPKI pin, so a
+// forged system-DNS answer cannot redirect it to an attacker's server
+// (the pin catches it at TLS). It MUST NOT be used for unauthenticated
+// core SNTP, where a forged answer would redirect to a fake listener.
+// Writes a literal + family like Dns_ResolveEx. Returns 0 / -1.
+int Dns_ResolveSystem(const char *host, char *out_ip, int *out_family);
 
 // Clear the entire in-memory cache. Primarily for tests.
 void Dns_CacheClear(void);
@@ -133,6 +148,8 @@ typedef struct {
     const char *hostname;          // SNI + HTTP Host:, e.g. "cloudflare-dns.com"
     const char *ip_primary;         // hardcoded anycast IPv4 dotted-quad
     const char *ip_secondary;       // NULL if no secondary
+    const char *ip6_primary;        // hardcoded anycast IPv6 literal, or NULL
+    const char *ip6_secondary;      // NULL if no secondary
     const char *label;              // short tag for logs, e.g. "cloudflare"
     const char *operator_family;    // independent operator grouping
 } DnsResolver;
@@ -173,6 +190,15 @@ int Dns_ParseResponseA(const uint8_t *in, size_t in_len,
                        char (*out_ips)[16], size_t ips_cap,
                        size_t *out_count,
                        uint32_t *out_min_ttl);
+
+// General A/AAAA response parser. want_qtype is 1 (A) or 28 (AAAA); the
+// address strings land in NET_IP_STRLEN-wide buffers (see netutil.h).
+// Same return codes as Dns_ParseResponseA. Exported for tests.
+int Dns_ParseResponse(const uint8_t *in, size_t in_len,
+                      uint16_t expect_id, const char *expect_host,
+                      uint16_t want_qtype,
+                      char (*out_ips)[46], size_t ips_cap,
+                      size_t *out_count, uint32_t *out_min_ttl);
 
 // --- A-record set helper (exported for tests) -------------------------------
 
