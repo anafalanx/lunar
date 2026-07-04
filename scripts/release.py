@@ -48,6 +48,55 @@ def sha256(path: Path) -> str:
     return h.hexdigest()
 
 
+def sign_exe(exe: Path) -> None:
+    """Authenticode-sign exe if LUNAR_SIGN_CMD is set; warn loudly if not.
+
+    LUNAR_SIGN_CMD is a full command line; the literal placeholder {exe}
+    is replaced with the path of the exe to sign (the path is appended if
+    the placeholder is absent). Example:
+
+        set LUNAR_SIGN_CMD=signtool sign /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib ... {exe}
+
+    See docs/distribution.md for concrete setups (Azure Trusted Signing,
+    OV certificate).
+    """
+    template = os.environ.get("LUNAR_SIGN_CMD", "").strip()
+    if not template:
+        print()
+        print("*" * 68)
+        print("*  WARNING: LUNAR_SIGN_CMD is not set.                             *")
+        print("*  This release is UNSIGNED. Windows SmartScreen will warn users.  *")
+        print("*  See docs/distribution.md for signing setup.                     *")
+        print("*" * 68)
+        print()
+        return
+
+    if "{exe}" in template:
+        cmd = template.replace("{exe}", str(exe))
+    else:
+        cmd = f'{template} "{exe}"'
+
+    log(f"Signing: {cmd}")
+    rc = subprocess.call(cmd, shell=True)
+    if rc != 0:
+        sys.exit(f"signing command failed (exit {rc})")
+
+    # Verify the signature actually landed (Get-AuthenticodeSignature
+    # equivalent). signtool verify /pa uses the Default Authenticode
+    # policy, which is what end users' machines apply.
+    signtool = shutil.which("signtool")
+    if signtool:
+        log("Verifying signature (signtool verify /pa)")
+        rc = subprocess.call([signtool, "verify", "/pa", str(exe)])
+        if rc != 0:
+            sys.exit(f"signature verification failed (exit {rc})")
+        log("Signature verified")
+    else:
+        print("NOTE: signtool not on PATH; skipping signature verification. "
+              "Verify manually with: signtool verify /pa <exe> or "
+              "Get-AuthenticodeSignature <exe>")
+
+
 README_TEMPLATE = """\
 Lunar {version}
 ================
@@ -121,6 +170,10 @@ def main() -> int:
     shutil.copy2(EXE, staged_exe)
     log(f"Copied {EXE.name} ({staged_exe.stat().st_size / 1048576:.2f} MB)")
 
+    # Sign the staged copy (before hashing/zipping, so the digest in
+    # README.txt and the zipped exe both reflect the signed binary).
+    sign_exe(staged_exe)
+
     digest = sha256(staged_exe)
     readme = bundle_dir / "README.txt"
     readme.write_text(
@@ -130,13 +183,17 @@ def main() -> int:
     )
     log(f"Wrote {readme.name}")
 
-    # Include LICENSE if the project has one.
+    # Include LICENSE (required for distribution; warn if missing so a
+    # release without it doesn't slip through silently).
     for name in ("LICENSE", "LICENSE.txt", "LICENSE.md"):
         src = ROOT / name
         if src.is_file():
             shutil.copy2(src, bundle_dir / name)
             log(f"Copied {name}")
             break
+    else:
+        print("WARNING: no LICENSE file found at repo root; "
+              "the zip will not contain a license.")
 
     # Zip it.
     log(f"Creating {zip_path.name}")

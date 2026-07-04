@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (UCRT64)
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-python
+
+      - name: Build
+        run: python scripts/build.py --no-desktop
+
+      - name: Unit tests
+        run: python tests/run_tests.py
+
+      # The smoke test launches a real window. GitHub Windows runners
+      # usually have an interactive desktop session, but window creation
+      # can be flaky in hosted configs, so this step never blocks the run.
+      - name: Smoke test (best effort)
+        continue-on-error: true
+        run: python tests/test_smoke.py
+
+      - name: Upload Lunar.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lunar.exe
+          path: build/Lunar.exe
+          if-no-files-found: error

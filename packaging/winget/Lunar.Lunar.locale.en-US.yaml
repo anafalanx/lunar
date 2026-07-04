@@ -1,0 +1,27 @@
+# Default locale manifest (template). Replace {VERSION} before submitting.
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: Lunar.Lunar
+PackageVersion: "{VERSION}"
+PackageLocale: en-US
+Publisher: Lunar
+PublisherUrl: https://github.com/anafalanx/lunar
+PublisherSupportUrl: https://github.com/anafalanx/lunar/issues
+PackageName: Lunar
+PackageUrl: https://github.com/anafalanx/lunar
+License: MIT
+LicenseUrl: https://github.com/anafalanx/lunar/blob/main/LICENSE
+ShortDescription: A minimalist analog clock for Windows.
+Description: >-
+  Lunar is a minimalist analog desktop clock for Windows. Single-file
+  native executable (Direct2D rendering, static C runtime), with
+  authenticated network time sync (NTS), time-zone awareness, and
+  optional chimes. No installer, no runtime dependencies.
+Tags:
+  - clock
+  - analog-clock
+  - time
+  - ntp
+  - nts
+  - desktop
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

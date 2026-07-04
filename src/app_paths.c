@@ -13,13 +13,21 @@ int Lunar_AppDataPathW(wchar_t *out, size_t out_len,
     if (!out || out_len == 0) return 0;
     out[0] = 0;
 
-    wchar_t appdata[MAX_PATH] = { 0 };
-    DWORD got = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
-    if (got == 0 || got >= MAX_PATH) return 0;
-
     wchar_t dir[MAX_PATH] = { 0 };
-    if (_snwprintf_s(dir, MAX_PATH, _TRUNCATE, L"%ls\\Lunar", appdata) < 0) {
-        return 0;
+
+    // LUNAR_DATA_DIR, when set and non-empty, replaces the default
+    // %APPDATA%\Lunar base directory entirely. Tests use this to
+    // redirect persistence away from the real user profile.
+    DWORD got = GetEnvironmentVariableW(L"LUNAR_DATA_DIR", dir, MAX_PATH);
+    if (got >= MAX_PATH) return 0;   // set but too long: fail, don't fall back
+    if (got == 0) {
+        wchar_t appdata[MAX_PATH] = { 0 };
+        got = GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH);
+        if (got == 0 || got >= MAX_PATH) return 0;
+
+        if (_snwprintf_s(dir, MAX_PATH, _TRUNCATE, L"%ls\\Lunar", appdata) < 0) {
+            return 0;
+        }
     }
 
     DWORD attr = GetFileAttributesW(dir);

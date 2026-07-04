@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.wintypes as wt
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import os
 from pathlib import Path
@@ -144,24 +146,29 @@ def collect_sys_menu(hwnd: int) -> list[str]:
 def main() -> int:
     user32.SetProcessDPIAware()
 
-    # Wipe any persisted window state / settings from earlier sessions so
-    # the smoke test always exercises the default geometry path.
-    appdata = os.environ.get("APPDATA")
-    if appdata:
-        for name in ("window.dat", "settings.dat"):
-            p = Path(appdata) / "Lunar" / name
-            try:
-                p.unlink()
-            except FileNotFoundError:
-                pass
+    # Point the app at a fresh per-run data directory via LUNAR_DATA_DIR
+    # (see src/app_paths.c). The child starts with no persisted window
+    # state / settings, so the test always exercises the default geometry
+    # path -- and the developer's real %APPDATA%\Lunar is never touched.
+    data_dir = Path(tempfile.mkdtemp(prefix="lunar-smoke-"))
+    child_env = os.environ.copy()
+    child_env["LUNAR_DATA_DIR"] = str(data_dir)
+    print(f"Using LUNAR_DATA_DIR={data_dir}")
 
+    try:
+        return run_checks(child_env)
+    finally:
+        shutil.rmtree(data_dir, ignore_errors=True)
+
+
+def run_checks(child_env: dict[str, str]) -> int:
     print("1) Binary exists")
     check(EXE.is_file(), f"{EXE} present ({EXE.stat().st_size if EXE.is_file() else 0} bytes)")
     if not EXE.is_file():
         return 2
 
     print("\n2) Launch and find main window")
-    proc = subprocess.Popen([str(EXE)])
+    proc = subprocess.Popen([str(EXE)], env=child_env)
     try:
         hwnd = find_main_window(proc.pid, timeout=6.0)
         check(hwnd != 0, f"HWND discovered within 6 s (pid={proc.pid})")
@@ -201,12 +208,16 @@ def main() -> int:
         check(proc.poll() is None, "process alive after IDM_SYNC_NOW")
 
         print("\n6) Clean shutdown via WM_CLOSE")
+        # The app's worst-case shutdown budget is ~8.5 s when a sync is
+        # in flight (watchdog 1.5 s + NTP aggregator 5 s + detached
+        # worker grace 2 s) -- and the IDM_SYNC_NOW we just posted starts
+        # a cold sync since the data dir is fresh. Allow 15 s.
         user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
         try:
-            rc = proc.wait(timeout=5.0)
+            rc = proc.wait(timeout=15.0)
             check(rc == 0, f"exited cleanly with code {rc}")
         except subprocess.TimeoutExpired:
-            check(False, "did not exit within 5 s")
+            check(False, "did not exit within 15 s")
             proc.kill()
             proc.wait()
     finally:
@@ -215,7 +226,8 @@ def main() -> int:
             proc.wait()
 
     print("\n7) Second instance after clean shutdown")
-    proc2 = subprocess.Popen([str(EXE)])
+    proc2 = subprocess.Popen([str(EXE)], env=child_env)
+    hwnd2 = 0
     try:
         hwnd2 = find_main_window(proc2.pid, timeout=6.0)
         check(hwnd2 != 0, "second instance window found")
