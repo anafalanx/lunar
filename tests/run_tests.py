@@ -88,7 +88,7 @@ def main() -> int:
         "-ld2d1", "-ldwrite", "-lwinmm",
         "-luser32", "-lkernel32", "-lgdi32", "-lcomctl32", "-lshell32",
         "-luxtheme", "-lole32", "-lws2_32", "-ldwmapi", "-ladvapi32", "-lcrypt32",
-        "-lbcrypt",
+        "-lbcrypt", "-lwtsapi32",
     ]
     print("==> Compiling tests")
     print("   ", " ".join(cmd))

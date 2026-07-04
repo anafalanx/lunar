@@ -384,7 +384,7 @@ def main() -> None:
         "-ld2d1", "-ldwrite", "-lwinmm",
         "-luser32", "-lkernel32", "-lgdi32", "-lcomctl32", "-lshell32",
         "-luxtheme", "-lole32", "-lws2_32", "-ldwmapi", "-ladvapi32", "-lcrypt32",
-        "-lbcrypt",
+        "-lbcrypt", "-lwtsapi32",
     )
     log(f"{exe}  ({exe.stat().st_size / 1048576:.2f} MB)")
 
