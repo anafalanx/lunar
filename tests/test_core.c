@@ -12,6 +12,7 @@
 #include "../src/netutil.h"
 #include "../src/pin_store.h"
 #include "../src/cert_verify_win.h"
+#include "../src/update_check.h"
 
 #include <wincrypt.h>   // CryptProtectData for the pin-store migration test
 
@@ -1943,8 +1944,18 @@ static void test_logbuf_truncation(void) {
 
 #include "../src/nts.h"
 
-// Cookie jar (RFC 8915 reuse) mechanics: store / take / harvest / cap /
-// drop, keyed by host.
+// Update-check version comparison (drives the "is a newer release
+// available" decision): numeric, per-component, missing = 0.
+static void test_update_version_cmp(void) {
+    CHECK(UpdateCheck_VersionCmp("0.5.0", "0.4.0") > 0);
+    CHECK(UpdateCheck_VersionCmp("0.4.0", "0.5.0") < 0);
+    CHECK(UpdateCheck_VersionCmp("0.4.0", "0.4.0") == 0);
+    CHECK(UpdateCheck_VersionCmp("0.4", "0.4.0") == 0);       // missing = 0
+    CHECK(UpdateCheck_VersionCmp("1.0.0", "0.99.99") > 0);
+    CHECK(UpdateCheck_VersionCmp("0.10.0", "0.9.0") > 0);     // numeric, not lexical
+    CHECK(UpdateCheck_VersionCmp("0.4.1", "0.4.0") > 0);
+}
+
 static void test_nts_cookie_jar(void) {
     Nts_TestJarReset();
 
@@ -3175,6 +3186,7 @@ int main(void) {
     test_ntske_parse_errors();
     test_nts_ef_roundtrip();
     test_nts_ef_tamper();
+    test_update_version_cmp();
     test_nts_cookie_jar();
     test_nts_pool_pins();
     test_logbuf_basic();

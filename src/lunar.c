@@ -82,6 +82,7 @@
 #include "logbuf.h"
 #include "tz.h"
 #include "tz_winmap.h"
+#include "update_check.h"
 #include "app_paths.h"
 
 // ---------------------------------------------------------------------------
@@ -125,6 +126,7 @@
 #define IDM_ABOUT         0x1004
 #define IDM_SYNC_NOW      0x1005   // deprecated, kept to preserve following IDs
 #define IDM_LOG           0x1006
+#define IDM_UPDATE        0x1007   // shown only when a newer release exists
 
 // Tray icon: notification message + context-menu command IDs.
 #define WM_LUNAR_TRAY     (WM_APP + 1)
@@ -1447,6 +1449,25 @@ static void InstallSystemMenuItems(void) {
     SyncAlwaysOnTopCheck();
 }
 
+// Once the background update check finds a newer release, add a
+// "Download update…" item to the top of the system menu (one-shot).
+// A passive notice: clicking it opens the release page in the browser;
+// Lunar never downloads or installs anything itself.
+static void MaybeAddUpdateMenuItem(void) {
+    static int added = 0;
+    if (added || !g_hwnd) return;
+    char ver[32];
+    if (!UpdateCheck_Available(ver, sizeof ver)) return;
+    HMENU sys = GetSystemMenu(g_hwnd, FALSE);
+    if (!sys) return;
+    wchar_t item[64];
+    _snwprintf_s(item, 64, _TRUNCATE, L"\x2b07 Download update (v%hs)\x2026", ver);
+    InsertMenuW(sys, 0, MF_BYPOSITION | MF_SEPARATOR, 0, NULL);
+    InsertMenuW(sys, 0, MF_BYPOSITION | MF_STRING, IDM_UPDATE, item);
+    added = 1;
+    Log_Append("update: notice added to system menu (v%s)", ver);
+}
+
 static void ApplyAlwaysOnTop(int on) {
     SetWindowPos(g_hwnd, on ? HWND_TOPMOST : HWND_NOTOPMOST,
                  0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -2377,6 +2398,7 @@ static void Tick(void) {
     ClockDisplay d;
     Clock_GetDisplay(&d);
     UpdateSystemClockWitness(&d);
+    MaybeAddUpdateMenuItem();
 
     // Periodic NTP re-sync. 60 s while a corroborated tier is live;
     // exponential backoff with jitter (5 s .. 5 min) otherwise, so a
@@ -2659,6 +2681,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_SETTINGS:  Log_Append("user: opened Settings"); ShowSettings();   return 0;
         case IDM_LOG:       ShowLogViewer(); return 0;
         case IDM_ABOUT:     Log_Append("user: opened About"); ShowAbout();      return 0;
+        case IDM_UPDATE:
+            Log_Append("user: opened update page");
+            ShellExecuteA(hwnd, "open", UPDATE_RELEASES_URL, NULL, NULL,
+                          SW_SHOWNORMAL);
+            return 0;
         case IDM_TRAY_OPEN: Tray_RestoreFromTray(hwnd); return 0;
         case IDM_TRAY_EXIT: PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0;
         }
@@ -2908,6 +2935,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
                " started; initiating first NTP sync");
     Ntp_Start();
     g_lastNtpKickMs = GetTickCount();
+
+    // Passive update check on a background thread (els-style, but through
+    // Lunar's own DoH + CA-validated TLS). Surfaces a menu notice only.
+    UpdateCheck_Start();
 
     int showCmd = nShow ? nShow : SW_SHOWDEFAULT;
     if (ws.valid && ws.maximized) showCmd = SW_SHOWMAXIMIZED;

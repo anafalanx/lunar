@@ -369,6 +369,7 @@ def main() -> None:
         str(SRC / "pinned_tls.c"),
         str(SRC / "cert_verify_win.c"),
         str(SRC / "pin_store.c"),
+        str(SRC / "update_check.c"),
         str(SRC / "nts.c"),
         str(SRC / "dns.c"),
         str(res),

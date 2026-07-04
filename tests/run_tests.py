@@ -65,6 +65,7 @@ def main() -> int:
         SRC  / "pinned_tls.c",
         SRC  / "cert_verify_win.c",
         SRC  / "pin_store.c",
+        SRC  / "update_check.c",
         SRC  / "nts.c",
         SRC  / "dns.c",
     ]
