@@ -41,7 +41,7 @@
 // dialog font).  Dialog is 280 x 215 DLU ~= 462 x 355 px @ 96 dpi.
 // -------------------------------------------------------------------
 
-100 DIALOGEX 0, 0, 280, 209
+100 DIALOGEX 0, 0, 280, 237
 STYLE DS_SETFONT | DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Lunar Settings"
 FONT 9, "Segoe UI", 400, 0, 0x1
@@ -53,24 +53,28 @@ BEGIN
                                                       1002,   15,  31, 180,  10
     PUSHBUTTON      "&Test chime",                    1007,  199,  27,  66,  14
 
-    GROUPBOX        "General",                        -1,      7,  56, 266,  40
+    GROUPBOX        "General",                        -1,      7,  56, 266,  68
     AUTOCHECKBOX    "Confirm before &closing the window",
                                                       1003,   15,  68, 248,  10
     AUTOCHECKBOX    "Use 24-&hour clock in title bar",
                                                       1009,   15,  82, 248,  10
+    AUTOCHECKBOX    "&Minimize to the notification area (tray)",
+                                                      1010,   15,  96, 248,  10
+    AUTOCHECKBOX    "&Start Lunar when you sign in",
+                                                      1011,   15, 110, 248,  10
 
-    GROUPBOX        "Display time zone",              -1,      7, 102, 266,  68
-    LTEXT           "&Filter:",                       -1,     15, 118,  28,  10
-    EDITTEXT                                          1005,   47, 116, 218,  12, ES_AUTOHSCROLL
-    LTEXT           "&Zone:",                         -1,     15, 136,  28,  10
-    COMBOBOX                                          1004,   47, 134, 218, 140,
+    GROUPBOX        "Display time zone",              -1,      7, 130, 266,  68
+    LTEXT           "&Filter:",                       -1,     15, 146,  28,  10
+    EDITTEXT                                          1005,   47, 144, 218,  12, ES_AUTOHSCROLL
+    LTEXT           "&Zone:",                         -1,     15, 164,  28,  10
+    COMBOBOX                                          1004,   47, 162, 218, 140,
                     CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
-    LTEXT           "Current time:",                  -1,     15, 154,  52,  10
-    LTEXT           "",                               1006,   67, 154, 198,  10
+    LTEXT           "Current time:",                  -1,     15, 182,  52,  10
+    LTEXT           "",                               1006,   67, 182, 198,  10
 
-    PUSHBUTTON      "&Defaults",                      1008,    7, 187,  60,  14
-    DEFPUSHBUTTON   "OK",                             IDOK,  159, 187,  52,  14
-    PUSHBUTTON      "Cancel",                         IDCANCEL,217, 187,  52,  14
+    PUSHBUTTON      "&Defaults",                      1008,    7, 215,  60,  14
+    DEFPUSHBUTTON   "OK",                             IDOK,  159, 215,  52,  14
+    PUSHBUTTON      "Cancel",                         IDCANCEL,217, 215,  52,  14
 END
 
 // -------------------------------------------------------------------
@@ -81,7 +85,7 @@ END
 // viewer is where the sync / clockwork details live.
 // -------------------------------------------------------------------
 
-101 DIALOGEX 0, 0, 200, 124
+101 DIALOGEX 0, 0, 200, 138
 STYLE DS_SETFONT | DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "About Lunar"
 FONT 9, "Segoe UI", 400, 0, 0x1
@@ -95,7 +99,8 @@ BEGIN
     LTEXT           "Runs independently of the system clock.",
                                                       2007,    12,  76, 176,  10, SS_CENTER
     LTEXT           "",                               2006,    12,  94, 176,  10, SS_CENTER
-    DEFPUSHBUTTON   "OK",                             IDOK,   146, 106,  46,  14
+    LTEXT           "",                               2008,    12, 106, 176,  10, SS_CENTER
+    DEFPUSHBUTTON   "OK",                             IDOK,   146, 120,  46,  14
 END
 
 1 VERSIONINFO
