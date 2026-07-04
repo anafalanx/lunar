@@ -230,12 +230,9 @@ static void LoadArmed(int armed[12]) {
 static void SaveArmed(const int armed[12]) {
     wchar_t path[MAX_PATH]; ArmedPathW(path, MAX_PATH);
     if (!path[0]) return;
-    FILE *f = _wfopen(path, L"wb");
-    if (!f) return;
     char buf[12];
     for (int i = 0; i < 12; i++) buf[i] = armed[i] ? '1' : '0';
-    fwrite(buf, 1, 12, f);
-    fclose(f);
+    Lunar_WriteFileAtomicW(path, buf, sizeof buf);
 }
 
 // ---------------------------------------------------------------------------
@@ -303,13 +300,12 @@ static void SaveWindowState(HWND hwnd, int alwaysOnTop) {
     RECT r = wp.rcNormalPosition;
     int maximized = (wp.showCmd == SW_SHOWMAXIMIZED) ? 1 : 0;
 
-    FILE *f = _wfopen(path, L"wb");
-    if (!f) return;
-    fprintf(f, "%ld %ld %ld %ld %d %d\n",
-            (long)r.left, (long)r.top,
-            (long)(r.right - r.left), (long)(r.bottom - r.top),
-            alwaysOnTop ? 1 : 0, maximized);
-    fclose(f);
+    char buf[128];
+    int n = snprintf(buf, sizeof buf, "%ld %ld %ld %ld %d %d\n",
+                     (long)r.left, (long)r.top,
+                     (long)(r.right - r.left), (long)(r.bottom - r.top),
+                     alwaysOnTop ? 1 : 0, maximized);
+    if (n > 0) Lunar_WriteFileAtomicW(path, buf, (size_t)n);
 }
 
 // ---------------------------------------------------------------------------
@@ -366,17 +362,18 @@ static void LoadSettings(void) {
 static void SaveSettings(void) {
     wchar_t path[MAX_PATH]; SettingsPathW(path, MAX_PATH);
     if (!path[0]) return;
-    FILE *f = _wfopen(path, L"wb");
-    if (!f) return;
-    fprintf(f,
-            "chimes=%d\n"
-            "unmin=%d\n"
-            "confirm=%d\n"
-            "fmt24=%d\n"
-            "tz=%s\n",
-            g_chimesEnabled, g_unminimizeOnChime, g_confirmOnClose,
-            g_use24h, g_tzIana);
-    fclose(f);
+    char buf[512];
+    int n = snprintf(buf, sizeof buf,
+                     "chimes=%d\n"
+                     "unmin=%d\n"
+                     "confirm=%d\n"
+                     "fmt24=%d\n"
+                     "tz=%s\n",
+                     g_chimesEnabled, g_unminimizeOnChime, g_confirmOnClose,
+                     g_use24h, g_tzIana);
+    if (n > 0 && n < (int)sizeof buf) {
+        Lunar_WriteFileAtomicW(path, buf, (size_t)n);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2401,7 +2398,31 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         SaveWindowState(hwnd, g_alwaysOnTop);
         Ntp_Shutdown();
         Clock_Shutdown();
+        Log_FlushToDisk(NULL);
         DestroyWindow(hwnd);
+        return 0;
+
+    case WM_QUERYENDSESSION:
+        // OS shutdown / logoff / update reboot. These bypass WM_CLOSE,
+        // which used to silently lose window state and the disciplined
+        // rate on every Patch-Tuesday reboot. Persist everything now;
+        // the session may still be cancelled, in which case nothing is
+        // lost by having saved.
+        SaveWindowState(hwnd, g_alwaysOnTop);
+        SaveSettings();
+        SaveArmed(g_armed);
+        return TRUE;
+
+    case WM_ENDSESSION:
+        if (wp) {
+            Log_Append("app: session ending (shutdown/logoff)");
+            SaveWindowState(hwnd, g_alwaysOnTop);
+            Clock_Shutdown();
+            Log_FlushToDisk(NULL);
+            // No Ntp_Shutdown here: its worker-drain wait could eat the
+            // few seconds Windows grants us, and the OS reclaims the
+            // sockets anyway.
+        }
         return 0;
 
     case WM_DESTROY:
@@ -2420,6 +2441,69 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 // ---------------------------------------------------------------------------
+// Crash handler
+// ---------------------------------------------------------------------------
+//
+// Best-effort last words. Before this, a field crash left zero
+// artifacts: the in-memory event ring evaporated with the process and
+// there was nothing to attach to a report. Now an unhandled exception
+// writes a minidump plus a snapshot of the 24 h event ring to
+// %APPDATA%\Lunar\crash\. dbghelp is loaded inside the handler; every
+// step is optional and failure just falls through to process death.
+
+typedef BOOL (WINAPI *MiniDumpWriteDumpFn)(HANDLE, DWORD, HANDLE, int,
+                                           void *, void *, void *);
+
+static LONG WINAPI CrashHandler(EXCEPTION_POINTERS *ep) {
+    wchar_t dir[MAX_PATH];
+    if (Lunar_AppDataPathW(dir, MAX_PATH, L"crash")) {
+        CreateDirectoryW(dir, NULL);   // ok if it already exists
+
+        DWORD pid  = GetCurrentProcessId();
+        DWORD tick = GetTickCount();
+        wchar_t path[MAX_PATH];
+
+        _snwprintf_s(path, MAX_PATH, _TRUNCATE,
+                     L"%ls\\lunar-%lu-%lu.dmp", dir,
+                     (unsigned long)pid, (unsigned long)tick);
+        HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
+        if (dbghelp) {
+            MiniDumpWriteDumpFn writeDump =
+                (MiniDumpWriteDumpFn)(void (*)(void))GetProcAddress(
+                    dbghelp, "MiniDumpWriteDump");
+            if (writeDump) {
+                HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL,
+                                       CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                       NULL);
+                if (f != INVALID_HANDLE_VALUE) {
+                    // MINIDUMP_EXCEPTION_INFORMATION, declared locally so
+                    // dbghelp.h is not a build dependency.
+                    struct {
+                        DWORD               ThreadId;
+                        EXCEPTION_POINTERS *ExceptionPointers;
+                        BOOL                ClientPointers;
+                    } mei = { GetCurrentThreadId(), ep, FALSE };
+                    writeDump(GetCurrentProcess(), pid, f,
+                              0 /* MiniDumpNormal */,
+                              ep ? &mei : NULL, NULL, NULL);
+                    CloseHandle(f);
+                }
+            }
+        }
+
+        wchar_t leaf[64];
+        _snwprintf_s(leaf, 64, _TRUNCATE, L"crash\\lunar-%lu-%lu.log",
+                     (unsigned long)pid, (unsigned long)tick);
+        Log_Append("app: unhandled exception 0x%08lX; writing crash dump",
+                   ep && ep->ExceptionRecord
+                       ? (unsigned long)ep->ExceptionRecord->ExceptionCode
+                       : 0UL);
+        Log_FlushToDisk(leaf);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// ---------------------------------------------------------------------------
 // WinMain
 // ---------------------------------------------------------------------------
 
@@ -2427,6 +2511,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     (void)hPrev;
     (void)cmdLine;
+
+    SetUnhandledExceptionFilter(CrashHandler);
 
     // Enable Per-Monitor-V2 DPI awareness so the system menu, title bar,
     // and dialogs are rendered at native pixel density instead of being

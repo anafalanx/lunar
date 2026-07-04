@@ -14,6 +14,7 @@
 
 #include "logbuf.h"
 #include "clock.h"
+#include "app_paths.h"
 
 // --- Per-entry record ----------------------------------------------------
 //
@@ -245,6 +246,32 @@ size_t Log_Snapshot(char *out, size_t out_cap) {
         out[term] = 0;
     }
     return written;
+}
+
+int Log_FlushToDisk(const wchar_t *leaf_name) {
+    EnsureInit();
+
+    wchar_t path[MAX_PATH];
+    if (!Lunar_AppDataPathW(path, MAX_PATH,
+                            leaf_name ? leaf_name : L"last-session.log")) {
+        return 0;
+    }
+
+    // This runs from shutdown paths and the crash handler, where the
+    // CRT heap may be corrupt: VirtualAlloc goes straight to the
+    // kernel and touches no heap locks. The pointer is kept for reuse
+    // (a crash-time flush may be the first and only call).
+    static char *s_flushBuf;
+    static const size_t kFlushCap = 512 * 1024;
+    if (!s_flushBuf) {
+        s_flushBuf = (char *)VirtualAlloc(NULL, kFlushCap,
+                                          MEM_COMMIT | MEM_RESERVE,
+                                          PAGE_READWRITE);
+        if (!s_flushBuf) return 0;
+    }
+    size_t n = Log_Snapshot(s_flushBuf, kFlushCap);
+    if (n == 0) return 0;
+    return Lunar_WriteFileAtomicW(path, s_flushBuf, n);
 }
 
 #ifdef LUNAR_TESTING

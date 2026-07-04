@@ -269,10 +269,10 @@ void Clock_Shutdown(void) {
     }
     wchar_t path[MAX_PATH];
     if (!Lunar_AppDataPathW(path, MAX_PATH, L"discipline.dat")) return;
-    FILE *f = _wfopen(path, L"wb");
-    if (!f) return;
-    fprintf(f, "%d %lld\n", (int)g_ratePpm, (long long)g_lastSyncUtcMs);
-    fclose(f);
+    char buf[64];
+    int n = snprintf(buf, sizeof buf, "%d %lld\n",
+                     (int)g_ratePpm, (long long)g_lastSyncUtcMs);
+    if (n <= 0 || !Lunar_WriteFileAtomicW(path, buf, (size_t)n)) return;
     Log_Append("clock: shutdown \xe2\x80\x94" " persisted rate=%+d ppm",
                (int)g_ratePpm);
 }

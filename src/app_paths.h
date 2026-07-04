@@ -22,6 +22,13 @@ extern "C" {
 int Lunar_AppDataPathW(wchar_t *out, size_t out_len,
                        const wchar_t *leaf_name);
 
+// Write `len` bytes of `data` to `path` atomically: the bytes land in a
+// sibling .tmp file, are flushed to disk, and replace the target via
+// MoveFileExW (same pattern as pin_store.c). A crash or power cut
+// mid-write can no longer leave a truncated or torn file behind.
+// Returns 1 on success, 0 on failure (the target is left untouched).
+int Lunar_WriteFileAtomicW(const wchar_t *path, const void *data, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

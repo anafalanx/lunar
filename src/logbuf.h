@@ -56,6 +56,13 @@ void Log_Append(const char *fmt, ...);
 // Safe to call with out=NULL / out_cap=0 to query the required size.
 size_t Log_Snapshot(char *out, size_t out_cap);
 
+// Persist the current ring to %APPDATA%\Lunar\<leaf_name> (atomically;
+// leaf_name NULL uses "last-session.log"). Called on shutdown, session
+// end, and from the crash handler, so the diagnostic history the trust
+// machinery produced survives the failure it explains. Returns 1 on
+// success.
+int Log_FlushToDisk(const wchar_t *leaf_name);
+
 #ifdef LUNAR_TESTING
 // Test-only: drop all buffered entries so a test can assert on log
 // content in isolation from whatever logging ran before it.
