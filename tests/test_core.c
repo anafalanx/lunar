@@ -879,6 +879,22 @@ static void test_clock_degraded(void) {
     CHECK_EQ_INT(Clock_IsDisciplined(), 0);
 }
 
+// A kiss-o'-death reply removes the sender from the cycle draw: RATE
+// (and unknown codes) for a 15-min cooldown, DENY/RSTR for the session.
+static void test_ntp_kiss_of_death(void) {
+    Ntp_TestClearKissOfDeath();
+    int full = Ntp_TestEligibleCoreCount();
+    CHECK(full >= 8);   // pool must cover 4 slots x 2 attempts
+
+    Ntp_TestMarkKissOfDeath(0, "RATE");
+    Ntp_TestMarkKissOfDeath(1, "DENY");
+    Ntp_TestMarkKissOfDeath(2, "RSTR");
+    CHECK_EQ_INT(Ntp_TestEligibleCoreCount(), full - 3);
+
+    Ntp_TestClearKissOfDeath();
+    CHECK_EQ_INT(Ntp_TestEligibleCoreCount(), full);
+}
+
 // ---------------------------------------------------------------------------
 // Ntp_Concur -- the pure trust-verdict evaluator (NTS-anchored)
 // ---------------------------------------------------------------------------
@@ -2670,6 +2686,7 @@ int main(void) {
     test_clock_degraded();
     test_ntp_concur();
     test_ntp_concur_degraded();
+    test_ntp_kiss_of_death();
     test_siv_rfc5297_appendix_a1();
     test_siv_rfc5297_appendix_a2();
     test_siv_edge_cases();

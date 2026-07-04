@@ -108,6 +108,13 @@ TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
                       int64_t *outBestQpc,
                       int64_t *outMaxSpreadMs);
 
+#ifdef LUNAR_TESTING
+// Kiss-o'-death bookkeeping hooks (see ntp.c).
+void Ntp_TestMarkKissOfDeath(int poolIdx, const char *kiss);
+int  Ntp_TestEligibleCoreCount(void);
+void Ntp_TestClearKissOfDeath(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

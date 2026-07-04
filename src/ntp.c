@@ -129,6 +129,33 @@ static_assert(CORE_POOL_SIZE >= NTP_CORE_COUNT,
 static_assert(NTP_CORE_COUNT * NTP_CORE_SLOT_ATTEMPTS <= CORE_POOL_SIZE,
               "core NTP pool must have replacement sources for each slot");
 
+// Kiss-o'-Death handling (RFC 5905 section 7.4): a stratum-0 reply whose
+// reference ID carries an ASCII code like RATE / DENY / RSTR is an
+// explicit server request to back off. Honoring it is basic etiquette
+// toward the national metrology institutes this pool depends on -- and
+// ignoring it invites the IP-level rate limiting that would prolong the
+// very outage we are polling to end. Per pool entry, a GetTickCount64
+// deadline before which the host is excluded from the cycle draw:
+// DENY/RSTR exclude for the rest of the session, everything else for
+// KOD_RATE_COOLDOWN_MS. Interlocked access; no lock needed.
+#define KOD_RATE_COOLDOWN_MS (15 * 60 * 1000)
+static volatile LONG64 g_coreKodUntilTick[CORE_POOL_SIZE];
+
+static void Ntp_MarkKissOfDeath(const NtpSource *src, const char *kiss) {
+    size_t i = (size_t)(src - kCorePool);
+    if (i >= CORE_POOL_SIZE) return;
+    int forever = (memcmp(kiss, "DENY", 4) == 0 ||
+                   memcmp(kiss, "RSTR", 4) == 0);
+    int64_t until = forever
+        ? INT64_MAX
+        : (int64_t)GetTickCount64() + KOD_RATE_COOLDOWN_MS;
+    InterlockedExchange64(&g_coreKodUntilTick[i], until);
+    Log_Append("ntp: %s sent kiss-o'-death %.4s; %s",
+               src->label ? src->label : src->host, kiss,
+               forever ? "excluded for the rest of the session"
+                       : "cooling down for 15 min");
+}
+
 // Published label buffers for each NTS slot. Pointed to by
 // g_results[4..5].label, so they MUST outlive the aggregator thread
 // that filled them -- which is exactly what file-scope storage gives
@@ -215,11 +242,14 @@ static void Ntp_WorkerFinished(void)
 // outOffsetMs is kept for API compatibility but repurposed: it now
 // carries ntpUtcMs (absolute UTC at qpcAtT4). The aggregator projects
 // those values onto a common QPC moment before computing concurrence.
+// outKiss (optional, char[5]): filled with the ASCII kiss-o'-death code
+// when the server replies with stratum 0; left untouched otherwise.
 static int NtpQueryHost(const char *host,
                         int64_t *outOffsetMs,
                         int64_t *outNtpUtcMs,
                         int64_t *outQpcAtT4,
-                        uint32_t *outRttMs) {
+                        uint32_t *outRttMs,
+                        char *outKiss) {
     unsigned char pkt[NTP_PACKET_LEN];
     memset(pkt, 0, sizeof(pkt));
     pkt[0] = 0x23;  // LI=0, VN=4, Mode=3 (client)
@@ -265,10 +295,17 @@ static int NtpQueryHost(const char *host,
     uint8_t vn      = (pkt[0] >> 3) & 0x7;
     uint8_t mode    =  pkt[0]       & 0x7;
     uint8_t stratum =  pkt[1];
-    if (li == 3)                         return 0;
     if (vn != 3 && vn != 4)              return 0;
     if (mode != 4)                       return 0;
-    if (stratum == 0 || stratum >= 16)   return 0;
+    if (stratum == 0) {
+        // Kiss-o'-Death: the reference ID (bytes 12..15) carries an
+        // ASCII back-off code (RFC 5905 section 7.4). Surface it so the
+        // worker can honor the server's request.
+        if (outKiss) { memcpy(outKiss, pkt + 12, 4); outKiss[4] = 0; }
+        return 0;
+    }
+    if (li == 3)                         return 0;
+    if (stratum >= 16)                   return 0;
 
     uint32_t secBE, fracBE;
     memcpy(&secBE, pkt + 32, 4); memcpy(&fracBE, pkt + 36, 4);
@@ -348,7 +385,8 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
 
         int64_t off = 0, utc = 0, qpc = 0;
         uint32_t rtt = 0;
-        if (NtpQueryHost(src->host, &off, &utc, &qpc, &rtt)) {
+        char kiss[5] = { 0 };
+        if (NtpQueryHost(src->host, &off, &utc, &qpc, &rtt, kiss)) {
             r->ok        = 1;
             r->offsetMs  = off;
             r->ntpUtcMs  = utc;
@@ -357,6 +395,7 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
             r->authMode  = NTP_AUTH_PLAIN_SNTP;
             goto done;
         }
+        if (kiss[0]) Ntp_MarkKissOfDeath(src, kiss);
 
         if (i + 1 < ctx->candidate_count && ctx->candidates[i + 1]) {
             const NtpSource *next = ctx->candidates[i + 1];
@@ -383,11 +422,21 @@ done:
 static size_t PickCoreSources(const NtpSource **out, size_t n_want)
 {
     if (!out || n_want == 0) return 0;
-    size_t pool = CORE_POOL_SIZE;
-    if (n_want > pool) n_want = pool;
 
+    // Exclude hosts honoring a kiss-o'-death cooldown. If that empties
+    // the pool entirely, the cycle simply fails -- the servers asked us
+    // to go away, and holdover display keeps running regardless.
     size_t idx[CORE_POOL_SIZE];
-    for (size_t i = 0; i < pool; i++) idx[i] = i;
+    size_t pool = 0;
+    int64_t now = (int64_t)GetTickCount64();
+    for (size_t i = 0; i < CORE_POOL_SIZE; i++) {
+        int64_t until = InterlockedCompareExchange64(
+            &g_coreKodUntilTick[i], 0, 0);
+        if (until > now) continue;
+        idx[pool++] = i;
+    }
+    if (pool == 0) return 0;
+    if (n_want > pool) n_want = pool;
 
     for (size_t i = 0; i < n_want; i++) {
         uint32_t r = 0;
@@ -404,6 +453,21 @@ static size_t PickCoreSources(const NtpSource **out, size_t n_want)
     }
     return n_want;
 }
+
+#ifdef LUNAR_TESTING
+void Ntp_TestMarkKissOfDeath(int poolIdx, const char *kiss) {
+    if (poolIdx < 0 || (size_t)poolIdx >= CORE_POOL_SIZE) return;
+    Ntp_MarkKissOfDeath(&kCorePool[poolIdx], kiss);
+}
+int Ntp_TestEligibleCoreCount(void) {
+    const NtpSource *tmp[CORE_POOL_SIZE];
+    return (int)PickCoreSources(tmp, CORE_POOL_SIZE);
+}
+void Ntp_TestClearKissOfDeath(void) {
+    for (size_t i = 0; i < CORE_POOL_SIZE; i++)
+        InterlockedExchange64(&g_coreKodUntilTick[i], 0);
+}
+#endif
 
 // NTS (authenticated) worker. The aggregator pre-selects a distinct
 // provider for each slot (see AggregatorProc) so the two NTS picks
