@@ -25,7 +25,13 @@ BUILD = ROOT / "build" / "tests"
 # Reuse build.py's cached mbedTLS archive builder so the tests link
 # against exactly the same static library as the shipped binary.
 sys.path.insert(0, str(ROOT / "scripts"))
-from build import build_mbedtls_archive, find_tool, MBEDTLS_DIR   # noqa: E402
+from build import (  # noqa: E402
+    build_mbedtls_archive,
+    find_tool,
+    read_version,
+    write_version_header,
+    MBEDTLS_DIR,
+)
 
 
 def main() -> int:
@@ -34,6 +40,10 @@ def main() -> int:
 
     # Ensure the mbedTLS static archive is built (cached after first run).
     mbedtls_archive = build_mbedtls_archive(gcc)
+
+    # lunar.c includes the generated version header; make sure it exists
+    # even when tests run before a full build.
+    write_version_header(ROOT / "build", read_version())
 
     exe = BUILD / "test_core.exe"
     src = [
@@ -65,6 +75,7 @@ def main() -> int:
         "-ffunction-sections", "-fdata-sections",
         f"-I{MBEDTLS_DIR / 'include'}",
         f"-I{ROOT / 'third_party'}",
+        f"-I{ROOT / 'build'}",
         "-DMBEDTLS_CONFIG_FILE=<lunar_mbedtls_config.h>",
         "-DLUNAR_TESTING",
         "-o", str(exe),

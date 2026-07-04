@@ -235,7 +235,8 @@ void Clock_Init(void) {
     LoadDiscipline();
     // Persisted rate is a bootstrap hint only. It won't be applied
     // until we have our first anchor (first successful NTP sync this
-    // run). Until then NowUtcMs() returns the raw system clock.
+    // run). Until then the display state is TRUST_INOP and no time is
+    // returned -- the Windows system clock is never a display source.
     g_ratePpm    = 0;
     g_haveSample = 0;
     g_haveRate   = 0;

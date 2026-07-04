@@ -9,10 +9,11 @@
 //
 // The parser supports the 64-bit (version >= '2') data block only.
 // Version '1' blobs that pre-date the 64-bit table are rejected, as
-// modern tzdata always writes at least version 2.  POSIX TZ footer
-// strings are not interpreted; instead we rely on `zic` padding the
-// transition table out to the year 2499, which covers Lunar's useful
-// lifetime.
+// modern tzdata always writes at least version 2.  The POSIX TZ footer
+// string IS parsed and is LOAD-BEARING: the embedded blobs are slim
+// (transition tables end around the build year), so every recurring
+// future DST transition comes from evaluating the footer rule. See
+// tzif.c's footer section.
 //
 // All fields in `TzifLocal` use the familiar conventions:
 //     month  1..12
