@@ -11,7 +11,7 @@
 // mutually agree; at least 3 of the 4 core sources must also concur
 // for the cycle to produce TRUST_OK. If NTS is unavailable but >= 3 core
 // sources still agree within a tighter 100 ms gate and a full OK occurred
-// within the last two hours, the cycle produces the unauthenticated
+// within the last eight hours, the cycle produces the unauthenticated
 // TRUST_DEGRADED state instead (see clock.h).
 #ifndef LUNAR_NTP_H
 #define LUNAR_NTP_H

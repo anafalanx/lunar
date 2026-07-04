@@ -44,6 +44,25 @@
 #ifndef PBT_APMRESUMEAUTOMATIC
 #define PBT_APMRESUMEAUTOMATIC  0x0012
 #endif
+// Session-change notifications (wtsapi32). Constants are hard-coded in
+// the same spirit as the DWM messages above; the register/unregister
+// functions are resolved dynamically so wtsapi32 is not a link-time
+// dependency.
+#ifndef WM_WTSSESSION_CHANGE
+#define WM_WTSSESSION_CHANGE    0x02B1
+#endif
+#ifndef WTS_CONSOLE_CONNECT
+#define WTS_CONSOLE_CONNECT     0x1
+#endif
+#ifndef WTS_REMOTE_CONNECT
+#define WTS_REMOTE_CONNECT      0x3
+#endif
+#ifndef WTS_SESSION_UNLOCK
+#define WTS_SESSION_UNLOCK      0x8
+#endif
+#ifndef NOTIFY_FOR_THIS_SESSION
+#define NOTIFY_FOR_THIS_SESSION 0
+#endif
 
 #include <time.h>
 #include <math.h>
@@ -69,12 +88,23 @@
 #define DEFAULT_W        600
 #define DEFAULT_H        600
 #define TICK_MS          200           // 5 fps sweep cadence
-#define UI_TIMER_GAP_TRIP_MS 1500      // fail closed after UI/timer stalls
-// Poll cadence: aggressive 5 s retry while INOP to minimize outage,
-// and a gentle 60 s after an NTS-anchored concurrence verdict. There
-// is no degraded middle ground -- the trust state is binary.
+// A UI-timer gap this large means the machine likely suspended (or the
+// session was frozen) without a power broadcast we handled: QPC elapsed
+// across the gap cannot be defended, so continuity is broken and the
+// display shows the last verified time until the next authenticated
+// cycle re-anchors. Short message-pump stalls do not invalidate the QPC
+// timescale and are ignored.
+#define CONTINUITY_GAP_TRIP_MS 10000
+// Poll cadence: 60 s while a corroborated tier (OK/DEGRADED) is live;
+// otherwise exponential backoff from 5 s to 5 min with jitter, so an
+// extended outage never hammers public time infrastructure.
 #define NTP_INTERVAL_OK_MS      60000   // 60 s
-#define NTP_INTERVAL_INOP_MS     5000   //  5 s
+#define NTP_INTERVAL_MIN_MS      5000   //  5 s first retry
+#define NTP_INTERVAL_MAX_MS    300000   //  5 min backoff ceiling
+// Chimes fire only while the display's honest error bound is tighter
+// than this. A 5-minute-granularity chime is still meaningful at +-30 s;
+// beyond that the clock no longer claims chime-worthy accuracy.
+#define CHIME_MAX_BOUND_MS      30000
 
 // System-menu command IDs. Must be in 1..0xEFFF (>= 0xF000 is reserved).
 #define IDM_ALWAYS_ON_TOP 0x1001
@@ -161,6 +191,10 @@ static float                  g_prevMins     = -1.0f;
 static char                   g_tzLabel[96]  = "";
 static DWORD                  g_lastNtpKickMs = 0;
 static ULONGLONG              g_lastTickSeenMs = 0;
+static DWORD                  g_ntpRetryBackoffMs = 0; // current retry interval
+                                                       // while uncorroborated
+static DWORD                  g_ntpNextDueMs = 0;      // GetTickCount deadline
+                                                       // of the next poll kick
 
 // User-configurable settings (persisted in %APPDATA%\Lunar\settings.dat).
 static int                    g_chimesEnabled      = 1;
@@ -450,9 +484,11 @@ static int HitTestHour(float mx, float my, float cx, float cy, float S) {
 //
 // Title format:
 //
-//   14:37  Europe/Paris (UTC+2, DST)
-//   2:37 PM  Europe/Paris (UTC+1)
-//   UTC                                   (no trusted time yet)
+//   14:37  Europe/Paris (UTC+2, DST)                      full trust
+//   14:37  Europe/Paris (UTC+2) — unauthenticated         degraded
+//   14:37  Europe/Paris (UTC+2) — unsynced 22m, ±0.5s     holdover
+//   Europe/Paris — reacquiring (last 14:32)               after resume
+//   UTC                                                   (no time yet)
 //
 // Called from Tick() every ~200 ms; SetWindowTextW is only invoked when
 // the composed string actually changes, so the caption does not churn.
@@ -461,6 +497,51 @@ static int HitTestHour(float mx, float my, float cx, float cy, float S) {
 // helpers.  Needed here because UpdateTitleBar prepends the digital time.
 static int UtcMsToLocalTm(int64_t utcMs, struct tm *out, int *outMs);
 
+// "±0.3s" / "±12s" / "±2.5min" -- human-sized error bound.
+static void FormatBoundW(int64_t boundMs, WCHAR *out, size_t outLen) {
+    if (boundMs < 10000) {
+        _snwprintf_s(out, outLen, _TRUNCATE, L"\x00b1%.1fs",
+                     (double)boundMs / 1000.0);
+    } else if (boundMs < 120000) {
+        _snwprintf_s(out, outLen, _TRUNCATE, L"\x00b1%llds",
+                     (long long)(boundMs / 1000));
+    } else {
+        _snwprintf_s(out, outLen, _TRUNCATE, L"\x00b1%.1fmin",
+                     (double)boundMs / 60000.0);
+    }
+}
+
+// "42s" / "22m" / "3.4h" -- human-sized age.
+static void FormatAgeW(int64_t ageMs, WCHAR *out, size_t outLen) {
+    if (ageMs < 90000) {
+        _snwprintf_s(out, outLen, _TRUNCATE, L"%llds",
+                     (long long)(ageMs / 1000));
+    } else if (ageMs < 5400000) {
+        _snwprintf_s(out, outLen, _TRUNCATE, L"%lldm",
+                     (long long)(ageMs / 60000));
+    } else {
+        _snwprintf_s(out, outLen, _TRUNCATE, L"%.1fh",
+                     (double)ageMs / 3600000.0);
+    }
+}
+
+static void FormatClockTimeW(int64_t utcMs, WCHAR *out, size_t outLen) {
+    out[0] = 0;
+    struct tm lt = { 0 };
+    int ms = 0;
+    if (!UtcMsToLocalTm(utcMs, &lt, &ms)) return;
+    if (g_use24h) {
+        _snwprintf_s(out, outLen, _TRUNCATE, L"%02d:%02d",
+                     lt.tm_hour, lt.tm_min);
+    } else {
+        int h12 = lt.tm_hour % 12;
+        if (h12 == 0) h12 = 12;
+        const wchar_t *mer = (lt.tm_hour < 12) ? L"AM" : L"PM";
+        _snwprintf_s(out, outLen, _TRUNCATE, L"%d:%02d %ls",
+                     h12, lt.tm_min, mer);
+    }
+}
+
 static void UpdateTitleBar(void) {
     static WCHAR s_last[192] = { 0 };
 
@@ -468,32 +549,42 @@ static void UpdateTitleBar(void) {
     if (g_tzLabel[0])
         MultiByteToWideChar(CP_UTF8, 0, g_tzLabel, -1, tz, 32);
 
-    // Digital time prefix, but only when the disciplined clockwork
-    // actually has a trustworthy reading this run.  Before the first
-    // good sync we omit the time entirely rather than paint a fake
-    // "00:00" or "--:--".
-    WCHAR when[16] = L"";
-    int64_t utcMs = 0;
-    if (Clock_NowUtcMs(&utcMs)) {
-        struct tm lt = { 0 };
-        int ms = 0;
-        if (UtcMsToLocalTm(utcMs, &lt, &ms)) {
-            if (g_use24h) {
-                _snwprintf_s(when, 16, _TRUNCATE, L"%02d:%02d",
-                             lt.tm_hour, lt.tm_min);
-            } else {
-                int h12 = lt.tm_hour % 12;
-                if (h12 == 0) h12 = 12;
-                const wchar_t *mer = (lt.tm_hour < 12) ? L"AM" : L"PM";
-                _snwprintf_s(when, 16, _TRUNCATE, L"%d:%02d %ls",
-                             h12, lt.tm_min, mer);
-            }
-        }
-    }
+    // Digital time prefix, but only when the clockwork has a running
+    // reading this run.  Before the first good sync we omit the time
+    // entirely rather than paint a fake "00:00" or "--:--"; while
+    // reacquiring after a resume we show the last verified reading
+    // labeled as such.
+    ClockDisplay d;
+    Clock_GetDisplay(&d);
 
     WCHAR title[192];
-    if (when[0]) {
+    WCHAR when[16] = L"";
+    if (d.state >= TRUST_HOLDOVER) {
+        FormatClockTimeW(d.utcMs, when, 16);
+    }
+
+    if (when[0] && d.state == TRUST_OK) {
         _snwprintf_s(title, 192, _TRUNCATE, L"%ls  %ls", when, tz);
+    } else if (when[0] && d.state == TRUST_DEGRADED) {
+        _snwprintf_s(title, 192, _TRUNCATE,
+                     L"%ls  %ls \x2014 unauthenticated", when, tz);
+    } else if (when[0]) {   // TRUST_HOLDOVER
+        WCHAR age[16], bound[16];
+        FormatAgeW(d.lastSyncAgeMs, age, 16);
+        FormatBoundW(d.boundMs, bound, 16);
+        _snwprintf_s(title, 192, _TRUNCATE,
+                     L"%ls  %ls \x2014 unsynced %ls, %ls",
+                     when, tz, age, bound);
+    } else if (d.state == TRUST_REACQUIRING && d.lastSyncUtcMs > 0) {
+        WCHAR last[16] = L"";
+        FormatClockTimeW(d.lastSyncUtcMs, last, 16);
+        if (last[0]) {
+            _snwprintf_s(title, 192, _TRUNCATE,
+                         L"%ls \x2014 reacquiring (last %ls)", tz, last);
+        } else {
+            _snwprintf_s(title, 192, _TRUNCATE,
+                         L"%ls \x2014 reacquiring", tz);
+        }
     } else {
         _snwprintf_s(title, 192, _TRUNCATE, L"%ls", tz);
     }
@@ -803,6 +894,49 @@ static void DrawInop(float dw, float dh, const Palette *pal) {
         DWRITE_MEASURING_MODE_NATURAL);
 }
 
+// Bottom-centered one-line status badge over the dial ("UNAUTHENTICATED",
+// "UNSYNCED 22m ±0.5s", "REACQUIRING ...").
+static void DrawBadge(const WCHAR *text, D2D1_COLOR_F color,
+                      float dw, float dh, float S) {
+    if (!text || !text[0]) return;
+    int fs = (int)(S * 0.045f);
+    if (fs < 11) fs = 11;
+    EnsureTextFormat(fs);
+    if (!g_txtSys) return;
+    IDWriteTextFormat_SetTextAlignment(g_txtSys,
+        DWRITE_TEXT_ALIGNMENT_CENTER);
+    IDWriteTextFormat_SetParagraphAlignment(g_txtSys,
+        DWRITE_PARAGRAPH_ALIGNMENT_FAR);
+    float pad = fs * 0.7f;
+    D2D1_RECT_F rect = { 0, 0, dw, dh - pad };
+    SetBrush(color);
+    ID2D1RenderTarget_DrawText(g_rt, text, (UINT32)wcslen(text),
+        g_txtSys, &rect, (ID2D1Brush*)g_brush,
+        D2D1_DRAW_TEXT_OPTIONS_NONE,
+        DWRITE_MEASURING_MODE_NATURAL);
+}
+
+// Small status line under the big INOP letters (reason / next retry).
+static void DrawInopStatus(const WCHAR *text, float dw, float dh, float S) {
+    if (!text || !text[0]) return;
+    int fs = (int)(S * 0.045f);
+    if (fs < 11) fs = 11;
+    EnsureTextFormat(fs);
+    if (!g_txtSys) return;
+    IDWriteTextFormat_SetTextAlignment(g_txtSys,
+        DWRITE_TEXT_ALIGNMENT_CENTER);
+    IDWriteTextFormat_SetParagraphAlignment(g_txtSys,
+        DWRITE_PARAGRAPH_ALIGNMENT_FAR);
+    float pad = fs * 1.2f;
+    D2D1_RECT_F rect = { 0, dh * 0.5f, dw, dh - pad };
+    D2D1_COLOR_F soft = { 0.63f, 0.63f, 0.63f, 1.0f };
+    SetBrush(soft);
+    ID2D1RenderTarget_DrawText(g_rt, text, (UINT32)wcslen(text),
+        g_txtSys, &rect, (ID2D1Brush*)g_brush,
+        D2D1_DRAW_TEXT_OPTIONS_NONE,
+        DWRITE_MEASURING_MODE_NATURAL);
+}
+
 static void DrawInopGdi(HDC hdc, const RECT *rc) {
     if (!hdc || !rc) return;
 
@@ -949,13 +1083,14 @@ static void Paint(HDC fallbackDc) {
         return;
     }
 
-    // Read the disciplined clockwork time. Clock_NowUtcMs() returns 0
-    // if we have not yet successfully synced THIS run -- the Windows
-    // system clock is never used as a display source. In that case we
-    // paint the INOP indicator and skip dial rendering entirely.
-    int64_t displayMs = 0;
-    uint64_t displayGeneration = 0;
-    int haveTime = Clock_ReadDisplayTime(&displayMs, &displayGeneration);
+    // Read the display snapshot: derived trust state, projected time,
+    // and honest error bound. The Windows system clock is never used as
+    // a display source.
+    ClockDisplay d;
+    Clock_GetDisplay(&d);
+    int64_t  displayMs         = d.utcMs;
+    uint64_t displayGeneration = d.generation;
+    int      haveTime          = (d.state >= TRUST_HOLDOVER);
 
     Palette pal = (g_theme == 1) ? palette_light() : palette_dark();
 
@@ -972,10 +1107,9 @@ static void Paint(HDC fallbackDc) {
     ID2D1RenderTarget_Clear(g_rt, &pal.bg);
     ID2D1RenderTarget_SetAntialiasMode(g_rt, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
-    int drewDial = 0;
-    if (!haveTime) {
-        DrawInop(dw, dh, &pal);
-    } else {
+    int drewDial   = 0;   // running dial: subject to the generation check
+    int drewFrozen = 0;   // static "last verified" face while reacquiring
+    if (haveTime) {
         struct tm lt = {0};
         int ms = 0;
         if (!UtcMsToLocalTm(displayMs, &lt, &ms)) {
@@ -990,53 +1124,73 @@ static void Paint(HDC fallbackDc) {
                 drewDial = 1;
             }
         }
+    } else if (d.state == TRUST_REACQUIRING && d.lastSyncUtcMs > 0) {
+        // After a suspend/resume or session handoff the projection can't
+        // be defended, but the last verified reading still can: draw it
+        // as a frozen, greyed dial so the user sees an honest "as of"
+        // face instead of a placard.
+        struct tm lt = {0};
+        int ms = 0;
+        if (UtcMsToLocalTm(d.lastSyncUtcMs, &lt, &ms) && S > 40.0f) {
+            Palette grey = pal;
+            grey.ink    = pal.inkSoft;
+            grey.accent = pal.inkSoft;
+            DrawDial(cx, cy, S, &grey, &lt, ms, g_armed);
+            drewFrozen = 1;
+        } else {
+            DrawInop(dw, dh, &pal);
+        }
+    } else {
+        DrawInop(dw, dh, &pal);
+        // Status line: why there is no time, and when we retry next.
+        WCHAR status[96] = L"";
+        LONG untilRetry = (LONG)(g_ntpNextDueMs - GetTickCount());
+        if (d.lastSyncUtcMs == 0) {
+            if (untilRetry > 1000) {
+                _snwprintf_s(status, 96, _TRUNCATE,
+                             L"no trusted time yet \x2014 next attempt in %lds",
+                             untilRetry / 1000);
+            } else {
+                _snwprintf_s(status, 96, _TRUNCATE,
+                             L"no trusted time yet \x2014 sync in progress");
+            }
+        } else {
+            _snwprintf_s(status, 96, _TRUNCATE,
+                         L"time display fault \x2014 see log");
+        }
+        DrawInopStatus(status, dw, dh, S);
     }
 
-    // "SYS" indicator (lower-right of the window) when NTP is stale.
-    // Suppressed while INOP is being shown -- INOP already conveys the
-    // untrusted state and we don't want to overpaint it.
-    if (haveTime && !Ntp_IsSynced()) {
-        int fs = (int)(S * 0.035f);
-        if (fs < 10) fs = 10;
-        EnsureTextFormat(fs);
-        if (g_txtSys) {
-            IDWriteTextFormat_SetTextAlignment(g_txtSys,
-                DWRITE_TEXT_ALIGNMENT_TRAILING);
-            IDWriteTextFormat_SetParagraphAlignment(g_txtSys,
-                DWRITE_PARAGRAPH_ALIGNMENT_FAR);
-            float pad = fs * 0.5f;
-            D2D1_RECT_F rect = { 0, 0, dw - pad, dh - pad };
-            SetBrush(pal.accent);
-            ID2D1RenderTarget_DrawText(g_rt, L"SYS", 3,
-                g_txtSys, &rect, (ID2D1Brush*)g_brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL);
+    // Honest state badge over the dial.
+    if ((drewDial || drewFrozen) && d.state != TRUST_OK) {
+        WCHAR badge[96] = L"";
+        D2D1_COLOR_F amber = { 0.95f, 0.62f, 0.05f, 1.0f };
+        D2D1_COLOR_F red   = { 0.92f, 0.10f, 0.10f, 1.0f };
+        D2D1_COLOR_F soft  = { 0.63f, 0.63f, 0.63f, 1.0f };
+        D2D1_COLOR_F color = amber;
+        if (d.state == TRUST_DEGRADED) {
+            WCHAR age[16];
+            FormatAgeW(d.lastSyncAgeMs, age, 16);
+            _snwprintf_s(badge, 96, _TRUNCATE,
+                         L"UNAUTHENTICATED \x00b7 %ls", age);
+        } else if (d.state == TRUST_HOLDOVER) {
+            WCHAR age[16], bound[16];
+            FormatAgeW(d.lastSyncAgeMs, age, 16);
+            FormatBoundW(d.boundMs, bound, 16);
+            _snwprintf_s(badge, 96, _TRUNCATE,
+                         L"UNSYNCED %ls \x00b7 %ls", age, bound);
+            color = (d.boundMs >= 10000) ? red
+                  : (d.boundMs >= 1000)  ? amber
+                  :                        soft;
+        } else if (d.state == TRUST_REACQUIRING) {
+            WCHAR last[16] = L"", age[16];
+            FormatClockTimeW(d.lastSyncUtcMs, last, 16);
+            FormatAgeW(d.lastSyncAgeMs, age, 16);
+            _snwprintf_s(badge, 96, _TRUNCATE,
+                         L"REACQUIRING \x00b7 last verified %ls (%ls ago)",
+                         last, age);
         }
-    }
-
-    // Amber "UNAUTHENTICATED" badge while running on the degraded tier
-    // (NTS unavailable; core sources corroborate a held anchor). The dial
-    // stays readable; the badge marks the time as unauthenticated. This is
-    // mutually exclusive with "SYS" -- degraded implies a recent NTS-OK so
-    // Ntp_IsSynced() is still true.
-    if (drewDial && Clock_Trust() == TRUST_DEGRADED) {
-        int fs = (int)(S * 0.05f);
-        if (fs < 11) fs = 11;
-        EnsureTextFormat(fs);
-        if (g_txtSys) {
-            IDWriteTextFormat_SetTextAlignment(g_txtSys,
-                DWRITE_TEXT_ALIGNMENT_CENTER);
-            IDWriteTextFormat_SetParagraphAlignment(g_txtSys,
-                DWRITE_PARAGRAPH_ALIGNMENT_FAR);
-            float pad = fs * 0.7f;
-            D2D1_RECT_F rect = { 0, 0, dw, dh - pad };
-            D2D1_COLOR_F amber = { 0.95f, 0.62f, 0.05f, 1.0f };
-            SetBrush(amber);
-            ID2D1RenderTarget_DrawText(g_rt, L"UNAUTHENTICATED", 15,
-                g_txtSys, &rect, (ID2D1Brush*)g_brush,
-                D2D1_DRAW_TEXT_OPTIONS_NONE,
-                DWRITE_MEASURING_MODE_NATURAL);
-        }
+        DrawBadge(badge, color, dw, dh, S);
     }
 
     // Validate the trusted-display generation, but do NOT hold the clock
@@ -1137,13 +1291,15 @@ static HBITMAP RenderClockToBitmap(int w, int h) {
     HRESULT hr = ID2D1RenderTarget_CreateSolidColorBrush(
         g_rt, &black, NULL, &g_brush);
     if (SUCCEEDED(hr)) {
-        // Current disciplined UTC (same source as Paint()). Returns 0
-        // if not synced this run; in that case render INOP into the
-        // thumbnail too -- the taskbar preview must never show a stale
-        // or system-clock time.
-        int64_t displayMs = 0;
-        uint64_t displayGeneration = 0;
-        int haveTime = Clock_ReadDisplayTime(&displayMs, &displayGeneration);
+        // Current display snapshot (same source as Paint()). The taskbar
+        // preview must never show a stale or system-clock time: a running
+        // dial only when the state carries one, a greyed frozen face
+        // while reacquiring, INOP otherwise.
+        ClockDisplay d;
+        Clock_GetDisplay(&d);
+        int64_t  displayMs         = d.utcMs;
+        uint64_t displayGeneration = d.generation;
+        int      haveTime          = (d.state >= TRUST_HOLDOVER);
 
         Palette pal = (g_theme == 1) ? palette_light() : palette_dark();
         float dw = (float)w, dh = (float)h;
@@ -1155,19 +1311,19 @@ static HBITMAP RenderClockToBitmap(int w, int h) {
         ID2D1RenderTarget_SetAntialiasMode(g_rt, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
         int drewDial = 0;
-        if (!haveTime) {
-            DrawInop(dw, dh, &pal);
+        struct tm lt = {0};
+        int ms = 0;
+        if (haveTime && UtcMsToLocalTm(displayMs, &lt, &ms) && S > 40.0f) {
+            DrawDial(cx, cy, S, &pal, &lt, ms, g_armed);
+            drewDial = 1;
+        } else if (d.state == TRUST_REACQUIRING && d.lastSyncUtcMs > 0 &&
+                   UtcMsToLocalTm(d.lastSyncUtcMs, &lt, &ms) && S > 40.0f) {
+            Palette grey = pal;
+            grey.ink    = pal.inkSoft;
+            grey.accent = pal.inkSoft;
+            DrawDial(cx, cy, S, &grey, &lt, ms, g_armed);
         } else {
-            struct tm lt = {0};
-            int ms = 0;
-            if (UtcMsToLocalTm(displayMs, &lt, &ms)) {
-                if (S > 40.0f) {
-                    DrawDial(cx, cy, S, &pal, &lt, ms, g_armed);
-                    drewDial = 1;
-                }
-            } else {
-                DrawInop(dw, dh, &pal);
-            }
+            DrawInop(dw, dh, &pal);
         }
         int presentedDial = 0;
         if (drewDial) {
@@ -1902,35 +2058,92 @@ static void RefreshClockSurface(void) {
 }
 
 // ---------------------------------------------------------------------------
-// Tick handler (fires 10x per second via WM_TIMER)
+// Session-change notifications
+// ---------------------------------------------------------------------------
+//
+// RDP reconnects, fast user switching and unlocks can hide a suspend (or
+// a long session freeze) that no WM_POWERBROADCAST reported, leaving a
+// confident-looking dial backed by an unverified projection. Register
+// for WM_WTSSESSION_CHANGE; the handler breaks QPC continuity the same
+// way resume does. wtsapi32 is loaded dynamically: on the off chance it
+// is unavailable, the 10 s timer-gap trip in Tick() still covers the
+// suspend case.
+
+typedef BOOL (WINAPI *WtsRegisterFn)(HWND, DWORD);
+typedef BOOL (WINAPI *WtsUnRegisterFn)(HWND);
+static HMODULE g_wtsapi;
+
+static void SessionNotify_Register(HWND hwnd) {
+    if (!g_wtsapi) g_wtsapi = LoadLibraryW(L"wtsapi32.dll");
+    if (!g_wtsapi) return;
+    WtsRegisterFn reg = (WtsRegisterFn)(void (*)(void))GetProcAddress(
+        g_wtsapi, "WTSRegisterSessionNotification");
+    if (!reg || !reg(hwnd, NOTIFY_FOR_THIS_SESSION)) {
+        Log_Append("app: session-change notifications unavailable "
+                   "(err=%lu)", (unsigned long)GetLastError());
+    }
+}
+
+static void SessionNotify_Unregister(HWND hwnd) {
+    if (!g_wtsapi) return;
+    WtsUnRegisterFn unreg = (WtsUnRegisterFn)(void (*)(void))GetProcAddress(
+        g_wtsapi, "WTSUnRegisterSessionNotification");
+    if (unreg) unreg(hwnd);
+    FreeLibrary(g_wtsapi);
+    g_wtsapi = NULL;
+}
+
+// ---------------------------------------------------------------------------
+// Tick handler (fires 5x per second via WM_TIMER)
 // ---------------------------------------------------------------------------
 
 static void Tick(void) {
+    // A long timer gap means the machine likely suspended (or the
+    // session froze) without a power broadcast we handled; QPC across
+    // the gap cannot be defended, so break continuity and re-sync.
+    // Short pump stalls are harmless: the QPC timescale kept running.
     ULONGLONG now64 = GetTickCount64();
     if (g_lastTickSeenMs != 0 &&
-        now64 - g_lastTickSeenMs > UI_TIMER_GAP_TRIP_MS) {
-        Clock_TripInop("UI timer gap or system resume");
+        now64 - g_lastTickSeenMs > CONTINUITY_GAP_TRIP_MS) {
+        Clock_OnContinuityBroken("timer gap suggests suspend/freeze");
+        g_ntpRetryBackoffMs = 0;
         Ntp_Start();
         g_lastNtpKickMs = GetTickCount();
     }
     g_lastTickSeenMs = now64;
 
-    // Periodic NTP re-sync. Binary cadence: 5 s while INOP (to recover
-    // fast), 60 s once the NTS-anchored concurrence gate is OK.
+    ClockDisplay d;
+    Clock_GetDisplay(&d);
+
+    // Periodic NTP re-sync. 60 s while a corroborated tier is live;
+    // exponential backoff with jitter (5 s .. 5 min) otherwise, so a
+    // long outage never hammers public time servers.
     DWORD nowMs = GetTickCount();
-    DWORD interval = (Clock_Trust() == TRUST_OK)
-        ? NTP_INTERVAL_OK_MS
-        : NTP_INTERVAL_INOP_MS;
+    DWORD interval;
+    if (d.state >= TRUST_DEGRADED) {
+        g_ntpRetryBackoffMs = 0;
+        interval = NTP_INTERVAL_OK_MS;
+    } else {
+        if (g_ntpRetryBackoffMs == 0) g_ntpRetryBackoffMs = NTP_INTERVAL_MIN_MS;
+        interval = g_ntpRetryBackoffMs;
+    }
     if ((nowMs - g_lastNtpKickMs) >= interval) {
         Ntp_Start();
         g_lastNtpKickMs = nowMs;
+        if (d.state < TRUST_DEGRADED) {
+            DWORD next = g_ntpRetryBackoffMs * 2;
+            if (next > NTP_INTERVAL_MAX_MS) next = NTP_INTERVAL_MAX_MS;
+            g_ntpRetryBackoffMs = next * (80 + (nowMs % 41)) / 100; // +-20%
+            interval = g_ntpRetryBackoffMs;
+        }
     }
+    g_ntpNextDueMs = g_lastNtpKickMs + interval;   // read by the INOP face
 
-    // Minute-crossing beep detection. Skip entirely if the clockwork
-    // is not synced this run -- chimes must never fire off an
-    // untrusted time.
-    int64_t displayMs = 0;
-    if (!Clock_NowUtcMs(&displayMs)) {
+    // Minute-crossing beep detection needs a running time; while
+    // reacquiring or INOP just repaint. Chimes additionally require the
+    // honest error bound to stay chime-worthy (CHIME_MAX_BOUND_MS).
+    int64_t displayMs = d.utcMs;
+    if (d.state < TRUST_HOLDOVER) {
         g_prevMins = -1.0f;   // reset so we don't cascade beeps on re-sync
         RefreshClockSurface();
         SetTimer(g_hwnd, IDT_REPAINT, TICK_MS, NULL);
@@ -1975,7 +2188,7 @@ static void Tick(void) {
         // s_last cache suppresses the SetWindowTextW call.
         if (delta > 0) UpdateTimezone();
 
-        if (delta >= 1 && delta <= 2) {
+        if (delta >= 1 && delta <= 2 && d.boundMs < CHIME_MAX_BOUND_MS) {
             for (int k = 1; k <= delta; k++) {
                 int mm = (prevFloor + k) % 60;
                 if (mm % 5 != 0) continue;
@@ -2025,6 +2238,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         InstallSystemMenuItems();
         UpdateTimezone();
+        SessionNotify_Register(hwnd);
         // Opt into DWM-driven iconic thumbnails + live previews so the
         // taskbar shows a current-time clock instead of a frozen
         // pre-minimize snapshot. Must be set after the HWND exists.
@@ -2096,11 +2310,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case PBT_APMRESUMECRITICAL:
         case PBT_APMRESUMESUSPEND:
         case PBT_APMRESUMEAUTOMATIC:
-            Clock_TripInop("system suspend/resume");
+            // QPC elapsed across a suspend is hardware-dependent and the
+            // holdover bound is incomputable across it: break continuity
+            // (display shows last verified time + age) and re-sync
+            // immediately.
+            Clock_OnContinuityBroken("system suspend/resume");
+            g_ntpRetryBackoffMs = 0;
             Ntp_Start();
             g_lastNtpKickMs = GetTickCount();
             RefreshClockSurface();
             return TRUE;
+        }
+        break;
+
+    case WM_WTSSESSION_CHANGE:
+        // RDP reconnect, fast user switching, console handoff, unlock
+        // after a long lock: the session may have been frozen or the
+        // machine suspended without a power broadcast we saw. Same
+        // treatment as resume (known-issues #5).
+        switch (wp) {
+        case WTS_CONSOLE_CONNECT:
+        case WTS_REMOTE_CONNECT:
+        case WTS_SESSION_UNLOCK:
+            Clock_OnContinuityBroken("session reconnect/unlock");
+            g_ntpRetryBackoffMs = 0;
+            Ntp_Start();
+            g_lastNtpKickMs = GetTickCount();
+            RefreshClockSurface();
+            return 0;
         }
         break;
 
@@ -2168,6 +2405,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_DESTROY:
+        SessionNotify_Unregister(hwnd);
         KillTimer(hwnd, IDT_REPAINT);
         ReleaseHandCache();
         DiscardDeviceResources();

@@ -508,7 +508,7 @@ static void test_clock_discipline(void) {
     CHECK_EQ_INT(Clock_RatePpm(), r2);           // loaded bootstrap
 }
 
-static void test_clock_display_fail_closed(void) {
+static void test_clock_display_states(void) {
     // Redirect APPDATA so we don't clobber the user's discipline.dat.
     wchar_t scratchW[MAX_PATH + 32];
     wchar_t cwd[MAX_PATH]; GetCurrentDirectoryW(MAX_PATH, cwd);
@@ -520,11 +520,19 @@ static void test_clock_display_fail_closed(void) {
 
     Clock_Init();
 
+    // Never anchored this run: hard INOP, nothing renderable.
+    ClockDisplay d0;
+    Clock_GetDisplay(&d0);
+    CHECK_EQ_INT(d0.state, TRUST_INOP);
+    CHECK(d0.utcMs == 0);
+    CHECK(d0.lastSyncUtcMs == 0);
+    int64_t display = 0;
+    CHECK_EQ_INT(Clock_NowUtcMs(&display), 0);
+
     int64_t trustedUtc = make_utc_ms(2026, 4, 25, 12, 0, 0);
     Clock_OnPollCycle(TRUST_OK, trustedUtc, Clock_Qpc(), 0);
     CHECK_EQ_INT(Clock_Trust(), TRUST_OK);
 
-    int64_t display = 0;
     uint64_t gen1 = 0;
     CHECK_EQ_INT(Clock_ReadDisplayTime(&display, &gen1), 1);
     CHECK(gen1 != 0);
@@ -539,14 +547,52 @@ static void test_clock_display_fail_closed(void) {
     CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen1), 0);
     CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen2), 1);
 
-    Clock_TestExpireDisplayLease();
-    CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen2), 0);
-    CHECK_EQ_INT(Clock_NowUtcMs(&display), 0);
-    CHECK_EQ_INT(Clock_Trust(), TRUST_INOP);
+    // A fresh anchor claims a tight bound (base 200 ms + negligible age).
+    ClockDisplay d1;
+    Clock_GetDisplay(&d1);
+    CHECK_EQ_INT(d1.state, TRUST_OK);
+    CHECK(d1.boundMs >= 200 && d1.boundMs < 300);
+    CHECK(d1.lastSyncUtcMs >= trustedUtc);
 
-    Clock_Init();
-    Clock_OnPollCycle(TRUST_OK, trustedUtc, Clock_Qpc(), 0);
+    // Staleness: with no corroborating cycle for >150 s the display
+    // derives to honest HOLDOVER -- still a running time, never dark,
+    // same projection basis (the generation is untouched).
+    Clock_TestAgeLastCycle(151000);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_HOLDOVER);
+    CHECK_EQ_INT(Clock_NowUtcMs(&display), 1);
+    CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen2), 1);
+
+    // The bound grows with anchor age: 200 ppm of 1 h = 720 ms + base.
+    Clock_TestAgeAnchor(3600000);
+    ClockDisplay d2;
+    Clock_GetDisplay(&d2);
+    CHECK_EQ_INT(d2.state, TRUST_HOLDOVER);
+    CHECK(d2.boundMs >= 900 && d2.boundMs <= 940);
+    CHECK(d2.lastSyncAgeMs >= 3600000);
+
+    // Continuity break (suspend/resume): REACQUIRING carries only the
+    // last verified reading, never a running projection.
+    Clock_OnContinuityBroken("unit test");
+    ClockDisplay d3;
+    Clock_GetDisplay(&d3);
+    CHECK_EQ_INT(d3.state, TRUST_REACQUIRING);
+    CHECK_EQ_INT(Clock_NowUtcMs(&display), 0);
+    CHECK(d3.lastSyncUtcMs >= trustedUtc);
+    CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen2), 0);
+
+    // Unauthenticated corroboration cannot end reacquisition...
+    Clock_OnPollCycle(TRUST_DEGRADED, trustedUtc, Clock_Qpc(), 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_REACQUIRING);
+
+    // ...only a full authenticated cycle re-anchors and restores display.
+    int64_t reUtc = trustedUtc + 5000;
+    Clock_OnPollCycle(TRUST_OK, reUtc, Clock_Qpc(), 0);
     CHECK_EQ_INT(Clock_Trust(), TRUST_OK);
+    CHECK_EQ_INT(Clock_NowUtcMs(&display), 1);
+    CHECK(display >= reUtc);
+
+    // Hard INOP latch (unrenderable fault, e.g. tz conversion failure):
+    // no time at all until a corroborating cycle clears it.
     uint64_t gen3 = 0;
     CHECK_EQ_INT(Clock_ReadDisplayTime(&display, &gen3), 1);
     CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen3), 1);
@@ -554,6 +600,9 @@ static void test_clock_display_fail_closed(void) {
     CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen3), 0);
     CHECK_EQ_INT(Clock_NowUtcMs(&display), 0);
     CHECK_EQ_INT(Clock_Trust(), TRUST_INOP);
+    Clock_OnPollCycle(TRUST_OK, reUtc, Clock_Qpc(), 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_OK);
+    CHECK_EQ_INT(Clock_NowUtcMs(&display), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -702,14 +751,29 @@ static void test_clock_fault_gate_and_escape(void) {
     CHECK_EQ_INT(Clock_IsDisciplined(), 1);
 
     // Cycles at the SAME qpc (zero elapsed -> projection == anchor utc)
-    // whose agreed time is +500 ms off: each is a local-oscillator fault.
+    // whose agreed time is +500 ms off: each is a corroborated
+    // disagreement. Fail-honest: the display keeps running as HOLDOVER
+    // with the bound inflated to cover the disagreement, and after the
+    // Nth consecutive fault the consensus wins (forced re-anchor).
     int64_t bad = utc + 500;
+    int64_t disp = 0;
     Clock_OnPollCycle(TRUST_OK, bad, qpc, 0);
-    CHECK_EQ_INT(Clock_Trust(), TRUST_INOP);            // fault 1/3
+    CHECK_EQ_INT(Clock_Trust(), TRUST_HOLDOVER);        // fault 1/3
+    CHECK_EQ_INT(Clock_NowUtcMs(&disp), 1);             // still displaying
+    {
+        ClockDisplay df;
+        Clock_GetDisplay(&df);
+        CHECK(df.boundMs >= 500);                       // covers the 500 ms
+    }
     Clock_OnPollCycle(TRUST_OK, bad, qpc, 0);
-    CHECK_EQ_INT(Clock_Trust(), TRUST_INOP);            // fault 2/3
+    CHECK_EQ_INT(Clock_Trust(), TRUST_HOLDOVER);        // fault 2/3
     Clock_OnPollCycle(TRUST_OK, bad, qpc, 0);
-    CHECK_EQ_INT(Clock_Trust(), TRUST_OK);              // escape-hatch snap
+    CHECK_EQ_INT(Clock_Trust(), TRUST_OK);              // forced re-anchor
+    {
+        ClockDisplay df;
+        Clock_GetDisplay(&df);
+        CHECK(df.boundMs < 500);                        // inflation cleared
+    }
 
     // After the snap the anchor moved to `bad`; a matching cycle agrees.
     Clock_OnPollCycle(TRUST_OK, bad, qpc, 0);
@@ -760,8 +824,9 @@ static void test_clock_resume_consistent(void) {
 }
 
 // TRUST_DEGRADED holds the last authenticated anchor with the rate frozen
-// (core sources corroborate but never steer), keeps displaying, and trips
-// INOP if the held projection drifts from the core consensus by >200ms.
+// (core sources corroborate but never steer) and keeps displaying. A core
+// consensus that disagrees with the held projection by >200ms cannot
+// re-anchor; the display holds over with an inflated bound instead.
 static void test_clock_degraded(void) {
     clock_test_reset_appdata();
     Clock_Init();
@@ -787,12 +852,19 @@ static void test_clock_degraded(void) {
     CHECK_EQ_INT(Clock_NowUtcMs(&disp), 1);   // still displays a time
 
     // DEGRADED cycle whose consensus disagrees with the held projection by
-    // >200ms -> trip INOP (we never re-anchor to unauthenticated sources).
+    // >200ms: unauthenticated sources can neither steer nor blank the
+    // clock -- the display drops to HOLDOVER with the bound inflated to
+    // cover the reported disagreement.
     int64_t qpc3  = qpc2 + f * dt;
     int64_t proj3 = utc + (2 * dt) * 1000;
     Clock_OnPollCycle(TRUST_DEGRADED, proj3 + 500, qpc3, 0);
-    CHECK_EQ_INT(Clock_Trust(), TRUST_INOP);
-    CHECK_EQ_INT(Clock_NowUtcMs(&disp), 0);
+    CHECK_EQ_INT(Clock_Trust(), TRUST_HOLDOVER);
+    CHECK_EQ_INT(Clock_NowUtcMs(&disp), 1);
+    {
+        ClockDisplay df;
+        Clock_GetDisplay(&df);
+        CHECK(df.boundMs >= 500);
+    }
 
     // A real OK cycle re-anchors and restores full trust.
     Clock_OnPollCycle(TRUST_OK, proj3, qpc3, 0);
@@ -2588,7 +2660,7 @@ int main(void) {
     test_minute_guard();
     test_ntp_header_validation();
     test_clock_discipline();
-    test_clock_display_fail_closed();
+    test_clock_display_states();
     test_clock_drift_convergence();
     test_clock_rate_clamps();
     test_clock_jitter_rejection();

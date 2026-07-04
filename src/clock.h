@@ -1,13 +1,14 @@
 // clock.h -- NTP-disciplined monotonic clock ("the clockwork").
 //
-// Every read of UTC in the app goes through Clock_NowUtcMs(). It is
-// driven by QueryPerformanceCounter (monotonic, unaffected by DST,
-// Windows Time Service, sleeps, or user time changes), projected onto
-// UTC through an anchor point (anchorUtcMs, anchorQpc) and a disciplined
-// rate (rate_ppm: parts per million deviation from 1.0).
+// Every read of UTC in the app goes through Clock_GetDisplay() (or the
+// Clock_NowUtcMs() convenience wrapper). It is driven by
+// QueryPerformanceCounter (monotonic while the machine stays awake),
+// projected onto UTC through an anchor point (anchorUtcMs, anchorQpc)
+// and a disciplined rate (rate_ppm: parts per million deviation from
+// 1.0).
 //
-// The rate is updated on each successful NTP sample via a first-order
-// PLL (EMA on the fractional drift since the previous anchor). Accepted
+// The rate is updated on each accepted NTP cycle by a clamped integral
+// controller on the residual drift since the previous anchor. Accepted
 // residuals snap immediately to the newest trusted anchor; the UI never
 // knowingly displays a cosmetically-slewed time that differs from the
 // freshest trusted reading.
@@ -16,10 +17,15 @@
 // start can run accurately even before the first NTP reply lands, but
 // every run re-verifies the rate on its first sync.
 //
-// Before any successful sync THIS run, or after the trusted display
-// lease expires, Clock_NowUtcMs() refuses to return a time (returns 0).
-// The Windows system clock is never used as a display source; callers
-// must render an "INOP" indicator in that case.
+// Display policy is FAIL-HONEST: once anchored, the clock keeps
+// displaying a projected time for as long as the projection is
+// physically defensible, together with an honest worst-case error
+// bound that grows while no cycle corroborates it. The display only
+// refuses a running time when the projection itself is invalid: before
+// the first sync of a run (TRUST_INOP) or after a suspend/resume or
+// session handoff broke QPC continuity (TRUST_REACQUIRING, which shows
+// the last verified time plus its age instead). The Windows system
+// clock is never used as a display source.
 
 #ifndef LUNAR_CLOCK_H
 #define LUNAR_CLOCK_H
@@ -36,28 +42,67 @@ void    Clock_Init(void);
 // Called at shutdown (WM_CLOSE). Persists the current rate to disk.
 void    Clock_Shutdown(void);
 
-// The canonical time readout. On success writes disciplined UTC
-// milliseconds since Unix epoch into *outMs and returns 1. If the
-// clockwork has NOT been anchored by a successful NTP sync this run, or
-// if the display lease from the last trusted cycle has expired, returns
-// 0 and leaves *outMs untouched. Callers MUST check the return value --
-// the Windows system clock is never used as a display fallback.
+// --- Display states --------------------------------------------------------
+//
+// Ordered by confidence. TRUST_HOLDOVER and above carry a running
+// projected time; TRUST_REACQUIRING carries only the last verified time
+// plus its age; TRUST_INOP carries nothing.
+typedef enum {
+    TRUST_INOP        = 0,  // no renderable time: never anchored this run,
+                            // or a local conversion fault was tripped
+    TRUST_REACQUIRING = 1,  // anchor exists but QPC continuity was broken
+                            // (suspend/resume, session handoff): show the
+                            // last verified time + age, not a running dial;
+                            // exits only via a full authenticated cycle
+    TRUST_HOLDOVER    = 2,  // running projection with no live corroboration
+                            // (offline, gate failing, or polling stalled):
+                            // the error bound grows ~12 ms/min worst case
+    TRUST_DEGRADED    = 3,  // NTS unavailable, but >= 3 unauthenticated core
+                            // sources corroborate the held anchor within
+                            // 100 ms and the last authenticated cycle is
+                            // within the freshness window
+    TRUST_OK          = 4,  // full authenticated consensus
+} TrustState;
+
+// Everything a painter or badge needs, captured atomically.
+typedef struct {
+    TrustState state;         // derived display state (includes staleness:
+                              // an OK/DEGRADED older than the corroboration
+                              // window is reported as TRUST_HOLDOVER)
+    int64_t    utcMs;         // projected UTC ms; valid when
+                              // state >= TRUST_HOLDOVER, else 0
+    int64_t    boundMs;       // honest worst-case display error bound (ms);
+                              // valid when state >= TRUST_HOLDOVER, else 0
+    int64_t    lastSyncUtcMs; // UTC of the last accepted authenticated
+                              // anchor (0 if never anchored this run)
+    int64_t    lastSyncAgeMs; // wall age of that anchor, measured with
+                              // GetTickCount64 so it keeps counting across
+                              // sleep (drives the REACQUIRING/holdover age
+                              // readouts)
+    uint64_t   generation;    // display generation token, see below
+} ClockDisplay;
+
+// The canonical readout. Always fills *out (state may be TRUST_INOP).
+void    Clock_GetDisplay(ClockDisplay *out);
+
+// Convenience wrapper: writes the projected UTC ms and returns 1 when a
+// running time exists (state >= TRUST_HOLDOVER); returns 0 otherwise and
+// leaves *outMs untouched. The Windows system clock is never used as a
+// display fallback.
 int     Clock_NowUtcMs(int64_t *outMs);
 
-// Same canonical display readout, plus a generation token that remains
-// valid only while the display trust state and anchor/rate backing the
-// dial are unchanged. Painters can verify the token immediately before
-// presenting a dial; if it is stale, they must render INOP instead.
+// Same as Clock_NowUtcMs plus the generation token. Painters can verify
+// the token immediately before presenting a dial; if it is stale, they
+// must repaint from fresh state instead.
 int     Clock_ReadDisplayTime(int64_t *outMs, uint64_t *outGeneration);
 
-// True iff `generation` is still the current trusted display generation.
-// Also fails closed if the display lease expired while checking. The
+// True iff `generation` is still the current display generation. The
 // clock lock is taken and released internally, so the lock is never held
 // across the caller's (potentially slow, GPU-flushing) present. A painter
 // validates the generation immediately BEFORE presenting a dial, and
 // again immediately AFTER the present returns: if the post-present check
 // fails, the dial it just presented is stale and the painter must repaint
-// (the live window) or hand back an INOP bitmap (the taskbar thumbnail).
+// (the live window) or hand back a fresh bitmap (the taskbar thumbnail).
 int     Clock_DisplayGenerationIsCurrent(uint64_t generation);
 
 // True once we have at least one NTP sample anchoring the clockwork in
@@ -76,47 +121,34 @@ int32_t Clock_RatePpm(void);
 // round-trip twice.
 void    Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc);
 
-// --- Trust state machine -------------------------------------------------
+// --- Poll-cycle intake -----------------------------------------------------
 //
 // After each parallel NTP polling cycle, ntp.c calls Clock_OnPollCycle()
-// with the concurrence verdict computed by Ntp_Concur:
+// with the concurrence verdict computed by Ntp_Concur. Cycle verdicts
+// only ever use three of the enum values:
 //   TRUST_OK       -- two operator-diverse NTS anchors and the required
-//                     core SNTP super-majority concur within 200 ms. The
-//                     anchor and rate are updated from this cycle.
+//                     core SNTP super-majority concur within 200 ms.
+//                     bestUtcMs / bestQpc update the anchor and rate,
+//                     and restore QPC continuity after a resume.
 //   TRUST_DEGRADED -- NTS is unavailable, but >= 3 core sources still
-//                     corroborate our existing projection within the
-//                     tighter 100 ms gate AND the last TRUST_OK cycle was
-//                     less than two hours ago. The clock keeps displaying
-//                     the last authenticated anchor with the rate frozen
-//                     (unauthenticated core sources never steer it); the
-//                     UI marks the time UNAUTHENTICATED.
-//   TRUST_INOP     -- anything else: the gate failed, NTS is present but
-//                     conflicting, the degraded window lapsed, or our
-//                     projection disagrees with the corroborating sources
-//                     by more than 200 ms (local-oscillator fault).
+//                     corroborate within the tighter 100 ms gate and the
+//                     last authenticated cycle is inside the freshness
+//                     window. bestUtcMs / bestQpc are NOT used to
+//                     re-anchor; they only cross-check the held
+//                     projection. Corroboration keeps the claimed error
+//                     bound tight but never steers the clockwork.
+//   TRUST_INOP     -- the gate failed or no sources answered. The anchor
+//                     is untouched; the display state derives to
+//                     TRUST_HOLDOVER (anchored, continuity intact),
+//                     TRUST_REACQUIRING (continuity broken) or TRUST_INOP
+//                     (never anchored).
 //
-// In TRUST_INOP, Clock_NowUtcMs() returns 0 even if a valid anchor was
-// previously established: higher layers must render INOP. TRUST_OK and
-// TRUST_DEGRADED both return a time; callers distinguish them via
-// Clock_Trust() to badge the degraded (unauthenticated) state. The enum
-// values are ordered by confidence so "trust != TRUST_INOP" means
-// "displayable".
-typedef enum {
-    TRUST_INOP     = 0,
-    TRUST_DEGRADED = 1,
-    TRUST_OK       = 2,
-} TrustState;
-
-// Called by ntp.c at the end of every polling cycle.
-//   TRUST_OK       -- bestUtcMs / bestQpc update the anchor (same
-//                     semantics as Clock_OnSyncedNtpUtc).
-//   TRUST_DEGRADED -- bestUtcMs / bestQpc carry the core-only consensus;
-//                     they are NOT used to re-anchor (the rate and anchor
-//                     are held) but only to cross-check that our existing
-//                     projection still agrees within 200 ms. If it does,
-//                     the clock keeps displaying; if not, it trips INOP.
-//   TRUST_INOP     -- the anchor is NOT updated and Clock_NowUtcMs() will
-//                     refuse to return a time.
+// A gate-passing cycle whose consensus disagrees with our running
+// projection by more than 200 ms inflates the published error bound to
+// cover the disagreement and reports TRUST_HOLDOVER; after
+// LOCAL_FAULT_ESCAPE_N consecutive such cycles the consensus wins and
+// the clockwork snaps to it with a prominent TIME STEP log entry (our
+// anchor/rate are the broken party, not the network).
 // maxPairSpreadMs is the largest pairwise offset difference from the
 // cycle (used for audit / UI).
 void    Clock_OnPollCycle(TrustState state,
@@ -124,18 +156,26 @@ void    Clock_OnPollCycle(TrustState state,
                           int64_t bestQpc,
                           int64_t maxPairSpreadMs);
 
-// Force the display trust state to INOP immediately. Used by the UI for
-// safety events such as resume/timer gaps or local-time conversion
-// failures. The old anchor is retained for diagnostics but will not be
-// returned by Clock_NowUtcMs() until a new trusted poll cycle succeeds.
+// QPC continuity was broken or become untrustworthy: system
+// suspend/resume, RDP session reconnect, or a timer gap long enough to
+// suggest a missed suspend. The projection can no longer be defended,
+// so the display drops to TRUST_REACQUIRING (last verified time + age)
+// until the next full authenticated cycle re-anchors the clockwork.
+void    Clock_OnContinuityBroken(const char *reason);
+
+// Force the display state to hard INOP (no time at all). Reserved for
+// genuinely unrenderable faults, e.g. local time conversion failure.
 void    Clock_TripInop(const char *reason);
 
-// Current trust state. TRUST_INOP before the first concurrence-valid
-// cycle and whenever the last cycle failed to concur.
+// Current derived display state (same value Clock_GetDisplay reports).
 TrustState Clock_Trust(void);
 
 #ifdef LUNAR_TESTING
-void    Clock_TestExpireDisplayLease(void);
+// Age the last corroborating cycle / the last accepted anchor by ageMs,
+// so staleness derivation and bound growth can be tested without
+// sleeping.
+void    Clock_TestAgeLastCycle(int64_t ageMs);
+void    Clock_TestAgeAnchor(int64_t ageMs);
 #endif
 
 // Convenience for ntp.c: read the QPC at a defined moment.

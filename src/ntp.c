@@ -65,7 +65,12 @@
 #define NTP_NTS_SLOT_ATTEMPTS  2       // initial pick + one immediate replacement
 #define NTP_PACKET_LEN       48
 #define NTP_EPOCH_DELTA_S    2208988800ULL        // seconds between 1900 and 1970
-#define FRESH_WINDOW_MS      (2LL * 60LL * 60LL * 1000LL) // 2 hours
+// How long unauthenticated core corroboration may keep the DEGRADED tier
+// alive after the last full authenticated cycle. Sized to cover a working
+// day behind an NTS-blocking network without letting spoofable SNTP
+// consensus extend its own permission indefinitely; past this the display
+// falls to honest holdover.
+#define FRESH_WINDOW_MS      (8LL * 60LL * 60LL * 1000LL) // 8 hours
 #define CONCUR_THRESHOLD_MS  200
 #define DEGRADED_CONCUR_THRESHOLD_MS 100   // tighter core-only gate (DEGRADED)
 #define NTP_CYCLE_TIMEOUT_MS (NTS_SLOT_TIMEOUT_MS * NTP_NTS_SLOT_ATTEMPTS)
@@ -986,7 +991,7 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
               (trust == TRUST_OK)
                   ? "2 operator-diverse NTS + >=3/4 core within +/-200ms"
             : (trust == TRUST_DEGRADED)
-                  ? "NTS unavailable; >=3/4 core within 100ms, holding last-OK anchor (<2h)"
+                  ? "NTS unavailable; >=3/4 core within 100ms, holding last-OK anchor (<8h)"
                   : "need 2 operator-diverse NTS agreeing + >=3/4 core";
         Log_Append("ntp: cycle %s  concur=%d/%d core + %d/%d NTS  "
                    "spread=%lldms  gate=%s",
