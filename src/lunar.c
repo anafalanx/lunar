@@ -70,8 +70,6 @@
 #define DEFAULT_H        600
 #define TICK_MS          200           // 5 fps sweep cadence
 #define UI_TIMER_GAP_TRIP_MS 1500      // fail closed after UI/timer stalls
-#define WATCHDOG_TIMER_MS      100     // out-of-process liveness check cadence
-#define WATCHDOG_STALE_MS      900     // cover stale dial before in-process gap trip
 // Poll cadence: aggressive 5 s retry while INOP to minimize outage,
 // and a gentle 60 s after an NTS-anchored concurrence verdict. There
 // is no degraded middle ground -- the trust state is binary.
@@ -103,15 +101,6 @@
 #define IDT_SETTINGS_PREVIEW  2
 
 #define IDT_REPAINT       1
-#define IDT_WATCHDOG      1
-
-#define WATCHDOG_MAGIC    0x4C554E4157444731ULL  // "LUNAWDG1"
-#define WATCHDOG_VERSION  1u
-#define WATCHDOG_SHUTDOWN_WAIT_MS 1500
-#define WATCHDOG_RESTART_MIN_MS   2000
-
-#define WATCHDOG_DISPLAY_INOP 0x0001u
-#define WATCHDOG_DISPLAY_DIAL 0x0002u
 
 #ifndef PI
 #define PI 3.14159265358979323846f
@@ -172,32 +161,6 @@ static float                  g_prevMins     = -1.0f;
 static char                   g_tzLabel[96]  = "";
 static DWORD                  g_lastNtpKickMs = 0;
 static ULONGLONG              g_lastTickSeenMs = 0;
-
-typedef struct {
-    uint64_t        magic;
-    uint32_t        version;
-    uint32_t        structSize;
-    DWORD           mainPid;
-    volatile LONG64 heartbeatTick;
-    volatile LONG64 watchdogTick;
-    volatile LONG64 hwndValue;
-    volatile LONG   displayFlags;
-    volatile LONG   shutdown;
-} WatchdogShared;
-
-static HANDLE                 g_watchdogMap;
-static WatchdogShared        *g_watchdogShared;
-static HANDLE                 g_watchdogProcess;
-static DWORD                  g_watchdogPid;
-static wchar_t                g_watchdogMapName[128];
-static DWORD                  g_watchdogLastLaunchMs;
-static DWORD                  g_watchdogLastFaultLogMs;
-
-static int  Watchdog_RunIfRequested(HINSTANCE hInst, int *exitCode);
-static int  Watchdog_EnsureRunning(void);
-static int  Watchdog_DisplayGuardOk(void);
-static void Watchdog_PublishHeartbeat(uint32_t displayFlags);
-static void Watchdog_Shutdown(void);
 
 // User-configurable settings (persisted in %APPDATA%\Lunar\settings.dat).
 static int                    g_chimesEnabled      = 1;
@@ -912,419 +875,6 @@ static HBITMAP RenderInopBitmapGdi(int w, int h) {
 }
 
 // ---------------------------------------------------------------------------
-// Out-of-process display watchdog
-// ---------------------------------------------------------------------------
-
-static int Watchdog_IsHeartbeatStale(uint64_t nowMs, uint64_t heartbeatMs) {
-    return heartbeatMs == 0 || nowMs < heartbeatMs ||
-           nowMs - heartbeatMs > WATCHDOG_STALE_MS;
-}
-
-static int Watchdog_BuildCommandLine(const wchar_t *exe,
-                                     const wchar_t *mapName,
-                                     wchar_t *out,
-                                     size_t outLen) {
-    if (!exe || !*exe || !mapName || !*mapName || !out || outLen == 0) return 0;
-    out[0] = 0;
-    return _snwprintf_s(out, outLen, _TRUNCATE,
-                        L"\"%ls\" --lunar-watchdog %ls", exe, mapName) >= 0;
-}
-
-static void Watchdog_CloseProcessHandle(void) {
-    if (g_watchdogProcess) {
-        CloseHandle(g_watchdogProcess);
-        g_watchdogProcess = NULL;
-    }
-    g_watchdogPid = 0;
-}
-
-static int Watchdog_ProcessAlive(void) {
-    if (!g_watchdogProcess) return 0;
-    DWORD wait = WaitForSingleObject(g_watchdogProcess, 0);
-    if (wait == WAIT_TIMEOUT) return 1;
-    Watchdog_CloseProcessHandle();
-    return 0;
-}
-
-static void Watchdog_LogFaultThrottled(const char *msg, DWORD err) {
-    DWORD now = GetTickCount();
-    if (g_watchdogLastFaultLogMs == 0 ||
-        now - g_watchdogLastFaultLogMs >= 5000) {
-        g_watchdogLastFaultLogMs = now;
-        if (err) Log_Append("watchdog: %s (err=%lu)", msg, (unsigned long)err);
-        else     Log_Append("watchdog: %s", msg);
-    }
-}
-
-static int Watchdog_EnsureMapping(void) {
-    if (g_watchdogShared) return 1;
-
-    uint32_t rnd[4] = { 0 };
-    if (!BCRYPT_SUCCESS(BCryptGenRandom(NULL, (PUCHAR)rnd, sizeof rnd,
-                                        BCRYPT_USE_SYSTEM_PREFERRED_RNG))) {
-        LARGE_INTEGER qpc;
-        QueryPerformanceCounter(&qpc);
-        rnd[0] = GetCurrentProcessId();
-        rnd[1] = GetTickCount();
-        rnd[2] = (uint32_t)qpc.LowPart;
-        rnd[3] = (uint32_t)qpc.HighPart;
-    }
-
-    if (_snwprintf_s(g_watchdogMapName,
-                     sizeof(g_watchdogMapName) / sizeof(g_watchdogMapName[0]),
-                     _TRUNCATE,
-                     L"Local\\LunarWatchdog_%lu_%08lX%08lX%08lX%08lX",
-                     (unsigned long)GetCurrentProcessId(),
-                     (unsigned long)rnd[0], (unsigned long)rnd[1],
-                     (unsigned long)rnd[2], (unsigned long)rnd[3]) < 0) {
-        g_watchdogMapName[0] = 0;
-        return 0;
-    }
-
-    g_watchdogMap = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
-                                       PAGE_READWRITE, 0,
-                                       (DWORD)sizeof(WatchdogShared),
-                                       g_watchdogMapName);
-    if (!g_watchdogMap) return 0;
-
-    g_watchdogShared = (WatchdogShared*)MapViewOfFile(
-        g_watchdogMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0,
-        sizeof(WatchdogShared));
-    if (!g_watchdogShared) {
-        CloseHandle(g_watchdogMap);
-        g_watchdogMap = NULL;
-        return 0;
-    }
-
-    ZeroMemory(g_watchdogShared, sizeof(*g_watchdogShared));
-    g_watchdogShared->magic = WATCHDOG_MAGIC;
-    g_watchdogShared->version = WATCHDOG_VERSION;
-    g_watchdogShared->structSize = sizeof(WatchdogShared);
-    g_watchdogShared->mainPid = GetCurrentProcessId();
-    InterlockedExchange64(&g_watchdogShared->heartbeatTick,
-                          (LONG64)GetTickCount64());
-    InterlockedExchange64(&g_watchdogShared->watchdogTick, 0);
-    InterlockedExchange64(&g_watchdogShared->hwndValue,
-                          (LONG64)(uintptr_t)g_hwnd);
-    InterlockedExchange(&g_watchdogShared->displayFlags,
-                        (LONG)WATCHDOG_DISPLAY_INOP);
-    InterlockedExchange(&g_watchdogShared->shutdown, 0);
-    return 1;
-}
-
-static int Watchdog_EnsureRunning(void) {
-    if (!g_hwnd) return 0;
-    if (Watchdog_ProcessAlive()) return 1;
-
-    DWORD now = GetTickCount();
-    if (g_watchdogLastLaunchMs != 0 &&
-        now - g_watchdogLastLaunchMs < WATCHDOG_RESTART_MIN_MS) {
-        return 0;
-    }
-    g_watchdogLastLaunchMs = now;
-
-    if (!Watchdog_EnsureMapping()) {
-        Watchdog_LogFaultThrottled("shared memory unavailable; display guard inactive",
-                                   GetLastError());
-        return 0;
-    }
-
-    InterlockedExchange(&g_watchdogShared->shutdown, 0);
-    InterlockedExchange64(&g_watchdogShared->hwndValue,
-                          (LONG64)(uintptr_t)g_hwnd);
-    InterlockedExchange64(&g_watchdogShared->heartbeatTick,
-                          (LONG64)GetTickCount64());
-
-    wchar_t exe[MAX_PATH] = { 0 };
-    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) {
-        Watchdog_LogFaultThrottled("cannot locate executable for watchdog",
-                                   GetLastError());
-        return 0;
-    }
-
-    wchar_t cmd[768];
-    if (!Watchdog_BuildCommandLine(exe, g_watchdogMapName, cmd,
-                                   sizeof(cmd) / sizeof(cmd[0]))) {
-        Watchdog_LogFaultThrottled("cannot build watchdog command line", 0);
-        return 0;
-    }
-
-    STARTUPINFOW si = { 0 };
-    PROCESS_INFORMATION pi = { 0 };
-    si.cb = sizeof(si);
-    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
-                        NULL, NULL, &si, &pi)) {
-        Watchdog_LogFaultThrottled("CreateProcess failed; display guard inactive",
-                                   GetLastError());
-        return 0;
-    }
-
-    g_watchdogProcess = pi.hProcess;
-    g_watchdogPid = pi.dwProcessId;
-    if (pi.hThread) CloseHandle(pi.hThread);
-    Log_Append("watchdog: started pid=%lu", (unsigned long)g_watchdogPid);
-    return 1;
-}
-
-static int Watchdog_DisplayGuardOk(void) {
-    if (!g_watchdogShared || !Watchdog_ProcessAlive()) return 0;
-    uint64_t now = GetTickCount64();
-    uint64_t watchdogTick = (uint64_t)InterlockedCompareExchange64(
-        &g_watchdogShared->watchdogTick, 0, 0);
-    return !Watchdog_IsHeartbeatStale(now, watchdogTick);
-}
-
-static void Watchdog_PublishHeartbeat(uint32_t displayFlags) {
-    if (!g_watchdogShared) return;
-    InterlockedExchange64(&g_watchdogShared->hwndValue,
-                          (LONG64)(uintptr_t)g_hwnd);
-    InterlockedExchange(&g_watchdogShared->displayFlags, (LONG)displayFlags);
-    InterlockedExchange64(&g_watchdogShared->heartbeatTick,
-                          (LONG64)GetTickCount64());
-}
-
-static void Watchdog_Shutdown(void) {
-    if (g_watchdogShared) {
-        InterlockedExchange(&g_watchdogShared->shutdown, 1);
-    }
-    if (g_watchdogProcess) {
-        WaitForSingleObject(g_watchdogProcess, WATCHDOG_SHUTDOWN_WAIT_MS);
-    }
-    Watchdog_CloseProcessHandle();
-    if (g_watchdogShared) {
-        UnmapViewOfFile(g_watchdogShared);
-        g_watchdogShared = NULL;
-    }
-    if (g_watchdogMap) {
-        CloseHandle(g_watchdogMap);
-        g_watchdogMap = NULL;
-    }
-    g_watchdogMapName[0] = 0;
-}
-
-typedef struct {
-    WatchdogShared *shared;
-    HANDLE          mapping;
-    HANDLE          parent;
-    HWND            overlay;
-    int             overlayVisible;
-    uint64_t        lastIconicUpdateMs;
-} WatchdogRuntime;
-
-static void Watchdog_SetInopIconicBitmaps(HWND target) {
-    if (!IsWindow(target)) return;
-
-    HBITMAP thumb = RenderInopBitmapGdi(256, 256);
-    if (thumb) {
-        DwmSetIconicThumbnail(target, thumb, 0);
-        DeleteObject(thumb);
-    }
-
-    RECT wr;
-    int w = 320, h = 320;
-    if (GetWindowRect(target, &wr)) {
-        w = wr.right - wr.left;
-        h = wr.bottom - wr.top;
-        if (w < 64) w = 320;
-        if (h < 64) h = 320;
-        if (w > 1200) w = 1200;
-        if (h > 1200) h = 1200;
-    }
-    HBITMAP live = RenderInopBitmapGdi(w, h);
-    if (live) {
-        DwmSetIconicLivePreviewBitmap(target, live, NULL, 0);
-        DeleteObject(live);
-    }
-}
-
-static void Watchdog_HideOverlay(WatchdogRuntime *rt) {
-    if (!rt || !rt->overlayVisible) return;
-    ShowWindow(rt->overlay, SW_HIDE);
-    rt->overlayVisible = 0;
-}
-
-static void Watchdog_ShowOverlay(WatchdogRuntime *rt, HWND target) {
-    if (!rt || !rt->overlay || !IsWindow(target) || !IsWindowVisible(target)) {
-        Watchdog_HideOverlay(rt);
-        return;
-    }
-    if (IsIconic(target)) {
-        Watchdog_HideOverlay(rt);
-        return;
-    }
-
-    RECT wr;
-    if (!GetWindowRect(target, &wr)) {
-        Watchdog_HideOverlay(rt);
-        return;
-    }
-    int w = wr.right - wr.left;
-    int h = wr.bottom - wr.top;
-    if (w < 1 || h < 1) {
-        Watchdog_HideOverlay(rt);
-        return;
-    }
-
-    SetWindowPos(rt->overlay, HWND_TOPMOST, wr.left, wr.top, w, h,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    InvalidateRect(rt->overlay, NULL, FALSE);
-    rt->overlayVisible = 1;
-}
-
-static void Watchdog_OnTimer(WatchdogRuntime *rt) {
-    if (!rt || !rt->shared) return;
-    uint64_t now = GetTickCount64();
-    InterlockedExchange64(&rt->shared->watchdogTick, (LONG64)now);
-
-    if (InterlockedCompareExchange(&rt->shared->shutdown, 0, 0) != 0) {
-        PostQuitMessage(0);
-        return;
-    }
-    if (rt->parent && WaitForSingleObject(rt->parent, 0) == WAIT_OBJECT_0) {
-        PostQuitMessage(0);
-        return;
-    }
-
-    HWND target = (HWND)(uintptr_t)InterlockedCompareExchange64(
-        &rt->shared->hwndValue, 0, 0);
-    if (!IsWindow(target)) {
-        PostQuitMessage(0);
-        return;
-    }
-
-    uint64_t heartbeat = (uint64_t)InterlockedCompareExchange64(
-        &rt->shared->heartbeatTick, 0, 0);
-    if (!Watchdog_IsHeartbeatStale(now, heartbeat)) {
-        Watchdog_HideOverlay(rt);
-        return;
-    }
-
-    if (IsIconic(target)) {
-        Watchdog_HideOverlay(rt);
-        if (rt->lastIconicUpdateMs == 0 || now - rt->lastIconicUpdateMs > 1000) {
-            rt->lastIconicUpdateMs = now;
-            Watchdog_SetInopIconicBitmaps(target);
-        }
-        return;
-    }
-
-    Watchdog_ShowOverlay(rt, target);
-}
-
-static LRESULT CALLBACK WatchdogWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    WatchdogRuntime *rt = (WatchdogRuntime*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    switch (msg) {
-    case WM_NCCREATE: {
-        CREATESTRUCTW *cs = (CREATESTRUCTW*)lp;
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)cs->lpCreateParams);
-        return TRUE;
-    }
-    case WM_TIMER:
-        if (wp == IDT_WATCHDOG) Watchdog_OnTimer(rt);
-        return 0;
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        BeginPaint(hwnd, &ps);
-        RECT rc;
-        GetClientRect(hwnd, &rc);
-        DrawInopGdi(ps.hdc, &rc);
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-    case WM_ERASEBKGND:
-        return 1;
-    case WM_CLOSE:
-        return 0;
-    case WM_DESTROY:
-        KillTimer(hwnd, IDT_WATCHDOG);
-        return 0;
-    }
-    return DefWindowProcW(hwnd, msg, wp, lp);
-}
-
-static int Watchdog_Run(HINSTANCE hInst, const wchar_t *mapName) {
-    if (!mapName || !*mapName) return 2;
-
-    HANDLE mapping = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE,
-                                      FALSE, mapName);
-    if (!mapping) return 3;
-    WatchdogShared *shared = (WatchdogShared*)MapViewOfFile(
-        mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(WatchdogShared));
-    if (!shared) {
-        CloseHandle(mapping);
-        return 4;
-    }
-    if (shared->magic != WATCHDOG_MAGIC ||
-        shared->version != WATCHDOG_VERSION ||
-        shared->structSize != sizeof(WatchdogShared)) {
-        UnmapViewOfFile(shared);
-        CloseHandle(mapping);
-        return 5;
-    }
-
-    WatchdogRuntime rt;
-    ZeroMemory(&rt, sizeof(rt));
-    rt.shared = shared;
-    rt.mapping = mapping;
-    rt.parent = OpenProcess(SYNCHRONIZE, FALSE, shared->mainPid);
-
-    static const wchar_t kWatchdogClass[] = L"LunarWatchdogWin";
-    WNDCLASSEXW wc = { 0 };
-    wc.cbSize        = sizeof(wc);
-    wc.lpfnWndProc   = WatchdogWndProc;
-    wc.hInstance     = hInst;
-    wc.hCursor       = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
-    wc.lpszClassName = kWatchdogClass;
-    RegisterClassExW(&wc);
-
-    rt.overlay = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                                 kWatchdogClass, L"Lunar INOP",
-                                 WS_POPUP,
-                                 0, 0, 1, 1,
-                                 NULL, NULL, hInst, &rt);
-    if (!rt.overlay) {
-        if (rt.parent) CloseHandle(rt.parent);
-        UnmapViewOfFile(shared);
-        CloseHandle(mapping);
-        return 6;
-    }
-    SetTimer(rt.overlay, IDT_WATCHDOG, WATCHDOG_TIMER_MS, NULL);
-    InterlockedExchange64(&shared->watchdogTick, (LONG64)GetTickCount64());
-
-    MSG msg;
-    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
-
-    if (rt.overlay && IsWindow(rt.overlay)) DestroyWindow(rt.overlay);
-    if (rt.parent) CloseHandle(rt.parent);
-    UnmapViewOfFile(shared);
-    CloseHandle(mapping);
-    return 0;
-}
-
-static int Watchdog_RunIfRequested(HINSTANCE hInst, int *exitCode) {
-    if (exitCode) *exitCode = 0;
-    int argc = 0;
-    LPWSTR *argv = CommandLineToArgvW(GetCommandLineW(), &argc);
-    if (!argv) return 0;
-
-    int handled = 0;
-    for (int i = 1; i + 1 < argc; i++) {
-        if (wcscmp(argv[i], L"--lunar-watchdog") == 0) {
-            if (exitCode) *exitCode = Watchdog_Run(hInst, argv[i + 1]);
-            handled = 1;
-            break;
-        }
-    }
-    LocalFree(argv);
-    return handled;
-}
-
-
-// ---------------------------------------------------------------------------
 // Dial
 // ---------------------------------------------------------------------------
 
@@ -1396,7 +946,6 @@ static void DrawDial(float cx, float cy, float S, const Palette *pal,
 static void Paint(HDC fallbackDc) {
     if (FAILED(CreateDeviceResources())) {
         PaintInopGdi(fallbackDc);
-        Watchdog_PublishHeartbeat(WATCHDOG_DISPLAY_INOP);
         return;
     }
 
@@ -1407,7 +956,6 @@ static void Paint(HDC fallbackDc) {
     int64_t displayMs = 0;
     uint64_t displayGeneration = 0;
     int haveTime = Clock_ReadDisplayTime(&displayMs, &displayGeneration);
-    if (!Watchdog_DisplayGuardOk()) haveTime = 0;
 
     Palette pal = (g_theme == 1) ? palette_light() : palette_dark();
 
@@ -1497,8 +1045,7 @@ static void Paint(HDC fallbackDc) {
     // immediately before the present, and again immediately after.
     int presentedDial = 0;
     if (drewDial) {
-        if (Watchdog_DisplayGuardOk() &&
-            Clock_DisplayGenerationIsCurrent(displayGeneration)) {
+        if (Clock_DisplayGenerationIsCurrent(displayGeneration)) {
             presentedDial = 1;
         } else {
             ID2D1RenderTarget_Clear(g_rt, &pal.bg);
@@ -1523,9 +1070,6 @@ static void Paint(HDC fallbackDc) {
             presentedDial = 0;
             InvalidateRect(g_hwnd, NULL, FALSE);
         }
-        Watchdog_PublishHeartbeat(presentedDial
-            ? WATCHDOG_DISPLAY_DIAL
-            : WATCHDOG_DISPLAY_INOP);
     }
 }
 
@@ -1600,7 +1144,6 @@ static HBITMAP RenderClockToBitmap(int w, int h) {
         int64_t displayMs = 0;
         uint64_t displayGeneration = 0;
         int haveTime = Clock_ReadDisplayTime(&displayMs, &displayGeneration);
-        if (!Watchdog_DisplayGuardOk()) haveTime = 0;
 
         Palette pal = (g_theme == 1) ? palette_light() : palette_dark();
         float dw = (float)w, dh = (float)h;
@@ -1628,8 +1171,7 @@ static HBITMAP RenderClockToBitmap(int w, int h) {
         }
         int presentedDial = 0;
         if (drewDial) {
-            if (Watchdog_DisplayGuardOk() &&
-                Clock_DisplayGenerationIsCurrent(displayGeneration)) {
+            if (Clock_DisplayGenerationIsCurrent(displayGeneration)) {
                 presentedDial = 1;
             } else {
                 ID2D1RenderTarget_Clear(g_rt, &pal.bg);
@@ -2364,10 +1906,6 @@ static void RefreshClockSurface(void) {
 // ---------------------------------------------------------------------------
 
 static void Tick(void) {
-    if (!Watchdog_EnsureRunning()) {
-        Clock_TripInop("display watchdog unavailable");
-    }
-
     ULONGLONG now64 = GetTickCount64();
     if (g_lastTickSeenMs != 0 &&
         now64 - g_lastTickSeenMs > UI_TIMER_GAP_TRIP_MS) {
@@ -2624,7 +2162,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         Log_Append("app: shutting down");
         SaveWindowState(hwnd, g_alwaysOnTop);
-        Watchdog_Shutdown();
         Ntp_Shutdown();
         Clock_Shutdown();
         DestroyWindow(hwnd);
@@ -2652,11 +2189,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     (void)hPrev;
     (void)cmdLine;
-
-    int watchdogExit = 0;
-    if (Watchdog_RunIfRequested(hInst, &watchdogExit)) {
-        return watchdogExit;
-    }
 
     // Enable Per-Monitor-V2 DPI awareness so the system menu, title bar,
     // and dialogs are rendered at native pixel density instead of being
@@ -2751,9 +2283,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
 
     // Kick off the first NTP sync as soon as the window exists.
     Clock_Init();
-    if (!Watchdog_EnsureRunning()) {
-        Clock_TripInop("display watchdog unavailable");
-    }
     Log_Append("app: Lunar 0.3 started; initiating first NTP sync");
     Ntp_Start();
     g_lastNtpKickMs = GetTickCount();

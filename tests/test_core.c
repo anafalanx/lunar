@@ -2573,28 +2573,6 @@ static void test_app_data_path(void) {
     CHECK_EQ_INT(tiny[0], 0);
 }
 
-static void test_watchdog_helpers(void) {
-    CHECK_EQ_INT(Watchdog_IsHeartbeatStale(1000, 0), 1);
-    CHECK_EQ_INT(Watchdog_IsHeartbeatStale(2000, 2000), 0);
-    CHECK_EQ_INT(Watchdog_IsHeartbeatStale(2000, 2000 - WATCHDOG_STALE_MS), 0);
-    CHECK_EQ_INT(Watchdog_IsHeartbeatStale(2000, 2000 - WATCHDOG_STALE_MS - 1), 1);
-    CHECK_EQ_INT(Watchdog_IsHeartbeatStale(1000, 2000), 1);
-
-    wchar_t cmd[256];
-    CHECK_EQ_INT(Watchdog_BuildCommandLine(
-        L"C:\\Program Files\\Lunar\\Lunar.exe",
-        L"Local\\LunarWatchdog_unit",
-        cmd, sizeof(cmd) / sizeof(cmd[0])), 1);
-    CHECK(wcscmp(cmd,
-        L"\"C:\\Program Files\\Lunar\\Lunar.exe\" --lunar-watchdog Local\\LunarWatchdog_unit") == 0);
-
-    wchar_t tiny[16];
-    CHECK_EQ_INT(Watchdog_BuildCommandLine(
-        L"C:\\Program Files\\Lunar\\Lunar.exe",
-        L"Local\\LunarWatchdog_unit",
-        tiny, sizeof(tiny) / sizeof(tiny[0])), 0);
-}
-
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
@@ -2652,7 +2630,6 @@ int main(void) {
     test_dns_cache_clear();
     test_pin_store_roundtrip();
     test_app_data_path();
-    test_watchdog_helpers();
 
     printf("\n%d checks, %d failed\n", g_pass + g_fail, g_fail);
     return g_fail == 0 ? 0 : 1;
