@@ -360,6 +360,8 @@ def main() -> None:
         str(SRC / "tz.c"),
         str(SRC / "tzif.c"),
         str(SRC / "tz_embed.c"),
+        str(SRC / "tz_winmap.c"),
+        str(SRC / "tz_winmap_gen.c"),
         str(SRC / "siv.c"),
         str(SRC / "nts_ke.c"),
         str(SRC / "nts_ef.c"),

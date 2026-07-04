@@ -56,6 +56,8 @@ def main() -> int:
         SRC  / "tz.c",
         SRC  / "tzif.c",
         SRC  / "tz_embed.c",
+        SRC  / "tz_winmap.c",
+        SRC  / "tz_winmap_gen.c",
         SRC  / "siv.c",
         SRC  / "nts_ke.c",
         SRC  / "nts_ef.c",

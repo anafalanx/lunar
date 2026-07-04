@@ -897,6 +897,38 @@ static void test_ntp_kiss_of_death(void) {
     CHECK_EQ_INT(Ntp_TestEligibleCoreCount(), full);
 }
 
+// Windows->IANA timezone map: the generated table must be sorted (the
+// binary-search invariant), and every mapped IANA name must actually
+// resolve in Lunar's embedded index -- the real point of the filter.
+static void test_tz_winmap(void) {
+    int n = TzWinmap_Count();
+    CHECK(n > 100);
+
+    // Sorted ascending by the Windows key (wcscmp order).
+    for (int i = 1; i < n; i++) {
+        CHECK(wcscmp(g_tz_winmap[i - 1].win, g_tz_winmap[i].win) < 0);
+    }
+
+    // Every mapped IANA name is present in the embedded tz index.
+    for (int i = 0; i < n; i++) {
+        CHECK(Tz_FindByName(g_tz_winmap[i].iana) != TZ_ID_INVALID);
+    }
+
+    // Spot-check well-known mappings (canonicalized where CLDR is legacy).
+    const char *berlin = TzWinmap_IanaFromWindows(L"W. Europe Standard Time");
+    CHECK(berlin && strcmp(berlin, "Europe/Berlin") == 0);
+    const char *la = TzWinmap_IanaFromWindows(L"Pacific Standard Time");
+    CHECK(la && strcmp(la, "America/Los_Angeles") == 0);
+    const char *kolkata = TzWinmap_IanaFromWindows(L"India Standard Time");
+    CHECK(kolkata && strcmp(kolkata, "Asia/Kolkata") == 0);   // not Calcutta
+    CHECK(TzWinmap_IanaFromWindows(L"No Such Zone Key") == nullptr);
+
+    // The machine's own zone must map to an embedded name.
+    char iana[64];
+    CHECK_EQ_INT(TzWinmap_CurrentIana(iana, sizeof iana), 1);
+    CHECK(Tz_FindByName(iana) != TZ_ID_INVALID);
+}
+
 // ---------------------------------------------------------------------------
 // Ntp_Concur -- the pure trust-verdict evaluator (NTS-anchored)
 // ---------------------------------------------------------------------------
@@ -3028,6 +3060,7 @@ int main(void) {
     test_ntp_concur_degraded();
     test_ntp_concur_rotated();
     test_ntp_kiss_of_death();
+    test_tz_winmap();
     test_siv_rfc5297_appendix_a1();
     test_siv_rfc5297_appendix_a2();
     test_siv_edge_cases();

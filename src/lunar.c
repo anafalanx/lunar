@@ -80,6 +80,7 @@
 #include "clock.h"
 #include "logbuf.h"
 #include "tz.h"
+#include "tz_winmap.h"
 #include "app_paths.h"
 
 // ---------------------------------------------------------------------------
@@ -230,6 +231,9 @@ static int                    g_trayActive         = 0;  // Shell_NotifyIcon add
 // are resolved against tz_embed.c without any OS timezone call.
 static char                   g_tzIana[64]         = "";
 static TzId                   g_tzId               = TZ_ID_UTC;
+// 1 once a settings file with an explicit tz= line has been loaded, so
+// first-run OS-zone suggestion only fires when the user has never chosen.
+static int                    g_tzChosen           = 0;
 
 // ---------------------------------------------------------------------------
 // Persistence
@@ -376,9 +380,12 @@ static void LoadSettings(void) {
         else if (strncmp(line, "tz=", 3) == 0) {
             // IANA name (ASCII).  We copy it in raw; the resolver will
             // silently reject unknown values (including obsolete
-            // Windows keys from pre-IANA builds).
+            // Windows keys from pre-IANA builds). Seeing the key at all
+            // (even empty = explicit UTC) counts as a deliberate choice,
+            // so first-run OS-zone suggestion won't override it.
             const char *v = line + 3;
             snprintf(g_tzIana, sizeof(g_tzIana), "%s", v);
+            g_tzChosen = 1;
         }
         line = strtok_s(NULL, "\r\n", &save);
     }
@@ -2886,6 +2893,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     WindowState ws = {0};
     LoadWindowState(&ws);
     LoadSettings();
+    // First run (no prior tz choice): suggest the OS's zone by NAME so
+    // the clock opens on the user's likely local time instead of UTC.
+    // Reading the zone name is not trusting the OS clock -- time is
+    // still disciplined from the network. Not persisted until the user
+    // confirms a zone in Settings, so it re-suggests until then.
+    if (!g_tzChosen && g_tzIana[0] == 0) {
+        char sug[64];
+        if (TzWinmap_CurrentIana(sug, sizeof sug)) {
+            snprintf(g_tzIana, sizeof g_tzIana, "%s", sug);
+            Log_Append("tz: first run \xe2\x80\x94 suggesting OS zone %s", sug);
+        }
+    }
     // The registry Run key is the source of truth for run-at-startup;
     // reconcile the loaded setting with it (the user may have removed
     // the entry via msconfig/Task Manager outside Lunar).
