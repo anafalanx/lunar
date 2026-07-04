@@ -773,6 +773,26 @@ TrustState Clock_Trust(void) {
     return d.state;
 }
 
+// (system UTC) - (disciplined UTC), in ms. This is the one comparison
+// the whole trust stack uniquely enables: how wrong the PC's own clock
+// is.
+int Clock_SystemDeltaMs(int64_t *outDeltaMs) {
+    if (!g_csInit || !outDeltaMs) return 0;
+
+    ClockDisplay d;
+    Clock_GetDisplay(&d);
+    if (d.state < TRUST_HOLDOVER) return 0;
+
+    FILETIME ft;
+    GetSystemTimePreciseAsFileTime(&ft);
+    ULARGE_INTEGER u = { .LowPart = ft.dwLowDateTime,
+                         .HighPart = ft.dwHighDateTime };
+    int64_t sysMs = (int64_t)(u.QuadPart / 10000ULL) - 11644473600000LL;
+
+    *outDeltaMs = sysMs - d.utcMs;
+    return 1;
+}
+
 #ifdef LUNAR_TESTING
 void Clock_TestAgeLastCycle(int64_t ageMs) {
     if (!g_csInit) Clock_Init();

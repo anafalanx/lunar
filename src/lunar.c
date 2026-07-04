@@ -108,6 +108,13 @@
 // than this. A 5-minute-granularity chime is still meaningful at +-30 s;
 // beyond that the clock no longer claims chime-worthy accuracy.
 #define CHIME_MAX_BOUND_MS      30000
+// System-clock witness: a tick-to-tick jump in (system - disciplined)
+// larger than this means the OS clock stepped (w32time correction,
+// manual set) -- log it with magnitude. The dial badges the PC clock as
+// wrong once its offset exceeds the badge threshold and dwarfs our own
+// uncertainty.
+#define SYS_STEP_LOG_MS           250
+#define SYS_DELTA_BADGE_MS        500
 
 // System-menu command IDs. Must be in 1..0xEFFF (>= 0xF000 is reserved).
 #define IDM_ALWAYS_ON_TOP 0x1001
@@ -116,6 +123,20 @@
 #define IDM_ABOUT         0x1004
 #define IDM_SYNC_NOW      0x1005   // deprecated, kept to preserve following IDs
 #define IDM_LOG           0x1006
+
+// Tray icon: notification message + context-menu command IDs.
+#define WM_LUNAR_TRAY     (WM_APP + 1)
+#define IDT_TRAY_ID       1
+#define IDM_TRAY_OPEN     0x1101
+#define IDM_TRAY_EXIT     0x1102
+
+// Tray + startup helpers are defined below the settings dialog (which
+// references them); this file wires functions by definition order, so
+// forward-declare the ones used earlier.
+static void Tray_UpdateTip(HWND hwnd);
+static void Tray_RestoreFromTray(HWND hwnd);
+static int  Startup_IsEnabled(void);
+static void Startup_Apply(int enable);
 
 // Settings dialog + controls.
 #define IDD_SETTINGS          100
@@ -128,6 +149,8 @@
 #define IDC_BTN_TEST_CHIME    1007
 #define IDC_BTN_DEFAULTS      1008
 #define IDC_CHK_24H           1009
+#define IDC_CHK_TRAY          1010
+#define IDC_CHK_STARTUP       1011
 
 // Dialog-scoped timer (dialogs own a separate timer namespace from
 // the main window, so reusing IDT_REPAINT is safe).
@@ -190,12 +213,17 @@ static DWORD                  g_ntpRetryBackoffMs = 0; // current retry interval
                                                        // while uncorroborated
 static DWORD                  g_ntpNextDueMs = 0;      // GetTickCount deadline
                                                        // of the next poll kick
+static int64_t                g_sysDeltaMs = 0;        // system - disciplined
+static int                    g_haveSysDelta = 0;      // g_sysDeltaMs valid
 
 // User-configurable settings (persisted in %APPDATA%\Lunar\settings.dat).
 static int                    g_chimesEnabled      = 1;
 static int                    g_unminimizeOnChime  = 0;
 static int                    g_confirmOnClose     = 0;
 static int                    g_use24h             = 1;  // 1 = HH:MM, 0 = h:MM AM/PM
+static int                    g_minimizeToTray     = 1;  // hide taskbar btn, use tray
+static int                    g_runAtStartup       = 0;  // HKCU..\Run entry present
+static int                    g_trayActive         = 0;  // Shell_NotifyIcon added
 // Selected display time zone as an IANA name (e.g. "Europe/Paris").
 // Empty string means UTC.  The clockwork itself is always UTC; this
 // controls only how local wall-clock components are rendered.  Zones
@@ -343,6 +371,8 @@ static void LoadSettings(void) {
         else if (sscanf(line, "unmin=%d",   &v) == 1) g_unminimizeOnChime = v ? 1 : 0;
         else if (sscanf(line, "confirm=%d", &v) == 1) g_confirmOnClose    = v ? 1 : 0;
         else if (sscanf(line, "fmt24=%d",   &v) == 1) g_use24h            = v ? 1 : 0;
+        else if (sscanf(line, "tray=%d",    &v) == 1) g_minimizeToTray    = v ? 1 : 0;
+        else if (sscanf(line, "startup=%d", &v) == 1) g_runAtStartup      = v ? 1 : 0;
         else if (strncmp(line, "tz=", 3) == 0) {
             // IANA name (ASCII).  We copy it in raw; the resolver will
             // silently reject unknown values (including obsolete
@@ -363,9 +393,11 @@ static void SaveSettings(void) {
                      "unmin=%d\n"
                      "confirm=%d\n"
                      "fmt24=%d\n"
+                     "tray=%d\n"
+                     "startup=%d\n"
                      "tz=%s\n",
                      g_chimesEnabled, g_unminimizeOnChime, g_confirmOnClose,
-                     g_use24h, g_tzIana);
+                     g_use24h, g_minimizeToTray, g_runAtStartup, g_tzIana);
     if (n > 0 && n < (int)sizeof buf) {
         Lunar_WriteFileAtomicW(path, buf, (size_t)n);
     }
@@ -1153,6 +1185,20 @@ static void Paint(HDC fallbackDc) {
         DrawInopStatus(status, dw, dh, S);
     }
 
+    // PC-clock witness badge: only while fully trusted (our reference
+    // must dwarf the claim) and the OS clock is off by more than the
+    // threshold and by more than twice our own bound.
+    if (drewDial && d.state == TRUST_OK && g_haveSysDelta) {
+        int64_t mag = g_sysDeltaMs < 0 ? -g_sysDeltaMs : g_sysDeltaMs;
+        if (mag >= SYS_DELTA_BADGE_MS && mag >= 2 * d.boundMs) {
+            WCHAR badge[64];
+            _snwprintf_s(badge, 64, _TRUNCATE, L"PC CLOCK %+.1fs",
+                         (double)g_sysDeltaMs / 1000.0);
+            D2D1_COLOR_F amber = { 0.95f, 0.62f, 0.05f, 1.0f };
+            DrawBadge(badge, amber, dw, dh, S);
+        }
+    }
+
     // Honest state badge over the dial.
     if ((drewDial || drewFrozen) && d.state != TRUST_OK) {
         WCHAR badge[96] = L"";
@@ -1463,6 +1509,23 @@ static INT_PTR CALLBACK AboutDlgProc(HWND hdlg, UINT msg,
             swprintf(tzLine, 96, L"Time zone data: IANA %ls", ver);
         }
         SetDlgItemTextW(hdlg, 2006, tzLine);
+
+        // System-clock witness line: how wrong the PC's own clock is,
+        // measured against the disciplined reference at dialog open.
+        wchar_t sysLine[96] = L"System clock: unmeasured (no reference)";
+        int64_t delta = 0;
+        if (Clock_SystemDeltaMs(&delta)) {
+            int64_t mag = delta < 0 ? -delta : delta;
+            if (mag < 100) {
+                swprintf(sysLine, 96,
+                         L"System clock: agrees within \x00b10.1 s");
+            } else {
+                swprintf(sysLine, 96,
+                         L"System clock: %+.2f s vs Lunar",
+                         (double)delta / 1000.0);
+            }
+        }
+        SetDlgItemTextW(hdlg, 2008, sysLine);
         return TRUE;
     }
     case WM_CTLCOLORSTATIC: {
@@ -1895,6 +1958,10 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM l
                        g_confirmOnClose ? BST_CHECKED : BST_UNCHECKED);
         CheckDlgButton(hdlg, IDC_CHK_24H,
                        g_use24h ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hdlg, IDC_CHK_TRAY,
+                       g_minimizeToTray ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(hdlg, IDC_CHK_STARTUP,
+                       g_runAtStartup ? BST_CHECKED : BST_UNCHECKED);
 
         // Populate zone combo from the embedded IANA index.  No OS
         // timezone API is consulted.
@@ -1980,6 +2047,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM l
             CheckDlgButton(hdlg, IDC_CHK_UNMIN,         BST_UNCHECKED);
             CheckDlgButton(hdlg, IDC_CHK_CONFIRM_CLOSE, BST_UNCHECKED);
             CheckDlgButton(hdlg, IDC_CHK_24H,           BST_CHECKED);
+            CheckDlgButton(hdlg, IDC_CHK_TRAY,          BST_CHECKED);
+            CheckDlgButton(hdlg, IDC_CHK_STARTUP,       BST_UNCHECKED);
             SetDlgItemTextW(hdlg, IDC_EDIT_TZ_FILTER, L"");
             settings_populate_tz_combo(hdlg, TZ_ID_UTC);
             settings_refresh_preview(hdlg);
@@ -1991,6 +2060,20 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hdlg, UINT msg, WPARAM wp, LPARAM l
             g_unminimizeOnChime = IsDlgButtonChecked(hdlg, IDC_CHK_UNMIN)         == BST_CHECKED;
             g_confirmOnClose    = IsDlgButtonChecked(hdlg, IDC_CHK_CONFIRM_CLOSE) == BST_CHECKED;
             g_use24h            = IsDlgButtonChecked(hdlg, IDC_CHK_24H)           == BST_CHECKED;
+            g_minimizeToTray    = IsDlgButtonChecked(hdlg, IDC_CHK_TRAY)          == BST_CHECKED;
+
+            int wantStartup = IsDlgButtonChecked(hdlg, IDC_CHK_STARTUP) == BST_CHECKED;
+            if (wantStartup != g_runAtStartup) {
+                Startup_Apply(wantStartup);
+                g_runAtStartup = Startup_IsEnabled();
+                Log_Append("user: run-at-startup -> %s",
+                           g_runAtStartup ? "on" : "off");
+            }
+            // If tray was just turned off while hidden, make sure the
+            // window is visible and the icon is gone.
+            if (!g_minimizeToTray && !IsWindowVisible(g_hwnd)) {
+                Tray_RestoreFromTray(g_hwnd);
+            }
 
             TzId id = settings_current_tz(hdlg);
             const char *nm = (id == TZ_ID_INVALID) ? NULL : Tz_Name(id);
@@ -2037,6 +2120,7 @@ static void ShowSettings(void) {
 static void RefreshClockSurface(void) {
     if (!g_hwnd) return;
     UpdateTitleBar();
+    Tray_UpdateTip(g_hwnd);
 
     // We opt into DWM iconic representation, so the taskbar can hold a
     // cached bitmap even while the real window has already repainted to
@@ -2044,7 +2128,9 @@ static void RefreshClockSurface(void) {
     // will ask for a fresh bitmap only when it needs one.
     DwmInvalidateIconicBitmaps(g_hwnd);
 
-    if (!IsIconic(g_hwnd)) {
+    // While hidden in the tray there is no window surface to repaint;
+    // the tooltip above is the only live indicator.
+    if (IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd)) {
         InvalidateRect(g_hwnd, NULL, FALSE);
     }
 }
@@ -2086,6 +2172,196 @@ static void SessionNotify_Unregister(HWND hwnd) {
 }
 
 // ---------------------------------------------------------------------------
+// Tray icon + run-at-startup
+// ---------------------------------------------------------------------------
+//
+// The audience keeps Lunar running all day. A tray presence lets it get
+// out of the taskbar (minimize-to-tray) and relaunch at sign-in, so it
+// is not a window the user has to remember to reopen every boot.
+
+static void Tray_BuildTip(wchar_t *out, size_t cap) {
+    // "14:37 Europe/Paris\nUnsynced 4m ±0.3s" -- time + zone + state.
+    ClockDisplay d;
+    Clock_GetDisplay(&d);
+
+    wchar_t tz[32] = L"UTC";
+    if (g_tzLabel[0])
+        MultiByteToWideChar(CP_UTF8, 0, g_tzLabel, -1, tz, 32);
+
+    if (d.state >= TRUST_HOLDOVER) {
+        wchar_t when[16] = L"";
+        FormatClockTimeW(d.utcMs, when, 16);
+        const wchar_t *state =
+              (d.state == TRUST_OK)       ? L"Synced"
+            : (d.state == TRUST_DEGRADED) ? L"Unauthenticated"
+            :                               L"Unsynced (holdover)";
+        _snwprintf_s(out, cap, _TRUNCATE, L"Lunar \x2014 %ls %ls\n%ls",
+                     when, tz, state);
+    } else if (d.state == TRUST_REACQUIRING) {
+        _snwprintf_s(out, cap, _TRUNCATE,
+                     L"Lunar \x2014 %ls\nReacquiring after resume", tz);
+    } else {
+        _snwprintf_s(out, cap, _TRUNCATE,
+                     L"Lunar \x2014 %ls\nNo trusted time yet", tz);
+    }
+}
+
+static void Tray_Fill(NOTIFYICONDATAW *nid, HWND hwnd) {
+    ZeroMemory(nid, sizeof *nid);
+    nid->cbSize = sizeof *nid;
+    nid->hWnd   = hwnd;
+    nid->uID    = IDT_TRAY_ID;
+}
+
+static void Tray_Add(HWND hwnd) {
+    if (g_trayActive) return;
+    NOTIFYICONDATAW nid;
+    Tray_Fill(&nid, hwnd);
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uCallbackMessage = WM_LUNAR_TRAY;
+    nid.hIcon = (HICON)LoadImageW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1),
+                                  IMAGE_ICON, GetSystemMetrics(SM_CXSMICON),
+                                  GetSystemMetrics(SM_CYSMICON), 0);
+    Tray_BuildTip(nid.szTip, ARRAYSIZE(nid.szTip));
+    g_trayActive = Shell_NotifyIconW(NIM_ADD, &nid) ? 1 : 0;
+}
+
+static void Tray_Remove(HWND hwnd) {
+    if (!g_trayActive) return;
+    NOTIFYICONDATAW nid;
+    Tray_Fill(&nid, hwnd);
+    Shell_NotifyIconW(NIM_DELETE, &nid);
+    g_trayActive = 0;
+}
+
+static void Tray_UpdateTip(HWND hwnd) {
+    if (!g_trayActive) return;
+    NOTIFYICONDATAW nid;
+    Tray_Fill(&nid, hwnd);
+    nid.uFlags = NIF_TIP;
+    Tray_BuildTip(nid.szTip, ARRAYSIZE(nid.szTip));
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+}
+
+static void Tray_HideToTray(HWND hwnd) {
+    Tray_Add(hwnd);
+    ShowWindow(hwnd, SW_HIDE);
+}
+
+static void Tray_RestoreFromTray(HWND hwnd) {
+    ShowWindow(hwnd, SW_SHOW);
+    ShowWindow(hwnd, SW_RESTORE);
+    SetForegroundWindow(hwnd);
+    // Keep the tray icon only if the window is not the primary surface;
+    // once restored, the taskbar button represents it again.
+    if (g_minimizeToTray) Tray_Remove(hwnd);
+}
+
+static void Tray_ShowContextMenu(HWND hwnd) {
+    POINT pt;
+    GetCursorPos(&pt);
+    HMENU m = CreatePopupMenu();
+    if (!m) return;
+    AppendMenuW(m, MF_STRING, IDM_TRAY_OPEN, L"&Open Lunar");
+    AppendMenuW(m, MF_STRING, IDM_SETTINGS,  L"&Settings…");
+    AppendMenuW(m, MF_STRING, IDM_LOG,       L"&Log…");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, IDM_TRAY_EXIT, L"E&xit");
+    // Per MSDN: foreground + trailing WM_NULL so the menu dismisses
+    // correctly when the user clicks elsewhere.
+    SetForegroundWindow(hwnd);
+    UINT cmd = TrackPopupMenu(m, TPM_RIGHTBUTTON | TPM_RETURNCMD,
+                              pt.x, pt.y, 0, hwnd, NULL);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+    DestroyMenu(m);
+    if (cmd) SendMessageW(hwnd, WM_SYSCOMMAND, cmd, 0);
+}
+
+// Run-at-startup via the per-user Run key. Stores the quoted exe path so
+// Explorer relaunches Lunar at sign-in; no scheduled task, no elevation.
+static const wchar_t kRunKey[]  = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t kRunName[] = L"Lunar";
+
+static int Startup_IsEnabled(void) {
+    HKEY k;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kRunKey, 0, KEY_QUERY_VALUE, &k)
+        != ERROR_SUCCESS) return 0;
+    DWORD type = 0, cb = 0;
+    LONG r = RegQueryValueExW(k, kRunName, NULL, &type, NULL, &cb);
+    RegCloseKey(k);
+    return (r == ERROR_SUCCESS && type == REG_SZ);
+}
+
+static void Startup_Apply(int enable) {
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, NULL, 0,
+                        KEY_SET_VALUE, NULL, &k, NULL) != ERROR_SUCCESS) {
+        Log_Append("startup: cannot open Run key (err=%lu)",
+                   (unsigned long)GetLastError());
+        return;
+    }
+    if (enable) {
+        wchar_t exe[MAX_PATH];
+        DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            wchar_t val[MAX_PATH + 2];
+            int m = _snwprintf_s(val, ARRAYSIZE(val), _TRUNCATE,
+                                 L"\"%ls\"", exe);
+            if (m > 0) {
+                RegSetValueExW(k, kRunName, 0, REG_SZ, (const BYTE *)val,
+                               (DWORD)((m + 1) * sizeof(wchar_t)));
+            }
+        }
+    } else {
+        RegDeleteValueW(k, kRunName);
+    }
+    RegCloseKey(k);
+}
+
+// ---------------------------------------------------------------------------
+// System-clock witness
+// ---------------------------------------------------------------------------
+//
+// Lunar never DISPLAYS the Windows clock, but it can MEASURE it: with a
+// disciplined reference in hand, (system - disciplined) is exactly how
+// wrong the PC's own clock is. Sampled every tick; a tick-to-tick jump
+// in the delta means the OS clock stepped (w32time correction, manual
+// set, VM time sync) and is logged with its magnitude. The baseline
+// resets whenever our own projection basis changes (re-anchor bumps the
+// generation) so Lunar's snaps are never misreported as OS steps.
+
+static void UpdateSystemClockWitness(const ClockDisplay *d) {
+    static int64_t  s_prevDelta;
+    static uint64_t s_prevGen;
+    static int      s_have;
+
+    int64_t delta = 0;
+    if (d->state < TRUST_HOLDOVER || !Clock_SystemDeltaMs(&delta)) {
+        g_haveSysDelta = 0;
+        s_have = 0;
+        return;
+    }
+    g_sysDeltaMs   = delta;
+    g_haveSysDelta = 1;
+
+    if (!s_have) {
+        Log_Append("witness: system clock is %+lldms vs disciplined time",
+                   (long long)delta);
+    } else if (d->generation == s_prevGen) {
+        int64_t jump = delta - s_prevDelta;
+        if (jump > SYS_STEP_LOG_MS || jump < -SYS_STEP_LOG_MS) {
+            Log_Append("witness: SYSTEM CLOCK STEPPED %+lldms "
+                       "(offset vs Lunar %+lldms \xe2\x86\x92 %+lldms)",
+                       (long long)jump,
+                       (long long)s_prevDelta, (long long)delta);
+        }
+    }
+    s_prevDelta = delta;
+    s_prevGen   = d->generation;
+    s_have      = 1;
+}
+
+// ---------------------------------------------------------------------------
 // Tick handler (fires 5x per second via WM_TIMER)
 // ---------------------------------------------------------------------------
 
@@ -2106,6 +2382,7 @@ static void Tick(void) {
 
     ClockDisplay d;
     Clock_GetDisplay(&d);
+    UpdateSystemClockWitness(&d);
 
     // Periodic NTP re-sync. 60 s while a corroborated tier is live;
     // exponential backoff with jitter (5 s .. 5 min) otherwise, so a
@@ -2367,6 +2644,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
     case WM_SYSCOMMAND: {
         UINT raw = (UINT)wp;
+        // SC_* carry status bits in the low 4 bits; mask for the command.
+        switch (raw & 0xFFF0) {
+        case SC_MINIMIZE:
+            if (g_minimizeToTray) {
+                Tray_HideToTray(hwnd);
+                return 0;
+            }
+            break;   // normal minimize
+        }
         switch (raw) {
         case IDM_ALWAYS_ON_TOP:
             g_alwaysOnTop = !g_alwaysOnTop;
@@ -2379,9 +2665,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDM_SETTINGS:  Log_Append("user: opened Settings"); ShowSettings();   return 0;
         case IDM_LOG:       ShowLogViewer(); return 0;
         case IDM_ABOUT:     Log_Append("user: opened About"); ShowAbout();      return 0;
+        case IDM_TRAY_OPEN: Tray_RestoreFromTray(hwnd); return 0;
+        case IDM_TRAY_EXIT: PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0;
         }
         break;
     }
+
+    case WM_LUNAR_TRAY:
+        switch (LOWORD(lp)) {
+        case WM_LBUTTONUP:
+        case WM_LBUTTONDBLCLK:
+            Tray_RestoreFromTray(hwnd);
+            return 0;
+        case WM_RBUTTONUP:
+        case WM_CONTEXTMENU:
+            Tray_ShowContextMenu(hwnd);
+            return 0;
+        }
+        return 0;
 
     case WM_CLOSE:
         if (g_confirmOnClose) {
@@ -2390,6 +2691,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (r != IDOK) return 0;
         }
         Log_Append("app: shutting down");
+        Tray_Remove(hwnd);
         SaveWindowState(hwnd, g_alwaysOnTop);
         Ntp_Shutdown();
         Clock_Shutdown();
@@ -2584,6 +2886,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     WindowState ws = {0};
     LoadWindowState(&ws);
     LoadSettings();
+    // The registry Run key is the source of truth for run-at-startup;
+    // reconcile the loaded setting with it (the user may have removed
+    // the entry via msconfig/Task Manager outside Lunar).
+    g_runAtStartup = Startup_IsEnabled();
 
     int posX = CW_USEDEFAULT, posY = CW_USEDEFAULT;
     if (ws.valid) {

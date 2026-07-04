@@ -170,6 +170,13 @@ void    Clock_TripInop(const char *reason);
 // Current derived display state (same value Clock_GetDisplay reports).
 TrustState Clock_Trust(void);
 
+// Writes (system UTC - disciplined UTC) in ms and returns 1 whenever a
+// running disciplined time exists (state >= TRUST_HOLDOVER); returns 0
+// otherwise. Positive means the PC's clock is FAST. This inverts the
+// app's usual stance on the system clock: here it is the MEASURED
+// quantity, never the reference.
+int     Clock_SystemDeltaMs(int64_t *outDeltaMs);
+
 #ifdef LUNAR_TESTING
 // Age the last corroborating cycle / the last accepted anchor by ageMs,
 // so staleness derivation and bound growth can be tested without
