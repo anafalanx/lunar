@@ -15,22 +15,42 @@ First run, renewal, and expired-pin recovery use the Windows Web PKI:
 4. Windows builds a server-auth chain from the current machine/user certificate stores.
 5. Windows applies hostname validation with `CERT_CHAIN_POLICY_SSL`.
 6. Lunar hashes the validated leaf certificate's SubjectPublicKeyInfo (SPKI) with SHA-256.
-7. Lunar stores that SPKI digest locally as the continuity pin for the endpoint.
+7. Lunar stores that SPKI digest locally as a continuity pin for the endpoint.
 
-After enrollment, ordinary operation is pin-first. If the local SPKI matches, the TLS
-connection is accepted without needing a fresh CA decision. When a pin reaches its renewal
-window, Lunar keeps accepting the still-matching pin while it attempts a fresh Windows CA
-validation. If the pin has passed the certificate `notAfter` time, the pin is no longer
-usable by itself; Lunar must obtain a fresh Windows CA validation or the endpoint fails
-closed.
+## Multi-SPKI Sets
+
+Each endpoint keeps a SET of up to four enrolled SPKIs, not a single pin. Anycast and
+multi-POP providers legitimately present different leaf keys per point of presence, so a
+roaming laptop would otherwise flap between "pinned" and "mismatch" as it changes POPs.
+
+- A TLS leaf matching ANY stored, un-expired SPKI in the set authenticates as an enrolled
+  pin.
+- Every new SPKI observed through a CA-validated connection is appended to the set. When
+  the set is full, the oldest observation is evicted.
+- Re-observing a known key refreshes its validity metadata and makes it the newest member
+  (so eviction order tracks how recently a key was confirmed, not just first enrollment).
+- Expired members are excluded from matching but remain in the set until evicted.
+
+After enrollment, ordinary operation is pin-first. If the leaf matches the set, the TLS
+connection is accepted without needing a fresh CA decision. When the newest pin reaches its
+renewal window, Lunar keeps accepting still-matching pins while it attempts a fresh Windows
+CA validation. If every stored pin has passed its certificate `notAfter` time, the set is no
+longer usable by itself; Lunar must obtain a fresh Windows CA validation or the endpoint
+fails closed.
 
 External network failures can therefore cause INOP, but they cannot force Lunar to replace
-a valid local pin outside the renewal/expiry path. A pin mismatch before renewal is rejected
-without CA refresh and logged as a suspicious endpoint change.
+a valid local pin outside the renewal/expiry path. For NTS endpoints, a pin mismatch before
+renewal is no longer an unconditional hard reject; see "Corroborated Rotation Acceptance"
+below. A mismatch that also fails Windows CA validation is always rejected.
 
 ## Local Storage
 
 Pins are stored in `%APPDATA%\Lunar\pins.dat`.
+
+The plaintext format is line-oriented, version 2 (`LUNAR_PINSTORE|2`): one record line per
+enrolled SPKI, where repeated endpoint keys accumulate into that endpoint's SPKI set in
+file order (oldest first). Version-1 files (one line per endpoint) load without error as
+single-entry sets and are upgraded to version 2 on the next write.
 
 The file is plaintext only inside the process. On disk it is protected with Windows DPAPI
 via `CryptProtectData` / `CryptUnprotectData`, using the current user's Windows profile as
@@ -57,33 +77,78 @@ Lunar stores certificate validity metadata next to each SPKI digest:
 - Unix timestamps for validity and computed renewal time
 - last enrollment status
 
-The renewal window starts 30 days before `notAfter`. During that window, a matching pin can
-continue to authenticate the endpoint while CA renewal is attempted. After `notAfter`, CA
-validation is mandatory.
+The renewal margin is adaptive:
 
-If CA validation succeeds, Lunar saves the observed leaf SPKI with one of these statuses:
+    margin = min(30 days, (notAfter - notBefore) / 3)
+
+The renewal window starts `margin` before `notAfter`. Long-lived certificates keep the
+classic 30-day margin; with the CA/B-Forum trend toward short-lived leaves the margin
+scales down proportionally (a 47-day leaf renews ~15.7 days early, a 6-day leaf 2 days
+early) instead of degenerating to "always renewing". Unknown or garbled validity metadata
+falls back to the 30-day cap. The chosen margin and which rule produced it are recorded in
+the pin-store log line for every save.
+
+During the renewal window, a matching pin can continue to authenticate the endpoint while
+CA renewal is attempted. After every stored pin's `notAfter`, CA validation is mandatory.
+
+If CA validation succeeds, Lunar saves the observed leaf SPKI into the endpoint's set with
+one of these statuses:
 
 - `first-run-enrollment`
 - `scheduled-renewal`
 - `expired-renewal`
-- `pin-rotation`
+- `pin-rotation` (mismatch inside the renewal window)
+- `rotation-corroborated` (mismatch outside the renewal window, promoted after
+  corroboration; see below)
+
+## Corroborated Rotation Acceptance (NTS)
+
+Providers occasionally rotate keys EARLY -- emergency re-issuance, CA mass-revocation,
+infrastructure moves -- outside any renewal window. Hard-rejecting such a leaf would brick
+that operator family until the stored pin's window opened. Instead, for NTS endpoints:
+
+1. The presented leaf matches no stored, un-expired SPKI and the endpoint is not in its
+   renewal window.
+2. Lunar runs the full Windows CA + hostname validation path anyway. If that fails, the
+   connection is rejected as before.
+3. If CA validation passes, the NTS exchange completes, but the sample is marked with the
+   `ROTATED_PIN` auth mode and the new SPKI is NOT persisted yet.
+4. In the trust gate, a `ROTATED_PIN` slot may count toward the two-NTS requirement ONLY
+   if the other NTS slot is a continuous enrolled pin from a different operator family.
+   An attacker exploiting a rotation must therefore simultaneously defeat a still-pinned
+   independent operator (plus the core source majority). Two rotated slots in one cycle
+   have no continuous corroborator and hard-fail the cycle (INOP) -- that is exactly the
+   shape of a CA-level machine-in-the-middle against both anchors.
+5. Only when the cycle passes the gate with the rotated slot counting is the new SPKI
+   promoted into the pin set (status `rotation-corroborated`), with a loud line in both
+   the in-memory event log and the on-disk audit log:
+
+       pin rotation accepted for <host>: <old-prefix>-><new-prefix>, corroborated by <other-family>
+
+   If the cycle does not pass, nothing is persisted and the next cycle starts from the
+   same stored state.
 
 ## NTS Concurrence
 
 Because first-run trust now depends on maintained public CA infrastructure, Lunar does not
 allow a single NTS source to anchor the clock. A trusted cycle requires both NTS slots to
-succeed, both to be authenticated by enrolled pins, and the two NTS providers to come from
+succeed, both to be pin-authenticated (enrolled pins, or at most ONE pending-rotation
+sample riding on a continuous enrolled peer), and the two NTS providers to come from
 different operator families. They must agree within 200 ms, and at least three of the four
 plain SNTP core sources must agree with their midpoint.
 
-If fewer than two operator-diverse NTS samples are available, Lunar stays INOP.
+If fewer than two operator-diverse NTS samples are available, Lunar stays INOP (or, with a
+recent enough authenticated anchor, the unauthenticated DEGRADED tier; see `src/ntp.h`).
 
 ## Logging
 
 Lunar logs the enrollment path in detail:
 
 - missing, expired, matching, mismatching, and renewal-due local pin states
-- loaded, saved, and used pin records with recorded validity windows and the next scheduled CA run
+- loaded, saved, and used pin records with recorded validity windows, set sizes, the
+  adaptive renewal-margin decision, and the next scheduled CA run
+- deferred (corroboration-pending) rotations, and accepted rotations in both the event log
+  and `audit.log`
 - Windows CA validation attempts and outcome
 - certificate subject, issuer, `notBefore`, `notAfter`, SPKI digest, chain status, policy status, and revocation status
 - DPAPI decrypt/protect failures

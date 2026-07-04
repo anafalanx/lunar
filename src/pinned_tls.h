@@ -72,6 +72,19 @@ int  PinnedTls_OpenEnrolled(PinnedTls *tls, SOCKET socket,
                             int force_ca_refresh,
                             PinnedTlsOpenResult *result);
 
+// As PinnedTls_OpenEnrolled, but the peer leaf SPKI is accepted when it
+// matches ANY of `pin_count` enrolled pins (multi-POP providers present
+// different leaf keys per POP). `spki_pins` may be NULL when pin_count
+// is 0. result->pin_matched reports a match against any set member.
+int  PinnedTls_OpenEnrolledSet(PinnedTls *tls, SOCKET socket,
+                               const char *hostname,
+                               const char **alpn,
+                               const uint8_t (*spki_pins)[32],
+                               size_t pin_count,
+                               int allow_ca_enrollment,
+                               int force_ca_refresh,
+                               PinnedTlsOpenResult *result);
+
 mbedtls_ssl_context *PinnedTls_Ssl(PinnedTls *tls);
 const char          *PinnedTls_NegotiatedAlpn(PinnedTls *tls);
 void                 PinnedTls_CloseNotify(PinnedTls *tls);

@@ -5,7 +5,10 @@
 //   1. Resolve host -> IPv4 through the enrolled DoH resolver.
 //   2. TCP connect with a 5 s timeout.
 //   3. TLS 1.3 handshake (shared pinned_tls helper) with ALPN "ntske/1".
-//   4. Match the local SPKI pin, or perform Windows CA enrollment/renewal.
+//   4. Match the leaf against the endpoint's enrolled SPKI set, or
+//      perform Windows CA enrollment/renewal. A CA-valid leaf that
+//      matches no stored pin outside the renewal window completes the
+//      exchange as a PENDING ROTATION (not persisted here; see ntp.c).
 //   5. Send the fixed NTS-KE client request (NtsKe_BuildClientRequest).
 //   6. Drain inbound TLS records until peer-close or full response is
 //      in our accumulator; parse with NtsKe_ParseResponse.
@@ -207,6 +210,13 @@ static SOCKET tcp_connect(const char *host, uint16_t port)
 
 int Nts_DoKe(const NtsProvider *p, NtsKeResult *out)
 {
+    return Nts_DoKeEx(p, out, NULL);
+}
+
+int Nts_DoKeEx(const NtsProvider *p, NtsKeResult *out,
+               NtsRotationPending *rot)
+{
+    if (rot) memset(rot, 0, sizeof *rot);
     if (p == NULL || out == NULL) return -1;
     memset(out, 0, sizeof *out);
 
@@ -226,35 +236,42 @@ int Nts_DoKe(const NtsProvider *p, NtsKeResult *out)
     PinRecord pin;
     int have_pin = PinStore_GetPin(PIN_ENDPOINT_NTS, p->label, p->host,
                                    port, &pin);
-    int renew_due = have_pin ? PinStore_ShouldRenew(&pin) : 1;
-    int expired = have_pin ? PinStore_IsExpired(&pin) : 1;
-    int allow_ca = !have_pin || renew_due || expired;
+    // The endpoint's usable pins: every stored, un-expired SPKI. A leaf
+    // matching ANY of them authenticates as an enrolled pin.
+    uint8_t pin_set[PIN_STORE_MAX_SPKIS][32];
+    size_t n_pins = have_pin ? PinStore_CollectValidSpkis(&pin, pin_set) : 0;
+    int usable = n_pins > 0;
+    int renew_due = usable ? PinStore_ShouldRenew(&pin) : 1;
     if (!have_pin) {
         Log_Append("nts: %s first-run enrollment required for %s:%u",
                    p->label, p->host, (unsigned)port);
-    } else if (expired) {
-        Log_Append("nts: %s local pin expired; CA revalidation required (valid=%s..%s nextCa=%s)",
-                   p->label, pin.not_before, pin.not_after,
+    } else if (!usable) {
+        Log_Append("nts: %s all %u local pin(s) expired; CA revalidation required (newest valid=%s..%s nextCa=%s)",
+                   p->label, (unsigned)pin.spki_count,
+                   pin.not_before, pin.not_after,
                    pin.renewal_due[0] ? pin.renewal_due : "unknown");
     } else if (renew_due) {
-        Log_Append("nts: %s scheduled CA renewal due (valid=%s..%s nextCa=%s nextCaUnix=%lld)",
-                   p->label, pin.not_before, pin.not_after,
+        Log_Append("nts: %s scheduled CA renewal due (pins=%u newest valid=%s..%s nextCa=%s nextCaUnix=%lld)",
+                   p->label, (unsigned)n_pins,
+                   pin.not_before, pin.not_after,
                    pin.renewal_due[0] ? pin.renewal_due : "unknown",
                    (long long)pin.renewal_due_unix);
     }
 
+    // CA fallback stays enabled even for an out-of-window mismatch:
+    // instead of hard-rejecting an early/emergency key rotation, the
+    // leaf is CA-validated and, if valid, flagged as a pending rotation
+    // for the aggregator to corroborate (never persisted here).
     PinnedTlsOpenResult openInfo;
-    if (PinnedTls_OpenEnrolled(&tls, s, p->host, alpn_list,
-                               (have_pin && !expired) ? pin.spki : NULL,
-                               allow_ca, renew_due && !expired, &openInfo) != 0) {
-        if (openInfo.pin_mismatched && !allow_ca) {
-            Log_Append("nts: %s pin mismatch before renewal window; endpoint rejected without CA refresh (peer_spki=%s stored_spki=%s stored_valid=%s..%s nextCa=%s)",
-                       p->label, openInfo.peer_spki_hex, pin.spki_hex,
-                       pin.not_before, pin.not_after,
-                       pin.renewal_due[0] ? pin.renewal_due : "unknown");
-        } else if (openInfo.ca_attempted) {
-            Log_Append("nts: %s CA validation rejected host=%s chain=0x%lx policy=0x%lx revocation=%s subject=\"%s\" issuer=\"%s\" spki=%s",
+    if (PinnedTls_OpenEnrolledSet(&tls, s, p->host, alpn_list,
+                                  usable ? (const uint8_t (*)[32])pin_set : NULL,
+                                  n_pins, 1 /* allow CA */,
+                                  usable && renew_due, &openInfo) != 0) {
+        if (openInfo.ca_attempted) {
+            Log_Append("nts: %s CA validation rejected host=%s%s chain=0x%lx policy=0x%lx revocation=%s subject=\"%s\" issuer=\"%s\" spki=%s",
                        p->label, p->host,
+                       openInfo.pin_mismatched
+                           ? " (pin mismatch; unvalidated rotation refused)" : "",
                        (unsigned long)openInfo.cert.chain_error_status,
                        (unsigned long)openInfo.cert.policy_error,
                        openInfo.cert.revocation_offline ? "offline" :
@@ -283,23 +300,50 @@ int Nts_DoKe(const NtsProvider *p, NtsKeResult *out)
                        (unsigned long)openInfo.cert.chain_error_status,
                        (unsigned long)openInfo.cert.policy_error);
             if (openInfo.ca_valid) {
-                const char *status = have_pin
-                    ? (expired ? "expired-renewal" :
-                       (openInfo.pin_matched ? "scheduled-renewal" : "pin-rotation"))
-                    : "first-run-enrollment";
-                PinStore_SavePin(PIN_ENDPOINT_NTS, p->label, p->host, port,
-                                 p->operator_family,
-                                 openInfo.cert.spki_sha256,
-                                 openInfo.cert.spki_hex,
-                                 openInfo.cert.not_before,
-                                 openInfo.cert.not_after,
-                                 openInfo.cert.not_before_unix,
-                                 openInfo.cert.not_after_unix,
-                                 status);
+                if (usable && !openInfo.pin_matched && !renew_due) {
+                    // Early/emergency rotation: CA-valid leaf, no pin
+                    // match, outside the renewal window. Complete the
+                    // exchange but DO NOT persist; the aggregator
+                    // promotes the pin only after an operator-diverse,
+                    // still-pinned peer corroborates the cycle.
+                    if (rot) {
+                        rot->pending = 1;
+                        rot->port = port;
+                        memcpy(rot->spki, openInfo.cert.spki_sha256, 32);
+                        memcpy(rot->spki_hex, openInfo.cert.spki_hex,
+                               sizeof rot->spki_hex);
+                        memcpy(rot->old_spki_hex, pin.spki_hex,
+                               sizeof rot->old_spki_hex);
+                        memcpy(rot->not_before, openInfo.cert.not_before,
+                               sizeof rot->not_before);
+                        memcpy(rot->not_after, openInfo.cert.not_after,
+                               sizeof rot->not_after);
+                        rot->not_before_unix = openInfo.cert.not_before_unix;
+                        rot->not_after_unix  = openInfo.cert.not_after_unix;
+                    }
+                    Log_Append("nts: %s pin ROTATION observed outside renewal window host=%s newSpki=%s storedNewest=%s pins=%u; enrollment deferred pending operator-diverse corroboration",
+                               p->label, p->host, openInfo.cert.spki_hex,
+                               pin.spki_hex, (unsigned)n_pins);
+                } else {
+                    const char *status = !usable
+                        ? (have_pin ? "expired-renewal" : "first-run-enrollment")
+                        : (openInfo.pin_matched ? "scheduled-renewal"
+                                                : "pin-rotation");
+                    PinStore_SavePin(PIN_ENDPOINT_NTS, p->label, p->host, port,
+                                     p->operator_family,
+                                     openInfo.cert.spki_sha256,
+                                     openInfo.cert.spki_hex,
+                                     openInfo.cert.not_before,
+                                     openInfo.cert.not_after,
+                                     openInfo.cert.not_before_unix,
+                                     openInfo.cert.not_after_unix,
+                                     status);
+                }
             }
         } else if (openInfo.pin_matched) {
-            Log_Append("nts: %s local pin match host=%s spki=%s valid=%s..%s nextCa=%s",
-                       p->label, p->host, pin.spki_hex,
+            Log_Append("nts: %s local pin match host=%s spki=%s (1 of %u enrolled) newest valid=%s..%s nextCa=%s",
+                       p->label, p->host, openInfo.peer_spki_hex,
+                       (unsigned)n_pins,
                        pin.not_before, pin.not_after,
                        pin.renewal_due[0] ? pin.renewal_due : "unknown");
         }
@@ -377,8 +421,10 @@ cleanup:
     PinnedTls_Free(&tls);
     WSACleanup();
     if (rc != 0) {
-        // Wipe any key material we may have written before failing.
+        // Wipe any key material we may have written before failing,
+        // and drop rotation evidence from a failed exchange.
         mbedtls_platform_zeroize(out, sizeof *out);
+        if (rot) memset(rot, 0, sizeof *rot);
     }
     return rc;
 }
@@ -423,14 +469,28 @@ int Nts_FetchSample(const NtsProvider *p,
                     int64_t  *out_qpcAtT4,
                     uint32_t *out_rttMs)
 {
+    return Nts_FetchSampleEx(p, out_ntpUtcMs, out_qpcAtT4, out_rttMs, NULL);
+}
+
+int Nts_FetchSampleEx(const NtsProvider *p,
+                      int64_t  *out_ntpUtcMs,
+                      int64_t  *out_qpcAtT4,
+                      uint32_t *out_rttMs,
+                      NtsRotationPending *rot)
+{
+    if (rot) memset(rot, 0, sizeof *rot);
     if (p == NULL || out_ntpUtcMs == NULL || out_qpcAtT4 == NULL
         || out_rttMs == NULL) return 0;
     *out_ntpUtcMs = 0; *out_qpcAtT4 = 0; *out_rttMs = 0;
 
-    // Phase 1: NTS-KE. Nts_DoKe runs its own WSAStartup/Cleanup pair
-    // and clears `ke` on failure, so we just inherit its verdict.
+    // Phase 1: NTS-KE. Nts_DoKeEx runs its own WSAStartup/Cleanup pair
+    // and clears `ke` (and `rot`) on failure, so we just inherit its
+    // verdict.
     NtsKeResult ke;
-    if (Nts_DoKe(p, &ke) != 0 || !ke.ok || ke.cookie_count == 0) return 0;
+    if (Nts_DoKeEx(p, &ke, rot) != 0 || !ke.ok || ke.cookie_count == 0) {
+        if (rot) memset(rot, 0, sizeof *rot);
+        return 0;
+    }
 
     const char *host = ke.ntp_host[0] ? ke.ntp_host : p->host;
     uint16_t    port = ke.ntp_port    ? ke.ntp_port : 123;
@@ -530,9 +590,13 @@ udp_done:
     mbedtls_platform_zeroize(nonce, sizeof nonce);
     mbedtls_platform_zeroize(pkt,   sizeof pkt);
     mbedtls_platform_zeroize(&ke,   sizeof ke);
+    // Rotation evidence from the KE is only meaningful when the whole
+    // authenticated sample succeeded.
+    if (rc == 0 && rot) memset(rot, 0, sizeof *rot);
     return rc;
 
 fail:
     mbedtls_platform_zeroize(&ke, sizeof ke);
+    if (rot) memset(rot, 0, sizeof *rot);
     return 0;
 }

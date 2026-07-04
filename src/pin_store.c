@@ -16,9 +16,14 @@
 #include "cert_verify_win.h"
 #include "logbuf.h"
 
-#define PINSTORE_VERSION 1
+// Version 2: multiple E-lines may share one endpoint key (kind, label,
+// host, port); together they form that endpoint's SPKI set, ordered
+// oldest -> newest in file order. Version 1 files (one E-line per
+// endpoint) parse under the same rules as single-entry sets and are
+// upgraded in place on the next persist.
+#define PINSTORE_VERSION 2
 #define PINSTORE_MAX_ENTRIES 64
-#define PINSTORE_RENEWAL_MARGIN_SECONDS (30LL * 24LL * 60LL * 60LL)
+#define PINSTORE_RENEWAL_MARGIN_CAP_SECONDS (30LL * 24LL * 60LL * 60LL)
 
 typedef struct {
     PinEndpointKind kind;
@@ -97,13 +102,47 @@ static int HexToBytes32(const char *hex, uint8_t out[32])
     return 1;
 }
 
+int64_t PinStore_RenewalMarginSeconds(int64_t not_before_unix,
+                                      int64_t not_after_unix)
+{
+    // Adaptive margin: min(30 days, validity / 3). With the CA/B trend
+    // toward short-lived leaves (47-day, even 6-day), a fixed 30-day
+    // margin degenerates to "always renewing"; a third of the validity
+    // period keeps a proportional refresh runway instead. Unknown or
+    // garbled validity metadata falls back to the fixed cap.
+    if (not_before_unix <= 0 || not_after_unix <= 0 ||
+        not_before_unix >= not_after_unix) {
+        return PINSTORE_RENEWAL_MARGIN_CAP_SECONDS;
+    }
+    int64_t adaptive = (not_after_unix - not_before_unix) / 3;
+    return adaptive < PINSTORE_RENEWAL_MARGIN_CAP_SECONDS
+        ? adaptive : PINSTORE_RENEWAL_MARGIN_CAP_SECONDS;
+}
+
 static int64_t ComputeRenewalDue(int64_t not_before, int64_t not_after)
 {
-    (void)not_before;
     if (not_after <= 0) return 0;
-    int64_t due = not_after - PINSTORE_RENEWAL_MARGIN_SECONDS;
+    int64_t due = not_after - PinStore_RenewalMarginSeconds(not_before,
+                                                            not_after);
     if (due < 0) due = 0;
     return due;
+}
+
+// Human-readable record of which margin rule applied, for audit lines.
+static void FormatMarginDecision(int64_t not_before, int64_t not_after,
+                                 char *out, size_t out_len)
+{
+    if (!out || out_len == 0) return;
+    int64_t margin = PinStore_RenewalMarginSeconds(not_before, not_after);
+    if (margin < PINSTORE_RENEWAL_MARGIN_CAP_SECONDS) {
+        _snprintf(out, out_len, "%llds=validity/3", (long long)margin);
+    } else if (not_before > 0 && not_after > not_before) {
+        _snprintf(out, out_len, "%llds=30d-cap", (long long)margin);
+    } else {
+        _snprintf(out, out_len, "%llds=30d-default(validity-unknown)",
+                  (long long)margin);
+    }
+    out[out_len - 1] = 0;
 }
 
 static void FormatUnixUtc(int64_t unix_seconds, char *out, size_t out_len)
@@ -138,14 +177,62 @@ static void FormatUnixUtc(int64_t unix_seconds, char *out, size_t out_len)
 static void LogPinRecordLocked(const char *event, const PinEntry *e)
 {
     if (!event || !e || !e->rec.present) return;
-    Log_Append("pinstore: %s %s:%s host=%s port=%u family=%s valid=%s..%s nextCa=%s nextCaUnix=%lld status=%s spki=%s",
+    char margin[64];
+    FormatMarginDecision(e->rec.not_before_unix, e->rec.not_after_unix,
+                         margin, sizeof margin);
+    Log_Append("pinstore: %s %s:%s host=%s port=%u family=%s valid=%s..%s nextCa=%s nextCaUnix=%lld margin=%s status=%s pins=%u spki=%s",
                event,
                KindName(e->kind), e->label, e->hostname, (unsigned)e->port,
                e->operator_family,
                e->rec.not_before, e->rec.not_after,
                e->rec.renewal_due[0] ? e->rec.renewal_due : "unknown",
                (long long)e->rec.renewal_due_unix,
-               e->rec.last_status, e->rec.spki_hex);
+               margin,
+               e->rec.last_status,
+               (unsigned)e->rec.spki_count,
+               e->rec.spki_hex);
+}
+
+// Insert one SPKI observation into a record's set. A key already in
+// the set has its metadata refreshed and moves to the newest position;
+// a new key appends, evicting the oldest member when the set is full.
+// The record's single-pin mirror fields always track the newest member.
+static void RecordUpsertSpkiLocked(PinRecord *rec, const PinSpki *s)
+{
+    size_t idx = rec->spki_count;
+    for (size_t i = 0; i < rec->spki_count; i++) {
+        if (memcmp(rec->spkis[i].spki, s->spki, 32) == 0) {
+            idx = i;
+            break;
+        }
+    }
+    if (idx < rec->spki_count) {
+        // Known key: shift the tail down and re-append as newest.
+        for (size_t i = idx; i + 1 < rec->spki_count; i++) {
+            rec->spkis[i] = rec->spkis[i + 1];
+        }
+        rec->spkis[rec->spki_count - 1] = *s;
+    } else if (rec->spki_count < PIN_STORE_MAX_SPKIS) {
+        rec->spkis[rec->spki_count++] = *s;
+    } else {
+        // Full: evict the oldest observation.
+        for (size_t i = 0; i + 1 < PIN_STORE_MAX_SPKIS; i++) {
+            rec->spkis[i] = rec->spkis[i + 1];
+        }
+        rec->spkis[PIN_STORE_MAX_SPKIS - 1] = *s;
+    }
+
+    const PinSpki *newest = &rec->spkis[rec->spki_count - 1];
+    rec->present = 1;
+    memcpy(rec->spki, newest->spki, 32);
+    memcpy(rec->spki_hex, newest->spki_hex, sizeof rec->spki_hex);
+    memcpy(rec->not_before, newest->not_before, sizeof rec->not_before);
+    memcpy(rec->not_after, newest->not_after, sizeof rec->not_after);
+    rec->not_before_unix  = newest->not_before_unix;
+    rec->not_after_unix   = newest->not_after_unix;
+    rec->renewal_due_unix = newest->renewal_due_unix;
+    memcpy(rec->renewal_due, newest->renewal_due, sizeof rec->renewal_due);
+    memcpy(rec->last_status, newest->last_status, sizeof rec->last_status);
 }
 
 static int EntryMatches(const PinEntry *e, PinEndpointKind kind,
@@ -306,7 +393,7 @@ static int WriteProtectedFile(const wchar_t *path, const uint8_t *buf, DWORD len
 
 static int SerializeLocked(char **out_text, DWORD *out_len)
 {
-    size_t cap = 4096 + g_entry_count * 512;
+    size_t cap = 4096 + g_entry_count * PIN_STORE_MAX_SPKIS * 768;
     char *buf = (char *)malloc(cap);
     if (!buf) return 0;
     size_t pos = 0;
@@ -315,17 +402,22 @@ static int SerializeLocked(char **out_text, DWORD *out_len)
     pos += (size_t)n;
     for (size_t i = 0; i < g_entry_count; i++) {
         PinEntry *e = &g_entries[i];
-        n = _snprintf(buf + pos, cap - pos,
-            "E|%s|%s|%s|%u|%s|%s|%s|%s|%lld|%lld|%lld|%s\n",
-            KindName(e->kind), e->label, e->hostname, (unsigned)e->port,
-            e->operator_family, e->rec.spki_hex,
-            e->rec.not_before, e->rec.not_after,
-            (long long)e->rec.not_before_unix,
-            (long long)e->rec.not_after_unix,
-            (long long)e->rec.renewal_due_unix,
-            e->rec.last_status);
-        if (n < 0 || (size_t)n >= cap - pos) { free(buf); return 0; }
-        pos += (size_t)n;
+        // One E-line per enrolled SPKI, oldest -> newest, so the load
+        // path rebuilds the set in eviction order.
+        for (size_t k = 0; k < e->rec.spki_count; k++) {
+            const PinSpki *s = &e->rec.spkis[k];
+            n = _snprintf(buf + pos, cap - pos,
+                "E|%s|%s|%s|%u|%s|%s|%s|%s|%lld|%lld|%lld|%s\n",
+                KindName(e->kind), e->label, e->hostname, (unsigned)e->port,
+                e->operator_family, s->spki_hex,
+                s->not_before, s->not_after,
+                (long long)s->not_before_unix,
+                (long long)s->not_after_unix,
+                (long long)s->renewal_due_unix,
+                s->last_status);
+            if (n < 0 || (size_t)n >= cap - pos) { free(buf); return 0; }
+            pos += (size_t)n;
+        }
     }
     *out_text = buf;
     *out_len = (DWORD)pos;
@@ -346,31 +438,43 @@ static int ParseLine(char *line)
         p = sep + 1;
     }
     if (n != 12) return 0;
-    if (g_entry_count >= PINSTORE_MAX_ENTRIES) return 0;
 
-    PinEntry e;
-    memset(&e, 0, sizeof e);
-    e.kind = ParseKind(fields[0]);
-    if (!e.kind) return 0;
-    if (!SafeCopy(e.label, sizeof e.label, fields[1])) return 0;
-    if (!SafeCopy(e.hostname, sizeof e.hostname, fields[2])) return 0;
+    PinEndpointKind kind = ParseKind(fields[0]);
+    if (!kind) return 0;
     int port = atoi(fields[3]);
     if (port <= 0 || port > 65535) return 0;
-    e.port = (uint16_t)port;
-    if (!SafeCopy(e.operator_family, sizeof e.operator_family, fields[4])) return 0;
-    if (!HexToBytes32(fields[5], e.rec.spki)) return 0;
-    if (!SafeCopy(e.rec.spki_hex, sizeof e.rec.spki_hex, fields[5])) return 0;
-    if (!SafeCopy(e.rec.not_before, sizeof e.rec.not_before, fields[6])) return 0;
-    if (!SafeCopy(e.rec.not_after, sizeof e.rec.not_after, fields[7])) return 0;
-    e.rec.not_before_unix = _strtoi64(fields[8], NULL, 10);
-    e.rec.not_after_unix = _strtoi64(fields[9], NULL, 10);
-    e.rec.renewal_due_unix = _strtoi64(fields[10], NULL, 10);
-    FormatUnixUtc(e.rec.renewal_due_unix,
-                  e.rec.renewal_due, sizeof e.rec.renewal_due);
-    if (!SafeCopy(e.rec.last_status, sizeof e.rec.last_status, fields[11])) return 0;
-    e.rec.present = 1;
 
-    g_entries[g_entry_count++] = e;
+    PinSpki s;
+    memset(&s, 0, sizeof s);
+    if (!HexToBytes32(fields[5], s.spki)) return 0;
+    if (!SafeCopy(s.spki_hex, sizeof s.spki_hex, fields[5])) return 0;
+    if (!SafeCopy(s.not_before, sizeof s.not_before, fields[6])) return 0;
+    if (!SafeCopy(s.not_after, sizeof s.not_after, fields[7])) return 0;
+    s.not_before_unix = _strtoi64(fields[8], NULL, 10);
+    s.not_after_unix = _strtoi64(fields[9], NULL, 10);
+    s.renewal_due_unix = _strtoi64(fields[10], NULL, 10);
+    FormatUnixUtc(s.renewal_due_unix, s.renewal_due, sizeof s.renewal_due);
+    if (!SafeCopy(s.last_status, sizeof s.last_status, fields[11])) return 0;
+
+    // Repeated endpoint keys accumulate into one entry's SPKI set in
+    // file order (oldest first). A version-1 file never repeats a key
+    // and thus loads as single-entry sets.
+    PinEntry *e = FindEntryLocked(kind, fields[1], fields[2], (uint16_t)port);
+    if (!e) {
+        if (g_entry_count >= PINSTORE_MAX_ENTRIES) return 0;
+        e = &g_entries[g_entry_count++];
+        memset(e, 0, sizeof *e);
+        e->kind = kind;
+        e->port = (uint16_t)port;
+        if (!SafeCopy(e->label, sizeof e->label, fields[1]) ||
+            !SafeCopy(e->hostname, sizeof e->hostname, fields[2]) ||
+            !SafeCopy(e->operator_family, sizeof e->operator_family,
+                      fields[4])) {
+            g_entry_count--;
+            return 0;
+        }
+    }
+    RecordUpsertSpkiLocked(&e->rec, &s);
     return 1;
 }
 
@@ -378,9 +482,16 @@ static int ParsePlaintextLocked(char *text, DWORD len)
 {
     if (!text || len == 0) return 0;
     g_entry_count = 0;
-    const char header[] = "LUNAR_PINSTORE|1\n";
-    size_t header_len = sizeof header - 1;
-    if (len < header_len || strncmp(text, header, header_len) != 0) return 0;
+    // Accept the current header and the legacy version-1 header; a v1
+    // cache is upgraded in place on the next persist.
+    const char header_v2[] = "LUNAR_PINSTORE|2\n";
+    const char header_v1[] = "LUNAR_PINSTORE|1\n";
+    size_t header_len = sizeof header_v2 - 1;
+    if (len < header_len ||
+        (strncmp(text, header_v2, header_len) != 0 &&
+         strncmp(text, header_v1, header_len) != 0)) {
+        return 0;
+    }
     char *p = text + header_len;
     while (*p) {
         char *line = p;
@@ -530,6 +641,21 @@ int PinStore_IsExpired(const PinRecord *rec)
     return now > 0 && now >= rec->not_after_unix;
 }
 
+size_t PinStore_CollectValidSpkis(const PinRecord *rec,
+                                  uint8_t out[PIN_STORE_MAX_SPKIS][32])
+{
+    if (!rec || !rec->present || !out) return 0;
+    int64_t now = NowUnixSeconds();
+    size_t written = 0;
+    for (size_t i = 0; i < rec->spki_count && i < PIN_STORE_MAX_SPKIS; i++) {
+        const PinSpki *s = &rec->spkis[i];
+        if (s->not_after_unix <= 0) continue;              // unknown expiry
+        if (now > 0 && now >= s->not_after_unix) continue; // expired
+        memcpy(out[written++], s->spki, 32);
+    }
+    return written;
+}
+
 int PinStore_SavePin(PinEndpointKind kind,
                      const char *label,
                      const char *hostname,
@@ -567,17 +693,18 @@ int PinStore_SavePin(PinEndpointKind kind,
                  operator_family ? operator_family : "unknown");
     }
 
-    e->rec.present = 1;
-    memcpy(e->rec.spki, spki, 32);
-    SafeCopy(e->rec.spki_hex, sizeof e->rec.spki_hex, spki_hex);
-    SafeCopy(e->rec.not_before, sizeof e->rec.not_before, not_before);
-    SafeCopy(e->rec.not_after, sizeof e->rec.not_after, not_after);
-    e->rec.not_before_unix = not_before_unix;
-    e->rec.not_after_unix = not_after_unix;
-    e->rec.renewal_due_unix = ComputeRenewalDue(not_before_unix, not_after_unix);
-    FormatUnixUtc(e->rec.renewal_due_unix,
-                  e->rec.renewal_due, sizeof e->rec.renewal_due);
-    SafeCopy(e->rec.last_status, sizeof e->rec.last_status, status);
+    PinSpki s;
+    memset(&s, 0, sizeof s);
+    memcpy(s.spki, spki, 32);
+    SafeCopy(s.spki_hex, sizeof s.spki_hex, spki_hex);
+    SafeCopy(s.not_before, sizeof s.not_before, not_before);
+    SafeCopy(s.not_after, sizeof s.not_after, not_after);
+    s.not_before_unix = not_before_unix;
+    s.not_after_unix = not_after_unix;
+    s.renewal_due_unix = ComputeRenewalDue(not_before_unix, not_after_unix);
+    FormatUnixUtc(s.renewal_due_unix, s.renewal_due, sizeof s.renewal_due);
+    SafeCopy(s.last_status, sizeof s.last_status, status);
+    RecordUpsertSpkiLocked(&e->rec, &s);
 
     LogPinRecordLocked("save", e);
     int ok = PersistLocked();

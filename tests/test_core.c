@@ -12,6 +12,8 @@
 #include "../src/pin_store.h"
 #include "../src/cert_verify_win.h"
 
+#include <wincrypt.h>   // CryptProtectData for the pin-store migration test
+
 #include <stdio.h>
 #include <wchar.h>
 
@@ -1227,6 +1229,87 @@ static void test_ntp_concur_degraded(void) {
     s[4] = MkSrc(0,    0, 0, "NTS1");
     s[5] = MkSrc(0,    0, 0, "NTS2");
     CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_DEGRADED);
+}
+
+// ---------------------------------------------------------------------------
+// Ntp_Concur -- ROTATED_PIN gating (corroborated pin rotation)
+// ---------------------------------------------------------------------------
+//
+// A ROTATED_PIN slot (CA-validated leaf that matched no stored pin
+// outside the renewal window) may count toward the 2-NTS gate ONLY when
+// the other slot is a continuous ENROLLED_PIN from a different operator
+// family. Two rotated slots have no continuous corroborator and must
+// hard-fail: that is exactly the shape of a CA-level MITM against both
+// anchors, so the cycle goes INOP rather than DEGRADED.
+static void test_ntp_concur_rotated(void) {
+    Clock_Init();
+
+    NtpSourceResult s[NTP_SOURCE_COUNT];
+    int64_t best = 0, qpc = 0, spread = 0;
+    const int64_t Q = 1000;
+
+    // R1) Enrolled(family-a) + rotated(family-b), agreeing, all cores
+    // concur -> full TRUST_OK (rotation rides on the continuous peer).
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1000, Q, "C");
+    s[3] = MkSrc(1, 1000, Q, "D");
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[5] = MkSrc(1, 1000, Q, "NTS2");
+    s[5].authMode = NTP_AUTH_ROTATED_PIN;
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
+    CHECK_EQ_INT(best, 1000);
+    CHECK_EQ_INT(qpc, Q);
+
+    // R2) Same but the rotated slot comes first -> order-independent.
+    s[4].authMode = NTP_AUTH_ROTATED_PIN;
+    s[5].authMode = NTP_AUTH_ENROLLED_PIN;
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_OK);
+
+    // R3) BOTH slots rotated (diverse families, perfect agreement,
+    // full core concurrence) -> INOP. Never OK, and never downgraded
+    // to core-only DEGRADED either.
+    s[4].authMode = NTP_AUTH_ROTATED_PIN;
+    s[5].authMode = NTP_AUTH_ROTATED_PIN;
+    best = qpc = -1;
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+    CHECK_EQ_INT(best, 0);
+    CHECK_EQ_INT(qpc, 0);
+
+    // R4) Rotated + enrolled but SAME operator family -> INOP.
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[5] = MkSrc(1, 1000, Q, "NTS2");
+    s[5].authMode = NTP_AUTH_ROTATED_PIN;
+    s[5].operatorFamily = "family-a";
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+
+    // R5) Rotated + enrolled, diverse families, but disagreeing by
+    // 201 ms -> INOP (mutual-agreement gate unchanged).
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[5] = MkSrc(1, 1201, Q, "NTS2");
+    s[5].authMode = NTP_AUTH_ROTATED_PIN;
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
+    CHECK_EQ_INT(spread, 201);
+
+    // R6) A lone rotated slot (other NTS failed) cannot anchor: with
+    // cores agreeing inside the 100 ms gate the cycle is core-only
+    // DEGRADED, same as any single-NTS cycle.
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[4].authMode = NTP_AUTH_ROTATED_PIN;
+    s[5] = MkSrc(0, 0, 0, "NTS2");
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_DEGRADED);
+    CHECK_EQ_INT(best, 1000);
+
+    // R7) Enrolled + rotated agreeing, but only 2 of 4 cores concur ->
+    // INOP (core super-majority still required with a rotation in play).
+    s[0] = MkSrc(1, 1000, Q, "A");
+    s[1] = MkSrc(1, 1000, Q, "B");
+    s[2] = MkSrc(1, 1500, Q, "C");
+    s[3] = MkSrc(1, 1500, Q, "D");
+    s[4] = MkSrc(1, 1000, Q, "NTS1");
+    s[5] = MkSrc(1, 1000, Q, "NTS2");
+    s[5].authMode = NTP_AUTH_ROTATED_PIN;
+    CHECK_EQ_INT(Ntp_Concur(s, &best, &qpc, &spread), TRUST_INOP);
 }
 
 // ---------------------------------------------------------------------------
@@ -2491,6 +2574,11 @@ static void test_pin_store_roundtrip(void) {
     CHECK_EQ_STR(rec.last_status, "unit-test");
     CHECK_EQ_INT(PinStore_IsExpired(&rec), 0);
     CHECK_EQ_INT(PinStore_ShouldRenew(&rec), 0);
+    // Single save => single-entry SPKI set whose newest member is the
+    // record-level mirror.
+    CHECK_EQ_INT(rec.spki_count, 1);
+    CHECK(memcmp(rec.spkis[0].spki, spki, sizeof spki) == 0);
+    CHECK_EQ_STR(rec.spkis[0].spki_hex, hex);
 
     wchar_t pinsPath[MAX_PATH];
     _snwprintf_s(pinsPath, MAX_PATH, _TRUNCATE, L"%ls\\Lunar\\pins.dat", tempAppData);
@@ -2504,6 +2592,258 @@ static void test_pin_store_roundtrip(void) {
     _snwprintf_s(lunarDir, MAX_PATH, _TRUNCATE, L"%ls\\Lunar", tempAppData);
     RemoveDirectoryW(lunarDir);
     RemoveDirectoryW(tempAppData);
+}
+
+// Shared scratch-dir setup for the multi-SPKI pin-store tests: redirect
+// persistence via LUNAR_DATA_DIR (see app_paths.c) so nothing touches
+// the real user profile.
+static void pinstore_test_begin(wchar_t dir[MAX_PATH], const wchar_t *tag) {
+    wchar_t tempRoot[MAX_PATH];
+    CHECK(GetTempPathW(MAX_PATH, tempRoot) > 0);
+    _snwprintf_s(dir, MAX_PATH, _TRUNCATE, L"%lslunar-pinstore-%ls-%lu",
+                 tempRoot, tag, (unsigned long)GetCurrentProcessId());
+    CHECK(CreateDirectoryW(dir, NULL) || GetLastError() == ERROR_ALREADY_EXISTS);
+    CHECK(SetEnvironmentVariableW(L"LUNAR_DATA_DIR", dir));
+    PinStore_TestReset();
+}
+
+static void pinstore_test_end(const wchar_t dir[MAX_PATH]) {
+    PinStore_TestReset();
+    SetEnvironmentVariableW(L"LUNAR_DATA_DIR", NULL);
+    wchar_t pins[MAX_PATH];
+    _snwprintf_s(pins, MAX_PATH, _TRUNCATE, L"%ls\\pins.dat", dir);
+    DeleteFileW(pins);
+    RemoveDirectoryW(dir);
+}
+
+static void test_pin_store_multi_spki(void) {
+    wchar_t dir[MAX_PATH];
+    pinstore_test_begin(dir, L"multi");
+
+    // Six distinct keys; k[i] differs in the first and last byte.
+    uint8_t k[6][32];
+    char hex[6][65];
+    for (int i = 0; i < 6; i++) {
+        memset(k[i], 0, sizeof k[i]);
+        k[i][0]  = (uint8_t)(0xA0 + i);
+        k[i][31] = (uint8_t)(i + 1);
+        CertVerifyWin_Hex32(k[i], hex[i]);
+    }
+    const int64_t NB = 1767225600LL;   // 2026-01-01
+    const int64_t NA = 4070908800LL;   // 2099-01-01
+
+#define SAVE_NTS(idx, nb, na, st) \
+    CHECK(PinStore_SavePin(PIN_ENDPOINT_NTS, "unit-nts", "nts.example", \
+                           4460, "unit-family", k[idx], hex[idx],       \
+                           "2026-01-01T00:00:00Z",                      \
+                           "2099-01-01T00:00:00Z",                      \
+                           (nb), (na), (st)))
+
+    PinRecord rec;
+
+    // First key: single-entry set.
+    SAVE_NTS(0, NB, NA, "first-run-enrollment");
+    CHECK(PinStore_GetPin(PIN_ENDPOINT_NTS, "unit-nts", "nts.example",
+                          4460, &rec));
+    CHECK_EQ_INT(rec.spki_count, 1);
+    CHECK(memcmp(rec.spki, k[0], 32) == 0);
+
+    // Second key APPENDS (multi-POP observation); the mirror follows
+    // the newest member, the older key is retained.
+    SAVE_NTS(1, NB, NA, "pin-rotation");
+    CHECK(PinStore_GetPin(PIN_ENDPOINT_NTS, "unit-nts", "nts.example",
+                          4460, &rec));
+    CHECK_EQ_INT(rec.spki_count, 2);
+    CHECK(memcmp(rec.spkis[0].spki, k[0], 32) == 0);
+    CHECK(memcmp(rec.spkis[1].spki, k[1], 32) == 0);
+    CHECK(memcmp(rec.spki, k[1], 32) == 0);
+
+    // Re-saving a known key refreshes it in place (no duplicate) and
+    // makes it the newest member again.
+    SAVE_NTS(0, NB, NA, "scheduled-renewal");
+    CHECK(PinStore_GetPin(PIN_ENDPOINT_NTS, "unit-nts", "nts.example",
+                          4460, &rec));
+    CHECK_EQ_INT(rec.spki_count, 2);
+    CHECK(memcmp(rec.spkis[0].spki, k[1], 32) == 0);
+    CHECK(memcmp(rec.spkis[1].spki, k[0], 32) == 0);
+    CHECK_EQ_STR(rec.last_status, "scheduled-renewal");
+
+    // Fill to capacity, then overflow: the OLDEST member is evicted.
+    SAVE_NTS(2, NB, NA, "pin-rotation");   // [k1 k0 k2]
+    SAVE_NTS(3, NB, NA, "pin-rotation");   // [k1 k0 k2 k3]
+    SAVE_NTS(4, NB, NA, "pin-rotation");   // k1 evicted -> [k0 k2 k3 k4]
+    CHECK(PinStore_GetPin(PIN_ENDPOINT_NTS, "unit-nts", "nts.example",
+                          4460, &rec));
+    CHECK_EQ_INT(rec.spki_count, PIN_STORE_MAX_SPKIS);
+    CHECK(memcmp(rec.spkis[0].spki, k[0], 32) == 0);
+    CHECK(memcmp(rec.spkis[1].spki, k[2], 32) == 0);
+    CHECK(memcmp(rec.spkis[2].spki, k[3], 32) == 0);
+    CHECK(memcmp(rec.spkis[3].spki, k[4], 32) == 0);
+    CHECK(memcmp(rec.spki, k[4], 32) == 0);
+
+    // All four un-expired keys are usable for TLS matching.
+    uint8_t valid[PIN_STORE_MAX_SPKIS][32];
+    CHECK_EQ_INT(PinStore_CollectValidSpkis(&rec, valid), 4);
+
+    // An expired observation stays in the set (subject to eviction like
+    // any member) but is excluded from the usable pin set.
+    SAVE_NTS(5, NB, NB + 86400, "pin-rotation");  // long expired -> [k2 k3 k4 k5]
+    CHECK(PinStore_GetPin(PIN_ENDPOINT_NTS, "unit-nts", "nts.example",
+                          4460, &rec));
+    CHECK_EQ_INT(rec.spki_count, PIN_STORE_MAX_SPKIS);
+    CHECK_EQ_INT(PinStore_CollectValidSpkis(&rec, valid), 3);
+    CHECK(memcmp(valid[0], k[2], 32) == 0);
+    CHECK(memcmp(valid[1], k[3], 32) == 0);
+    CHECK(memcmp(valid[2], k[4], 32) == 0);
+    // Record-level expiry keys on the newest member (k5, expired).
+    CHECK_EQ_INT(PinStore_IsExpired(&rec), 1);
+
+    // A different endpoint kind on the same host keeps its own set.
+    CHECK(PinStore_SavePin(PIN_ENDPOINT_DOH, "unit-doh", "nts.example",
+                           443, "unit-family", k[0], hex[0],
+                           "2026-01-01T00:00:00Z", "2099-01-01T00:00:00Z",
+                           NB, NA, "first-run-enrollment"));
+    PinRecord doh;
+    CHECK(PinStore_GetPin(PIN_ENDPOINT_DOH, "unit-doh", "nts.example",
+                          443, &doh));
+    CHECK_EQ_INT(doh.spki_count, 1);
+    CHECK(PinStore_GetPin(PIN_ENDPOINT_NTS, "unit-nts", "nts.example",
+                          4460, &rec));
+    CHECK_EQ_INT(rec.spki_count, PIN_STORE_MAX_SPKIS);
+
+    // Reload from disk: set order, count and status survive the DPAPI
+    // round trip (v2 file: one line per SPKI).
+    PinStore_TestReset();
+    memset(&rec, 0, sizeof rec);
+    CHECK(PinStore_GetPin(PIN_ENDPOINT_NTS, "unit-nts", "nts.example",
+                          4460, &rec));
+    CHECK_EQ_INT(rec.spki_count, PIN_STORE_MAX_SPKIS);
+    CHECK(memcmp(rec.spkis[0].spki, k[2], 32) == 0);
+    CHECK(memcmp(rec.spkis[1].spki, k[3], 32) == 0);
+    CHECK(memcmp(rec.spkis[2].spki, k[4], 32) == 0);
+    CHECK(memcmp(rec.spkis[3].spki, k[5], 32) == 0);
+    CHECK_EQ_STR(rec.spkis[3].last_status, "pin-rotation");
+    CHECK_EQ_INT(PinStore_CollectValidSpkis(&rec, valid), 3);
+
+#undef SAVE_NTS
+    pinstore_test_end(dir);
+}
+
+static void test_pin_store_v1_migration(void) {
+    wchar_t dir[MAX_PATH];
+    pinstore_test_begin(dir, L"miglegacy");
+
+    uint8_t key[32];
+    for (int i = 0; i < 32; i++) key[i] = (uint8_t)(0x40 + i);
+    char hex[65];
+    CertVerifyWin_Hex32(key, hex);
+
+    // Hand-build a version-1 cache exactly as the previous release
+    // serialized it (header "LUNAR_PINSTORE|1", one E-line per
+    // endpoint) and protect it with the same DPAPI call.
+    char text[512];
+    _snprintf(text, sizeof text,
+              "LUNAR_PINSTORE|1\n"
+              "E|nts|unit-nts|nts.example|4460|unit-family|%s|"
+              "2026-01-01T00:00:00Z|2099-01-01T00:00:00Z|"
+              "1767225600|4070908800|4068316800|legacy-v1\n",
+              hex);
+    text[sizeof text - 1] = 0;
+
+    DATA_BLOB in;
+    in.pbData = (BYTE *)text;
+    in.cbData = (DWORD)strlen(text);
+    DATA_BLOB prot;
+    memset(&prot, 0, sizeof prot);
+    CHECK(CryptProtectData(&in, L"Lunar enrolled pin cache", NULL, NULL,
+                           NULL, CRYPTPROTECT_UI_FORBIDDEN, &prot));
+
+    wchar_t pins[MAX_PATH];
+    _snwprintf_s(pins, MAX_PATH, _TRUNCATE, L"%ls\\pins.dat", dir);
+    HANDLE h = CreateFileW(pins, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    CHECK(h != INVALID_HANDLE_VALUE);
+    DWORD wrote = 0;
+    CHECK(WriteFile(h, prot.pbData, prot.cbData, &wrote, NULL) &&
+          wrote == prot.cbData);
+    CloseHandle(h);
+    LocalFree(prot.pbData);
+
+    // The v1 file must load WITHOUT error, as a single-entry SPKI set
+    // with all metadata preserved.
+    PinRecord rec;
+    CHECK(PinStore_GetPin(PIN_ENDPOINT_NTS, "unit-nts", "nts.example",
+                          4460, &rec));
+    CHECK_EQ_INT(rec.spki_count, 1);
+    CHECK(memcmp(rec.spki, key, 32) == 0);
+    CHECK_EQ_STR(rec.spki_hex, hex);
+    CHECK_EQ_STR(rec.last_status, "legacy-v1");
+    CHECK_EQ_INT(rec.renewal_due_unix, 4068316800LL);  // taken from the file
+
+    // Appending a second key rewrites the cache as v2 in place; both
+    // keys survive a reload.
+    uint8_t key2[32];
+    memset(key2, 0x77, sizeof key2);
+    char hex2[65];
+    CertVerifyWin_Hex32(key2, hex2);
+    CHECK(PinStore_SavePin(PIN_ENDPOINT_NTS, "unit-nts", "nts.example",
+                           4460, "unit-family", key2, hex2,
+                           "2026-01-01T00:00:00Z", "2099-01-01T00:00:00Z",
+                           1767225600LL, 4070908800LL, "pin-rotation"));
+    PinStore_TestReset();
+    memset(&rec, 0, sizeof rec);
+    CHECK(PinStore_GetPin(PIN_ENDPOINT_NTS, "unit-nts", "nts.example",
+                          4460, &rec));
+    CHECK_EQ_INT(rec.spki_count, 2);
+    CHECK(memcmp(rec.spkis[0].spki, key, 32) == 0);
+    CHECK(memcmp(rec.spkis[1].spki, key2, 32) == 0);
+    CHECK(memcmp(rec.spki, key2, 32) == 0);
+
+    pinstore_test_end(dir);
+}
+
+static void test_pin_store_adaptive_margin(void) {
+    const int64_t DAY = 24LL * 60 * 60;
+    const int64_t CAP = 30 * DAY;
+    const int64_t NB  = 1767225600LL;   // 2026-01-01
+
+    // Long-lived leaves: fixed 30-day cap.
+    CHECK_EQ_INT(PinStore_RenewalMarginSeconds(NB, NB + 365 * DAY), CAP);
+    CHECK_EQ_INT(PinStore_RenewalMarginSeconds(NB, NB + 91 * DAY), CAP);
+    // Exactly 90 days: validity/3 == cap.
+    CHECK_EQ_INT(PinStore_RenewalMarginSeconds(NB, NB + 90 * DAY), CAP);
+    // Below the boundary the margin becomes proportional.
+    CHECK_EQ_INT(PinStore_RenewalMarginSeconds(NB, NB + 89 * DAY),
+                 89 * DAY / 3);
+    // CA/B short-lived profiles: 47-day and 6-day leaves.
+    CHECK_EQ_INT(PinStore_RenewalMarginSeconds(NB, NB + 47 * DAY),
+                 47 * DAY / 3);
+    CHECK_EQ_INT(PinStore_RenewalMarginSeconds(NB, NB + 6 * DAY), 2 * DAY);
+    // Unknown or garbled validity metadata: fall back to the cap.
+    CHECK_EQ_INT(PinStore_RenewalMarginSeconds(0, NB + 90 * DAY), CAP);
+    CHECK_EQ_INT(PinStore_RenewalMarginSeconds(NB, 0), CAP);
+    CHECK_EQ_INT(PinStore_RenewalMarginSeconds(NB, NB), CAP);
+    CHECK_EQ_INT(PinStore_RenewalMarginSeconds(NB + DAY, NB), CAP);
+
+    // End-to-end: a saved 6-day pin computes renewal_due = notAfter -
+    // validity/3, i.e. it is NOT "always renewing" as the fixed 30-day
+    // margin would make it.
+    wchar_t dir[MAX_PATH];
+    pinstore_test_begin(dir, L"margin");
+    uint8_t key[32];
+    memset(key, 0x21, sizeof key);
+    char hex[65];
+    CertVerifyWin_Hex32(key, hex);
+    int64_t na = NB + 6 * DAY;
+    CHECK(PinStore_SavePin(PIN_ENDPOINT_NTS, "unit-nts", "nts.example",
+                           4460, "unit-family", key, hex,
+                           "2026-01-01T00:00:00Z", "2026-01-07T00:00:00Z",
+                           NB, na, "first-run-enrollment"));
+    PinRecord rec;
+    CHECK(PinStore_GetPin(PIN_ENDPOINT_NTS, "unit-nts", "nts.example",
+                          4460, &rec));
+    CHECK_EQ_INT(rec.renewal_due_unix, na - 2 * DAY);
+    pinstore_test_end(dir);
 }
 
 static void test_dns_build_query(void) {
@@ -2686,6 +3026,7 @@ int main(void) {
     test_clock_degraded();
     test_ntp_concur();
     test_ntp_concur_degraded();
+    test_ntp_concur_rotated();
     test_ntp_kiss_of_death();
     test_siv_rfc5297_appendix_a1();
     test_siv_rfc5297_appendix_a2();
@@ -2718,6 +3059,9 @@ int main(void) {
     test_dns_intersect();
     test_dns_cache_clear();
     test_pin_store_roundtrip();
+    test_pin_store_multi_spki();
+    test_pin_store_v1_migration();
+    test_pin_store_adaptive_margin();
     test_app_data_path();
 
     printf("\n%d checks, %d failed\n", g_pass + g_fail, g_fail);

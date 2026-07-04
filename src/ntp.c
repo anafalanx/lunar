@@ -54,6 +54,7 @@
 #include "dns.h"
 #include "logbuf.h"
 #include "app_paths.h"
+#include "pin_store.h"
 
 #include <bcrypt.h>
 
@@ -483,6 +484,11 @@ typedef struct {
     int                slot;
     int                attempts;
     NtpSourceResult    out;
+    // Pending pin-rotation evidence from the successful attempt; only
+    // meaningful when out.authMode == NTP_AUTH_ROTATED_PIN. The
+    // aggregator promotes (persists) it only after the cycle passes the
+    // trust gate with a continuous enrolled peer corroborating.
+    NtsRotationPending rot;
     char               labelBuf[32]; // "NTS:<provider>", owned by this struct
 } NtsCtx;
 
@@ -523,13 +529,14 @@ static DWORD WINAPI NtsWorkerProc(LPVOID param) {
 
         int64_t utc = 0, qpc = 0;
         uint32_t rtt = 0;
-        if (Nts_FetchSample(p, &utc, &qpc, &rtt)) {
+        if (Nts_FetchSampleEx(p, &utc, &qpc, &rtt, &ctx->rot)) {
             r->ok       = 1;
             r->ntpUtcMs = utc;
             r->qpcAtT4  = qpc;
             r->rttMs    = rtt;
             r->offsetMs = utc;   // legacy field (overwritten with display value below)
-            r->authMode = NTP_AUTH_ENROLLED_PIN;
+            r->authMode = ctx->rot.pending ? NTP_AUTH_ROTATED_PIN
+                                           : NTP_AUTH_ENROLLED_PIN;
             r->operatorFamily = p->operator_family;
             goto done;
         }
@@ -667,26 +674,56 @@ static int BestLogStamp(char *out, size_t n) {
     return 0;
 }
 
-static void AuditWrite(TrustState trust,
-                       int64_t maxSpreadMs,
-                       const NtpSourceResult results[NTP_SOURCE_COUNT]) {
+// Open audit.log for appending (rotating first if oversized). Returns
+// INVALID_HANDLE_VALUE when the path is unavailable; callers silently
+// skip the line -- losing a log line is preferable to stalling a cycle.
+static HANDLE AuditOpenAppend(void) {
     wchar_t dir[MAX_PATH];
     AuditDir(dir, MAX_PATH);
-    if (dir[0] == 0) return;
+    if (dir[0] == 0) return INVALID_HANDLE_VALUE;
 
     AuditRotateIfNeeded();
 
     wchar_t path[MAX_PATH];
     AuditPath(path, MAX_PATH);
-    if (path[0] == 0) return;
+    if (path[0] == 0) return INVALID_HANDLE_VALUE;
 
-    HANDLE h = CreateFileW(path,
-                           FILE_APPEND_DATA,
-                           FILE_SHARE_READ,
-                           NULL,
-                           OPEN_ALWAYS,
-                           FILE_ATTRIBUTE_NORMAL,
-                           NULL);
+    return CreateFileW(path,
+                       FILE_APPEND_DATA,
+                       FILE_SHARE_READ,
+                       NULL,
+                       OPEN_ALWAYS,
+                       FILE_ATTRIBUTE_NORMAL,
+                       NULL);
+}
+
+// Append one free-form NOTE line to the audit log, stamped the same way
+// as cycle lines. Used for out-of-band security events (pin rotation
+// acceptance) that must survive in the on-disk audit trail.
+static void AuditNote(const char *text) {
+    if (!text || !*text) return;
+    HANDLE h = AuditOpenAppend();
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    char stamp[32];
+    int trusted = BestLogStamp(stamp, sizeof stamp);
+
+    char line[512];
+    int pos = _snprintf(line, sizeof(line), "%s%c NOTE  %s",
+                        stamp, trusted ? ' ' : '~', text);
+    if (pos < 0 || pos > (int)sizeof(line) - 2) pos = (int)sizeof(line) - 2;
+    line[pos++] = '\r';
+    line[pos++] = '\n';
+
+    DWORD written = 0;
+    WriteFile(h, line, (DWORD)pos, &written, NULL);
+    CloseHandle(h);
+}
+
+static void AuditWrite(TrustState trust,
+                       int64_t maxSpreadMs,
+                       const NtpSourceResult results[NTP_SOURCE_COUNT]) {
+    HANDLE h = AuditOpenAppend();
     if (h == INVALID_HANDLE_VALUE) return;
 
     char stamp[32];
@@ -945,6 +982,46 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
         }
     }
 
+    // Corroborated pin-rotation promotion: an NTS slot that completed
+    // via a CA-valid leaf matching no stored pin (NTP_AUTH_ROTATED_PIN)
+    // earns persistence ONLY when this cycle reached full TRUST_OK --
+    // which by the gate rules means an operator-diverse, still-pinned
+    // ENROLLED_PIN peer plus the core majority corroborated it. Collect
+    // the evidence while the worker contexts are alive; the save and the
+    // loud audit note happen after AuditWrite below, so the audit stamp
+    // reflects the freshly disciplined clock.
+    struct {
+        int                valid;
+        NtsRotationPending rot;
+        const NtsProvider *provider;      // points into the static pool
+        const char        *corroborator;  // other slot's operator family
+    } promo[NTP_NTS_COUNT];
+    memset(promo, 0, sizeof promo);
+    for (int i = 0; i < NTP_NTS_COUNT; i++) {
+        int slot = NTP_FIRST_NTS_SLOT + i;
+        if (!nts_ctx[i] || !slot_done[slot] || slot_overrun[slot]) continue;
+        if (!snapshot[slot].ok ||
+            snapshot[slot].authMode != NTP_AUTH_ROTATED_PIN) continue;
+        if (!nts_ctx[i]->rot.pending || !nts_ctx[i]->provider) continue;
+        if (trust != TRUST_OK) {
+            Log_Append("ntp: NTS slot %d %s pin rotation NOT accepted (cycle did not pass the trust gate); nothing persisted",
+                       slot, snapshot[slot].label ? snapshot[slot].label : "?");
+            continue;
+        }
+        promo[i].valid = 1;
+        promo[i].rot = nts_ctx[i]->rot;
+        promo[i].provider = nts_ctx[i]->provider;
+        promo[i].corroborator = "?";
+        for (int j = 0; j < NTP_NTS_COUNT; j++) {
+            int other = NTP_FIRST_NTS_SLOT + j;
+            if (other == slot || !snapshot[other].ok) continue;
+            if (snapshot[other].authMode != NTP_AUTH_ENROLLED_PIN) continue;
+            if (snapshot[other].operatorFamily) {
+                promo[i].corroborator = snapshot[other].operatorFamily;
+            }
+        }
+    }
+
     // Rewrite snapshot[i].offsetMs to the MEANINGFUL display value:
     // this source's deviation from the cycle's trust anchor, projected
     // to a common QPC moment. The anchor is the Ntp_Concur result
@@ -1027,6 +1104,29 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
     // so the timestamp reflects the clockwork's *post-cycle* state
     // (disciplined if this cycle was OK, untrusted-fallback otherwise).
     AuditWrite(trust, maxSpread, snapshot);
+
+    // Promote corroborated pin rotations collected above: persist the
+    // new SPKI and leave a LOUD trace in both the in-memory event log
+    // and the on-disk audit trail.
+    for (int i = 0; i < NTP_NTS_COUNT; i++) {
+        if (!promo[i].valid) continue;
+        const NtsProvider *p = promo[i].provider;
+        const NtsRotationPending *rot = &promo[i].rot;
+        PinStore_SavePin(PIN_ENDPOINT_NTS, p->label, p->host, rot->port,
+                         p->operator_family, rot->spki, rot->spki_hex,
+                         rot->not_before, rot->not_after,
+                         rot->not_before_unix, rot->not_after_unix,
+                         "rotation-corroborated");
+        char msg[224];
+        _snprintf(msg, sizeof msg,
+                  "pin rotation accepted for %s: %.12s\xe2\x86\x92%.12s, "
+                  "corroborated by %s",
+                  p->host, rot->old_spki_hex, rot->spki_hex,
+                  promo[i].corroborator);
+        msg[sizeof msg - 1] = 0;
+        Log_Append("ntp: PIN ROTATION ACCEPTED \xe2\x80\x94 %s", msg);
+        AuditNote(msg);
+    }
 
     // Mirror a detailed summary into the rolling in-memory log so the
     // "Log" menu item can show recent cycles without hitting disk.
@@ -1118,10 +1218,12 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
 // 0..NTP_CORE_COUNT-1 are core (plain-SNTP) sources that corroborate.
 //
 // Full-OK rules:
-//   * Both NTS slots ok, authenticated by enrolled pins, from different
-//     operator families, AND they mutually agree within 200 ms
+//   * Both NTS slots ok, authenticated by pins (enrolled, or at most ONE
+//     pending-rotation slot riding on a continuous enrolled peer), from
+//     different operator families, AND they mutually agree within 200 ms
 //     (projected to a common QPC). The anchor is the QPC-aligned
-//     midpoint of the two NTS samples.
+//     midpoint of the two NTS samples. Two pending-rotation slots have
+//     no continuous corroborator and hard-fail the cycle.
 //   * >= 3 of the 4 core sources must agree with the NTS midpoint to
 //     within 200 ms. The 3-of-4 super-majority tolerates one national
 //     outage while still requiring a strong majority.
@@ -1249,12 +1351,19 @@ TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
     int64_t qpcFreq = Clock_QpcFreq();
     if (qpcFreq <= 0) return TRUST_INOP;
 
-    // Count successful, enrolled-pin NTS slots.
+    // Count successful, pin-authenticated NTS slots. ROTATED_PIN slots
+    // (CA-valid leaf, no stored-pin match, outside the renewal window)
+    // participate, but the continuity rule below restricts how they may
+    // combine.
     int ntsOkCount = 0;
+    int ntsRotated = 0;
     int ntsOkIdx[NTP_NTS_COUNT] = { -1, -1 };
     for (int i = 0; i < NTP_NTS_COUNT; i++) {
         int slot = NTP_FIRST_NTS_SLOT + i;
-        if (results[slot].ok && results[slot].authMode == NTP_AUTH_ENROLLED_PIN) {
+        if (results[slot].ok &&
+            (results[slot].authMode == NTP_AUTH_ENROLLED_PIN ||
+             results[slot].authMode == NTP_AUTH_ROTATED_PIN)) {
+            if (results[slot].authMode == NTP_AUTH_ROTATED_PIN) ntsRotated++;
             ntsOkIdx[ntsOkCount++] = slot;
         }
     }
@@ -1266,6 +1375,14 @@ TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
     // misconfiguration of, the authenticated layer), so we never downgrade
     // it to the unauthenticated DEGRADED tier.
     if (ntsOkCount == 2) {
+        // Continuity rule: a rotated pin is only trustworthy when a
+        // CONTINUOUS enrolled pin from an independent operator vouches
+        // for the cycle. Two rotated slots have no continuous
+        // corroborator -- exactly the shape of a CA-level MITM against
+        // both anchors -- so the cycle hard-fails rather than enrolling
+        // either key.
+        if (ntsRotated >= 2) return TRUST_INOP;
+
         const NtpSourceResult *a = &results[ntsOkIdx[0]];
         const NtpSourceResult *b = &results[ntsOkIdx[1]];
         const char *famA = a->operatorFamily ? a->operatorFamily : "";

@@ -10,7 +10,17 @@
 // Lunar ships endpoint metadata but no provider cryptographic material.
 // On first use / renewal, the endpoint is validated through the Windows
 // Web PKI, its leaf SPKI is captured into the protected local pin store,
-// and ordinary operation uses that local SPKI pin until renewal time.
+// and ordinary operation matches the leaf against the endpoint's set of
+// enrolled SPKIs (multi-POP providers present different leaf keys per
+// POP) until renewal time.
+//
+// A leaf that matches NO stored, un-expired pin OUTSIDE the renewal
+// window (early/emergency key rotation) is not hard-rejected: if full
+// Windows CA + hostname validation passes, the exchange completes but
+// the sample is flagged as a pending rotation (NtsRotationPending) and
+// the new SPKI is NOT persisted here. The aggregator in ntp.c promotes
+// it to an enrolled pin only after the trust gate passes with an
+// independent still-pinned operator corroborating the cycle.
 
 #ifndef LUNAR_NTS_H
 #define LUNAR_NTS_H
@@ -46,6 +56,23 @@ typedef struct {
     uint16_t ntp_port;                                // 0 => 123
 } NtsKeResult;
 
+// Pending pin-rotation evidence from one exchange. Filled (pending=1)
+// when the endpoint presented a CA-valid leaf that matched none of the
+// stored, un-expired SPKIs outside the renewal window. Carries what the
+// aggregator needs to persist the pin later ("promotion") plus the
+// newest previously stored pin for the audit trail.
+typedef struct {
+    int      pending;            // 1 => rotation observed, promotion undecided
+    uint16_t port;               // NTS-KE port used (for the eventual save)
+    uint8_t  spki[32];           // observed leaf SPKI SHA-256
+    char     spki_hex[65];
+    char     old_spki_hex[65];   // newest stored pin at mismatch time
+    char     not_before[32];     // observed leaf validity metadata
+    char     not_after[32];
+    int64_t  not_before_unix;
+    int64_t  not_after_unix;
+} NtsRotationPending;
+
 // Returns a pointer to the shipped provider metadata pool and its length.
 const NtsProvider *Nts_Pool(size_t *out_len);
 
@@ -64,10 +91,16 @@ size_t Nts_PickProviders(const NtsProvider **out, size_t n_want);
 //   exporter -> graceful close.
 //
 // Returns 0 on success (out->ok == 1); non-zero on any failure,
-// including SPKI pin mismatch, ALPN mismatch, server error record,
-// socket timeout, or TLS failure. Safe to call from any thread (no
-// shared state beyond lazy-initialised RNG).
+// including SPKI pin mismatch without CA validation, ALPN mismatch,
+// server error record, socket timeout, or TLS failure. Safe to call
+// from any thread (no shared state beyond lazy-initialised RNG).
 int Nts_DoKe(const NtsProvider *p, NtsKeResult *out);
+
+// As Nts_DoKe, additionally reporting pending pin-rotation evidence.
+// `rot` may be NULL; it is zeroed on entry and left zeroed unless the
+// exchange succeeded via the corroboration-pending rotation path.
+int Nts_DoKeEx(const NtsProvider *p, NtsKeResult *out,
+               NtsRotationPending *rot);
 
 // Fetch one NTS-authenticated SNTP timing sample.
 //
@@ -94,6 +127,15 @@ int Nts_FetchSample(const NtsProvider *p,
                     int64_t  *out_ntpUtcMs,
                     int64_t  *out_qpcAtT4,
                     uint32_t *out_rttMs);
+
+// As Nts_FetchSample, additionally reporting pending pin-rotation
+// evidence from the underlying NTS-KE exchange. `rot` may be NULL; it
+// is zeroed unless this call succeeds via the rotation path.
+int Nts_FetchSampleEx(const NtsProvider *p,
+                      int64_t  *out_ntpUtcMs,
+                      int64_t  *out_qpcAtT4,
+                      uint32_t *out_rttMs,
+                      NtsRotationPending *rot);
 
 #ifdef __cplusplus
 }

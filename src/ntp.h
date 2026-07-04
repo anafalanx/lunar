@@ -37,6 +37,12 @@ typedef enum {
     NTP_AUTH_NONE = 0,
     NTP_AUTH_PLAIN_SNTP = 1,
     NTP_AUTH_ENROLLED_PIN = 2,
+    // TLS leaf matched no stored pin outside the renewal window but
+    // passed full Windows CA + hostname validation (early/emergency key
+    // rotation). Counts toward the 2-NTS gate ONLY alongside a
+    // continuous ENROLLED_PIN peer from a different operator family;
+    // the new pin is persisted only after such a cycle passes the gate.
+    NTP_AUTH_ROTATED_PIN = 3,
 } NtpAuthMode;
 
 // One source's outcome from the most recent polling cycle. `label` is
@@ -49,7 +55,7 @@ typedef struct {
     int64_t     qpcAtT4;     // QPC tick at t4 (reply received)
     uint32_t    rttMs;       // round-trip time in ms
     const char *label;       // short source name, e.g. "NIST"
-    NtpAuthMode authMode;    // plain SNTP or enrolled NTS pin
+    NtpAuthMode authMode;    // plain SNTP, enrolled NTS pin, or pending rotation
     const char *operatorFamily;
 } NtpSourceResult;
 
@@ -86,13 +92,17 @@ int     Ntp_GetResults(NtpSourceResult out[NTP_SOURCE_COUNT]);
 // The NTS slots are the authenticated trust anchor; the core sources
 // corroborate. Two paths:
 //
-//   Path 1 -- both NTS slots ok (enrolled pins): the cycle must reach a
-//     full OK or hard-fail. TRUST_OK requires different operator families
-//     AND mutual agreement within 200 ms (projected to a common QPC) AND
-//     >= 3 of 4 core sources within 200 ms of the NTS midpoint; the anchor
-//     is that midpoint. A same-family, disagreeing, or under-corroborated
-//     NTS pair returns TRUST_INOP -- a conflicting authenticated layer is
-//     never downgraded to DEGRADED.
+//   Path 1 -- both NTS slots ok (enrolled or rotated pins): the cycle must
+//     reach a full OK or hard-fail. TRUST_OK requires different operator
+//     families AND mutual agreement within 200 ms (projected to a common
+//     QPC) AND >= 3 of 4 core sources within 200 ms of the NTS midpoint;
+//     the anchor is that midpoint. A ROTATED_PIN slot (CA-validated leaf
+//     that matched no stored pin outside the renewal window) may count
+//     ONLY when the other slot is a continuous ENROLLED_PIN -- an attacker
+//     must defeat a still-pinned independent operator to exploit a
+//     rotation. Two ROTATED_PIN slots return TRUST_INOP. A same-family,
+//     disagreeing, or under-corroborated NTS pair returns TRUST_INOP -- a
+//     conflicting authenticated layer is never downgraded to DEGRADED.
 //
 //   Path 2 -- fewer than two ok NTS slots (NTS unavailable): if >= 3 of 4
 //     core sources mutually agree within the tighter 100 ms gate, returns

@@ -94,12 +94,18 @@ static int peer_spki_sha256(mbedtls_ssl_context *ssl, uint8_t out[32])
     return mbedtls_sha256(crt->pk_raw.p, crt->pk_raw.len, out, 0) == 0 ? 0 : -1;
 }
 
-static int verify_spki_pin(mbedtls_ssl_context *ssl, const uint8_t pin[32],
-                           uint8_t got[32])
+// Constant-time membership test of `got` against a set of pins. Every
+// set member is compared regardless of earlier matches so the timing
+// does not reveal which (or whether an early) pin matched.
+static int spki_in_pin_set(const uint8_t got[32],
+                           const uint8_t (*pins)[32], size_t pin_count)
 {
-    if (peer_spki_sha256(ssl, got) != 0) return -1;
-    int diff = mbedtls_ct_memcmp(got, pin, 32);
-    return diff == 0 ? 0 : -1;
+    int matched = 0;
+    for (size_t i = 0; i < pin_count; i++) {
+        if (PinnedTls_PinIsZero(pins[i])) continue;
+        matched |= (mbedtls_ct_memcmp(got, pins[i], 32) == 0);
+    }
+    return matched;
 }
 
 static void open_result_init(PinnedTlsOpenResult *result)
@@ -172,6 +178,27 @@ int PinnedTls_OpenEnrolled(PinnedTls *tls, SOCKET socket,
                            int force_ca_refresh,
                            PinnedTlsOpenResult *result)
 {
+    const uint8_t (*pins)[32] = NULL;
+    size_t pin_count = 0;
+    if (spki_pin && !PinnedTls_PinIsZero(spki_pin)) {
+        pins = (const uint8_t (*)[32])spki_pin;
+        pin_count = 1;
+    }
+    return PinnedTls_OpenEnrolledSet(tls, socket, hostname, alpn,
+                                     pins, pin_count,
+                                     allow_ca_enrollment, force_ca_refresh,
+                                     result);
+}
+
+int PinnedTls_OpenEnrolledSet(PinnedTls *tls, SOCKET socket,
+                              const char *hostname,
+                              const char **alpn,
+                              const uint8_t (*spki_pins)[32],
+                              size_t pin_count,
+                              int allow_ca_enrollment,
+                              int force_ca_refresh,
+                              PinnedTlsOpenResult *result)
+{
     if (!tls) {
         if (socket != INVALID_SOCKET) closesocket(socket);
         return -1;
@@ -186,10 +213,10 @@ int PinnedTls_OpenEnrolled(PinnedTls *tls, SOCKET socket,
         CertVerifyWin_Hex32(got, result->peer_spki_hex);
     }
 
-    int pin_present = !PinnedTls_PinIsZero(spki_pin);
+    int pin_present = (spki_pins != NULL && pin_count > 0);
     int pin_matched = 0;
     if (result) result->pin_present = pin_present;
-    if (pin_present && verify_spki_pin(&tls->ssl, spki_pin, got) == 0) {
+    if (pin_present && spki_in_pin_set(got, spki_pins, pin_count)) {
         pin_matched = 1;
         if (result) {
             result->pin_matched = 1;
