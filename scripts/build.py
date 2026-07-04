@@ -333,7 +333,7 @@ def main() -> None:
     log("Compiling + linking Lunar.exe")
     run(
         gcc,
-        "-O2", "-Wall", "-Wextra", "-std=c11",
+        "-O2", "-Wall", "-Wextra", "-std=c23",
         "-mwindows", "-static-libgcc", "-static",
         # -ffunction-sections + -fdata-sections + -Wl,--gc-sections
         # make the linker strip unused functions/data, so pulling in

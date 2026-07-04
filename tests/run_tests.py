@@ -70,7 +70,7 @@ def main() -> int:
         str(gcc),
         "-O0", "-g",
         "-Wall", "-Wextra", "-Wno-unused-function", "-Werror",
-        "-std=c11",
+        "-std=c23",
         "-static-libgcc", "-static",
         "-ffunction-sections", "-fdata-sections",
         f"-I{MBEDTLS_DIR / 'include'}",
