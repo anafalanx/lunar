@@ -51,6 +51,12 @@ typedef struct {
     int64_t  renewal_due_unix;
     char     renewal_due[32];
     char     last_status[96];
+    // Wall-clock (unix s) of the last CA-refresh attempt for this
+    // endpoint. Runtime-only -- deliberately NOT persisted, so a fresh
+    // process makes exactly one refresh attempt per in-window pin and
+    // then honours the cooldown (see PinStore_ShouldRenew). Zero means
+    // "never attempted this run".
+    int64_t  last_renew_attempt_unix;
     // Full enrolled set, ordered oldest -> newest.
     size_t   spki_count;
     PinSpki  spkis[PIN_STORE_MAX_SPKIS];

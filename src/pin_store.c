@@ -25,6 +25,13 @@
 #define PINSTORE_VERSION 2
 #define PINSTORE_MAX_ENTRIES 64
 #define PINSTORE_RENEWAL_MARGIN_CAP_SECONDS (30LL * 24LL * 60LL * 60LL)
+// Once a pin is inside its renewal window, re-attempt the CA refresh at
+// most this often. Without this, an endpoint whose upstream cert has not
+// rotated yet (its recomputed nextCa stays in the past) would force a
+// full CA re-validation + whole-store rewrite on EVERY connection --
+// a storm that also starves the parallel NTS handshakes. One hour is far
+// more than enough to notice a rotation while eliminating the storm.
+#define PINSTORE_RENEWAL_RETRY_COOLDOWN_SECONDS (60LL * 60LL)
 
 typedef struct {
     PinEndpointKind kind;
@@ -646,7 +653,17 @@ int PinStore_ShouldRenew(const PinRecord *rec)
     if (!rec || !rec->present) return 1;
     if (rec->renewal_due_unix <= 0) return 1;
     int64_t now = NowUnixSeconds();
-    return now <= 0 || now >= rec->renewal_due_unix;
+    if (now <= 0) return 1;                        // no disciplined time yet
+    if (now < rec->renewal_due_unix) return 0;     // not in the renewal window
+    // In-window: an upstream that has not rotated yet keeps producing the
+    // same past nextCa, so gate the retry on a cooldown -- otherwise every
+    // connection forces a fresh CA validation + whole-store write.
+    if (rec->last_renew_attempt_unix > 0 &&
+        now - rec->last_renew_attempt_unix <
+            PINSTORE_RENEWAL_RETRY_COOLDOWN_SECONDS) {
+        return 0;
+    }
+    return 1;
 }
 
 int PinStore_IsExpired(const PinRecord *rec)
@@ -721,6 +738,11 @@ int PinStore_SavePin(PinEndpointKind kind,
     FormatUnixUtc(s.renewal_due_unix, s.renewal_due, sizeof s.renewal_due);
     SafeCopy(s.last_status, sizeof s.last_status, status);
     RecordUpsertSpkiLocked(&e->rec, &s);
+
+    // A save only happens after a CA validation, so this is exactly the
+    // moment a renewal attempt completed; stamp it so PinStore_ShouldRenew
+    // holds off for the cooldown when the upstream cert has not rotated.
+    e->rec.last_renew_attempt_unix = NowUnixSeconds();
 
     LogPinRecordLocked("save", e);
     int ok = PersistLocked();

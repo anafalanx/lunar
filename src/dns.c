@@ -839,6 +839,24 @@ int Dns_ResolveEx(const char *host, char *out_ip, int *out_family)
     size_t hlen = strlen(host);
     if (hlen == 0 || hlen > 255) return -1;
 
+    // If the caller already handed us a literal IP address there is nothing
+    // to resolve. This matters for NTS: an NTS-KE server may negotiate its
+    // NTP server as a bare IP (netnod returns e.g. 194.58.207.80), and
+    // DoH-querying an IP as a hostname fails slowly across every pinned
+    // resolver (~a minute of A then AAAA sweeps) before the system fallback
+    // parses it -- long enough to blow the whole sync cycle's budget.
+    {
+        struct sockaddr_storage sa;
+        int salen = 0;
+        int litfam = Net_ParseIp(host, 0, &sa, &salen);
+        if (litfam != AF_UNSPEC) {
+            if (hlen >= NET_IP_STRLEN) return -1;
+            memcpy(out_ip, host, hlen + 1);
+            if (out_family) *out_family = litfam;
+            return 0;
+        }
+    }
+
     int cached_fam = AF_UNSPEC;
     if (cache_lookup(host, out_ip, &cached_fam)) {
         if (out_family) *out_family = cached_fam;
