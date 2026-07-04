@@ -1,6 +1,13 @@
 # Lunar
 
-Minimalist analog clock for Windows. Native C + Direct2D.
+A trusted time reference for Windows, drawn as a minimalist analog
+clock. Native C (C23) + Direct2D.
+
+Lunar keeps its own cryptographically-attested timescale — disciplined
+by authenticated NTS consensus, never by the OS clock — and uses it to
+tell you the true time, how certain it is, and **when your PC's own
+clock is wrong and by how much**. It is fail-honest: it never silently
+lies, and it never goes dark just because the network did.
 
 Current version: **0.4.0** — single-sourced from the top-level
 [`VERSION`](VERSION) file (the build injects it into the exe's version
@@ -71,6 +78,16 @@ fully static (libgcc/libstdc++ linked in, mbedTLS archived in).
   time, greyed and frozen with its age, until an authenticated cycle
   re-anchors). The red INOP face is reserved for genuinely unrenderable
   states: no sync yet this run, or a local fault.
+- **System-clock witness.** Lunar never *displays* the Windows clock,
+  but with a disciplined reference in hand it *measures* it: the About
+  dialog shows "System clock: +N.NN s vs Lunar", the dial badges the PC
+  clock when it drifts past half a second, and every step in the OS
+  clock (a w32time correction, a manual set, a VM time-sync) is logged
+  with its magnitude. This is the one comparison the whole trust stack
+  uniquely enables.
+- **Lives in the tray.** Minimize-to-tray, a live time/zone/state
+  tooltip, and an optional run-at-startup entry, so it is an all-day
+  instrument rather than a window you reopen every boot.
 - Time zones come from an IANA tzdata snapshot embedded at build time;
   the OS time-zone API is never consulted.
 - Runtime dependencies: only OS-shipped DLLs (`d2d1`, `dwrite`,
