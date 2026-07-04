@@ -137,6 +137,17 @@ int Nts_FetchSampleEx(const NtsProvider *p,
                       uint32_t *out_rttMs,
                       NtsRotationPending *rot);
 
+#ifdef LUNAR_TESTING
+// Cookie-jar test hooks (see nts.c). Count returns -1 when there is no
+// jar for the host, else the current cookie count.
+void Nts_TestJarReset(void);
+int  Nts_TestJarCount(const char *host);
+void Nts_TestJarStore(const char *host, int count);
+int  Nts_TestJarTake(const char *host);
+void Nts_TestJarAdd(const char *host, int count);
+void Nts_TestJarDrop(const char *host);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

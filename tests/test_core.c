@@ -1943,6 +1943,45 @@ static void test_logbuf_truncation(void) {
 
 #include "../src/nts.h"
 
+// Cookie jar (RFC 8915 reuse) mechanics: store / take / harvest / cap /
+// drop, keyed by host.
+static void test_nts_cookie_jar(void) {
+    Nts_TestJarReset();
+
+    // No jar for an unknown host.
+    CHECK_EQ_INT(Nts_TestJarCount("a.example"), -1);
+    CHECK_EQ_INT(Nts_TestJarTake("a.example"), 0);
+
+    // Store 8 cookies; taking spends one at a time.
+    Nts_TestJarStore("a.example", 8);
+    CHECK_EQ_INT(Nts_TestJarCount("a.example"), 8);
+    CHECK_EQ_INT(Nts_TestJarTake("a.example"), 1);
+    CHECK_EQ_INT(Nts_TestJarCount("a.example"), 7);
+
+    // Harvest tops the jar back up, capped at the 8-cookie ceiling.
+    Nts_TestJarAdd("a.example", 3);
+    CHECK_EQ_INT(Nts_TestJarCount("a.example"), 8);   // 7 + 3 -> capped at 8
+
+    // Drain to empty; take then fails and the jar reports empty (not -1:
+    // the jar still exists, it just has no cookies).
+    for (int i = 0; i < 8; i++) CHECK_EQ_INT(Nts_TestJarTake("a.example"), 1);
+    CHECK_EQ_INT(Nts_TestJarCount("a.example"), 0);
+    CHECK_EQ_INT(Nts_TestJarTake("a.example"), 0);
+
+    // Distinct hosts have independent jars.
+    Nts_TestJarStore("b.example", 4);
+    Nts_TestJarStore("a.example", 2);
+    CHECK_EQ_INT(Nts_TestJarCount("a.example"), 2);
+    CHECK_EQ_INT(Nts_TestJarCount("b.example"), 4);
+
+    // Drop removes the jar entirely (-1, not 0).
+    Nts_TestJarDrop("b.example");
+    CHECK_EQ_INT(Nts_TestJarCount("b.example"), -1);
+    CHECK_EQ_INT(Nts_TestJarCount("a.example"), 2);   // unaffected
+
+    Nts_TestJarReset();
+}
+
 static void test_nts_pool_pins(void) {
     // The shipped binary must not contain provider cryptographic
     // material. The pool is endpoint/operator metadata only; SPKI pins
@@ -3136,6 +3175,7 @@ int main(void) {
     test_ntske_parse_errors();
     test_nts_ef_roundtrip();
     test_nts_ef_tamper();
+    test_nts_cookie_jar();
     test_nts_pool_pins();
     test_logbuf_basic();
     test_logbuf_truncation();

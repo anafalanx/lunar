@@ -444,6 +444,296 @@ static int parse_sntp_reply(const uint8_t *pkt, size_t pkt_len,
     return 1;
 }
 
+// ---------------------------------------------------------------------------
+// Cookie jar (RFC 8915 cookie reuse)
+// ---------------------------------------------------------------------------
+//
+// An NTS-KE handshake yields up to 8 cookies plus the C2S/S2C keys. RFC
+// 8915 intends those cookies to be REUSED: each authenticated NTP
+// exchange spends one cookie and the reply supplies a fresh replacement,
+// so a full TLS handshake is needed only at first contact, when the jar
+// empties, or when the server rejects a cookie. Previously Lunar did a
+// full KE every cycle -- ~2,880 handshakes/day/slot against a thin
+// 4-family provider pool. The jar fixes that.
+//
+// Keys and cookies from one KE session belong together (the keys
+// authenticate exchanges that spend that session's cookies), so the jar
+// holds them as a unit, keyed by provider host. Only cookies from a
+// fully ENROLLED KE are jarred: a rotation-pending KE (unverified leaf)
+// never populates a reusable jar, so a jar sample is always an enrolled
+// pin -- exactly what the aggregator wants.
+//
+// Guarded by a critical section: two NTS worker threads draw different
+// providers within a cycle, but consecutive cycles can overlap.
+
+#define NTS_JAR_SLOTS 12
+
+typedef struct {
+    char     host[NTSKE_MAX_NTP_HOST_LEN + 1];   // jar key = provider host
+    int      valid;
+    uint8_t  c2s_key[32];
+    uint8_t  s2c_key[32];
+    char     ntp_host[NTSKE_MAX_NTP_HOST_LEN + 1];
+    uint16_t ntp_port;
+    size_t   cookie_count;
+    size_t   cookie_len[NTSKE_MAX_COOKIES];
+    uint8_t  cookies[NTSKE_MAX_COOKIES][NTSKE_MAX_COOKIE_LEN];
+    uint64_t last_use_tick;
+} NtsJar;
+
+static NtsJar           g_jars[NTS_JAR_SLOTS];
+static CRITICAL_SECTION g_jar_cs;
+static volatile LONG    g_jar_cs_ready = 0;
+
+static void jar_cs_ensure(void) {
+    if (InterlockedCompareExchange(&g_jar_cs_ready, 1, 0) == 0) {
+        InitializeCriticalSection(&g_jar_cs);
+        g_jar_cs_ready = 2;
+    }
+    while (g_jar_cs_ready != 2) { Sleep(0); }
+}
+
+// caller holds g_jar_cs
+static NtsJar *jar_find(const char *host) {
+    for (int i = 0; i < NTS_JAR_SLOTS; i++) {
+        if (g_jars[i].valid && strcmp(g_jars[i].host, host) == 0)
+            return &g_jars[i];
+    }
+    return nullptr;
+}
+
+// Pop one cookie for `host` into (c2s,s2c,ntp_host,ntp_port,cookie).
+// Returns 1 if a jarred cookie was available, 0 otherwise.
+static int jar_take(const char *host,
+                    uint8_t c2s[32], uint8_t s2c[32],
+                    char *ntp_host, uint16_t *ntp_port,
+                    uint8_t *cookie, size_t *cookie_len) {
+    jar_cs_ensure();
+    int got = 0;
+    EnterCriticalSection(&g_jar_cs);
+    NtsJar *j = jar_find(host);
+    if (j && j->cookie_count > 0) {
+        memcpy(c2s, j->c2s_key, 32);
+        memcpy(s2c, j->s2c_key, 32);
+        _snprintf(ntp_host, NTSKE_MAX_NTP_HOST_LEN + 1, "%s", j->ntp_host);
+        *ntp_port = j->ntp_port;
+        size_t k = --j->cookie_count;    // spend the last cookie
+        *cookie_len = j->cookie_len[k];
+        memcpy(cookie, j->cookies[k], j->cookie_len[k]);
+        j->last_use_tick = GetTickCount64();
+        got = 1;
+    }
+    LeaveCriticalSection(&g_jar_cs);
+    return got;
+}
+
+// Replace (or create) the jar for `host` with a fresh KE's keys, NTP
+// endpoint, and cookie set. Evicts the least-recently-used slot if full.
+static void jar_store(const char *host,
+                      const uint8_t c2s[32], const uint8_t s2c[32],
+                      const char *ntp_host, uint16_t ntp_port,
+                      const uint8_t (*cookies)[NTSKE_MAX_COOKIE_LEN],
+                      const size_t *lens, size_t count) {
+    if (count == 0) return;
+    if (count > NTSKE_MAX_COOKIES) count = NTSKE_MAX_COOKIES;
+    jar_cs_ensure();
+    EnterCriticalSection(&g_jar_cs);
+    NtsJar *j = jar_find(host);
+    if (!j) {
+        // Free slot, else LRU eviction.
+        NtsJar *lru = &g_jars[0];
+        for (int i = 0; i < NTS_JAR_SLOTS; i++) {
+            if (!g_jars[i].valid) { lru = &g_jars[i]; break; }
+            if (g_jars[i].last_use_tick < lru->last_use_tick) lru = &g_jars[i];
+        }
+        j = lru;
+        mbedtls_platform_zeroize(j, sizeof *j);
+    }
+    _snprintf(j->host, sizeof j->host, "%s", host);
+    memcpy(j->c2s_key, c2s, 32);
+    memcpy(j->s2c_key, s2c, 32);
+    _snprintf(j->ntp_host, sizeof j->ntp_host, "%s", ntp_host ? ntp_host : "");
+    j->ntp_port = ntp_port;
+    j->cookie_count = count;
+    for (size_t i = 0; i < count; i++) {
+        j->cookie_len[i] = lens[i];
+        memcpy(j->cookies[i], cookies[i], lens[i]);
+    }
+    j->valid = 1;
+    j->last_use_tick = GetTickCount64();
+    LeaveCriticalSection(&g_jar_cs);
+}
+
+// Append harvested replacement cookies to the existing jar for `host`
+// (capped at NTSKE_MAX_COOKIES). No-op if the jar was dropped.
+static void jar_add_cookies(const char *host,
+                            const uint8_t (*cookies)[NTSKE_MAX_COOKIE_LEN],
+                            const size_t *lens, size_t count) {
+    if (count == 0) return;
+    jar_cs_ensure();
+    EnterCriticalSection(&g_jar_cs);
+    NtsJar *j = jar_find(host);
+    if (j) {
+        for (size_t i = 0; i < count && j->cookie_count < NTSKE_MAX_COOKIES; i++) {
+            size_t k = j->cookie_count++;
+            j->cookie_len[k] = lens[i];
+            memcpy(j->cookies[k], cookies[i], lens[i]);
+        }
+        j->last_use_tick = GetTickCount64();
+    }
+    LeaveCriticalSection(&g_jar_cs);
+}
+
+static void jar_drop(const char *host) {
+    jar_cs_ensure();
+    EnterCriticalSection(&g_jar_cs);
+    NtsJar *j = jar_find(host);
+    if (j) mbedtls_platform_zeroize(j, sizeof *j);
+    LeaveCriticalSection(&g_jar_cs);
+}
+
+static int jar_cookie_count(const char *host) {
+    jar_cs_ensure();
+    EnterCriticalSection(&g_jar_cs);
+    NtsJar *j = jar_find(host);
+    int n = j ? (int)j->cookie_count : 0;
+    LeaveCriticalSection(&g_jar_cs);
+    return n;
+}
+
+#ifdef LUNAR_TESTING
+void Nts_TestJarReset(void) {
+    jar_cs_ensure();
+    EnterCriticalSection(&g_jar_cs);
+    mbedtls_platform_zeroize(g_jars, sizeof g_jars);
+    LeaveCriticalSection(&g_jar_cs);
+}
+int Nts_TestJarCount(const char *host) {
+    jar_cs_ensure();
+    EnterCriticalSection(&g_jar_cs);
+    NtsJar *j = jar_find(host);
+    int n = j ? (int)j->cookie_count : -1;   // -1 = no jar
+    LeaveCriticalSection(&g_jar_cs);
+    return n;
+}
+void Nts_TestJarStore(const char *host, int count) {
+    uint8_t keys[32]; memset(keys, 0xAB, sizeof keys);
+    uint8_t cks[NTSKE_MAX_COOKIES][NTSKE_MAX_COOKIE_LEN];
+    size_t  lens[NTSKE_MAX_COOKIES];
+    if (count > NTSKE_MAX_COOKIES) count = NTSKE_MAX_COOKIES;
+    for (int i = 0; i < count; i++) { memset(cks[i], i + 1, 16); lens[i] = 16; }
+    jar_store(host, keys, keys, "ntp.example", 123,
+              (const uint8_t (*)[NTSKE_MAX_COOKIE_LEN])cks, lens, (size_t)count);
+}
+int Nts_TestJarTake(const char *host) {
+    uint8_t c2s[32], s2c[32], cookie[NTSKE_MAX_COOKIE_LEN];
+    char nh[NTSKE_MAX_NTP_HOST_LEN + 1]; uint16_t np; size_t cl;
+    return jar_take(host, c2s, s2c, nh, &np, cookie, &cl);
+}
+void Nts_TestJarAdd(const char *host, int count) {
+    uint8_t cks[NTSKE_MAX_COOKIES][NTSKE_MAX_COOKIE_LEN];
+    size_t  lens[NTSKE_MAX_COOKIES];
+    if (count > NTSKE_MAX_COOKIES) count = NTSKE_MAX_COOKIES;
+    for (int i = 0; i < count; i++) { memset(cks[i], 0x55, 16); lens[i] = 16; }
+    jar_add_cookies(host, (const uint8_t (*)[NTSKE_MAX_COOKIE_LEN])cks,
+                    lens, (size_t)count);
+}
+void Nts_TestJarDrop(const char *host) { jar_drop(host); }
+#endif
+
+// One authenticated SNTP exchange with a given key set and cookie:
+// build the request, run the QPC-bracketed UDP round trip, authenticate
+// and parse the reply, and report the timing plus any replacement
+// cookies the server returned. Returns 1 on success, 0 on any failure.
+static int nts_udp_exchange(const char *host, uint16_t port,
+                            const uint8_t c2s[32], const uint8_t s2c[32],
+                            const uint8_t *cookie, size_t cookie_len,
+                            int64_t *out_ntpUtcMs, int64_t *out_qpcAtT4,
+                            uint32_t *out_rttMs,
+                            uint8_t (*harvest)[NTSKE_MAX_COOKIE_LEN],
+                            size_t *harvest_lens, size_t *harvest_cnt) {
+    *harvest_cnt = 0;
+
+    uint8_t hdr[48];
+    memset(hdr, 0, sizeof hdr);
+    hdr[0] = 0x23;   // LI=0, VN=4, Mode=3 (client)
+
+    uint8_t uid[NTS_UNIQUE_ID_LEN], nonce[NTS_NONCE_LEN];
+    uint8_t pkt[NTS_UDP_MAX_PKT];
+    size_t  pkt_len = 0;
+    int     rc = 0;
+    SOCKET  s = INVALID_SOCKET;
+
+    if (BCryptGenRandom(NULL, uid, sizeof uid,
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return 0;
+    if (BCryptGenRandom(NULL, nonce, sizeof nonce,
+                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+        mbedtls_platform_zeroize(uid, sizeof uid);
+        return 0;
+    }
+    if (NtsEf_BuildRequest(hdr, uid, nonce, cookie, cookie_len,
+                           0 /* no placeholder cookies */, c2s,
+                           pkt, sizeof pkt, &pkt_len) != 0) goto done;
+
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) goto done;
+
+    // Dual-stack DoH with NTS-only system-DNS fallback (safe: the reply
+    // is AEAD-authenticated, so a forged answer cannot forge a sample).
+    char ip[NET_IP_STRLEN];
+    int  fam = AF_UNSPEC;
+    if (Dns_ResolveEx(host, ip, &fam) != 0) {
+        if (Dns_ResolveSystem(host, ip, &fam) != 0) goto net_done;
+    }
+    struct sockaddr_storage sa;
+    int salen = 0;
+    if (Net_ParseIp(ip, port, &sa, &salen) == AF_UNSPEC) goto net_done;
+    s = Net_DgramSocket(fam, NTS_UDP_TIMEOUT_MS);
+    if (s == INVALID_SOCKET) goto net_done;
+
+    int64_t qpcT1 = Clock_Qpc();
+    int sent = sendto(s, (const char *)pkt, (int)pkt_len, 0,
+                      (struct sockaddr *)&sa, salen);
+    if (sent != (int)pkt_len) goto net_done;
+
+    uint8_t reply[NTS_UDP_MAX_PKT];
+    int recvd = recv(s, (char *)reply, (int)sizeof reply, 0);
+    int64_t qpcT4 = Clock_Qpc();
+    if (recvd <= 0) goto net_done;
+
+    if (NtsEf_ParseResponse(reply, (size_t)recvd, uid, s2c,
+                            harvest, harvest_lens, harvest_cnt) != 0) {
+        *harvest_cnt = 0;
+        goto net_done;
+    }
+
+    int64_t t2_ms = 0, t3_ms = 0;
+    if (!parse_sntp_reply(reply, (size_t)recvd, &t2_ms, &t3_ms)) goto net_done;
+
+    int64_t qpcFreq = Clock_QpcFreq();
+    if (qpcFreq <= 0) goto net_done;
+    int64_t rtt = ((qpcT4 - qpcT1) * 1000LL + qpcFreq / 2) / qpcFreq;
+    if (rtt < 0) rtt = 0;
+    int64_t serverProc = t3_ms - t2_ms;
+    if (serverProc < 0) serverProc = 0;
+    int64_t netRtt = rtt - serverProc;
+    if (netRtt < 0) netRtt = 0;
+
+    *out_ntpUtcMs = t3_ms + netRtt / 2;
+    *out_qpcAtT4  = qpcT4;
+    *out_rttMs    = (uint32_t)(rtt > 0x7fffffff ? 0x7fffffff : rtt);
+    rc = 1;
+
+net_done:
+    if (s != INVALID_SOCKET) closesocket(s);
+    WSACleanup();
+done:
+    mbedtls_platform_zeroize(uid,   sizeof uid);
+    mbedtls_platform_zeroize(nonce, sizeof nonce);
+    mbedtls_platform_zeroize(pkt,   sizeof pkt);
+    return rc;
+}
+
 int Nts_FetchSample(const NtsProvider *p,
                     int64_t  *out_ntpUtcMs,
                     int64_t  *out_qpcAtT4,
@@ -463,119 +753,80 @@ int Nts_FetchSampleEx(const NtsProvider *p,
         || out_rttMs == NULL) return 0;
     *out_ntpUtcMs = 0; *out_qpcAtT4 = 0; *out_rttMs = 0;
 
-    // Phase 1: NTS-KE. Nts_DoKeEx runs its own WSAStartup/Cleanup pair
-    // and clears `ke` (and `rot`) on failure, so we just inherit its
-    // verdict.
+    uint8_t harvest[NTSKE_MAX_COOKIES][NTSKE_MAX_COOKIE_LEN];
+    size_t  harvest_lens[NTSKE_MAX_COOKIES];
+    size_t  harvest_cnt = 0;
+
+    // --- Path A: reuse a jarred cookie, no handshake -----------------------
+    // A jar only ever holds cookies from a fully enrolled KE, so a
+    // reused sample is inherently an enrolled pin -- rot stays zeroed.
+    {
+        uint8_t c2s[32], s2c[32], cookie[NTSKE_MAX_COOKIE_LEN];
+        char    nhost[NTSKE_MAX_NTP_HOST_LEN + 1];
+        uint16_t nport = 0;
+        size_t  clen = 0;
+        if (jar_take(p->host, c2s, s2c, nhost, &nport, cookie, &clen)) {
+            const char *host = nhost[0] ? nhost : p->host;
+            uint16_t    port = nport ? nport : 123;
+            int r = nts_udp_exchange(host, port, c2s, s2c, cookie, clen,
+                                     out_ntpUtcMs, out_qpcAtT4, out_rttMs,
+                                     harvest, harvest_lens, &harvest_cnt);
+            mbedtls_platform_zeroize(c2s, sizeof c2s);
+            mbedtls_platform_zeroize(s2c, sizeof s2c);
+            mbedtls_platform_zeroize(cookie, sizeof cookie);
+            if (r == 1) {
+                jar_add_cookies(p->host, (const uint8_t (*)[NTSKE_MAX_COOKIE_LEN])harvest,
+                                harvest_lens, harvest_cnt);
+                Log_Append("nts: %s cookie reuse ok (jar=%d)",
+                           p->label, jar_cookie_count(p->host));
+                mbedtls_platform_zeroize(harvest, sizeof harvest);
+                return 1;
+            }
+            // The jarred cookie was rejected or the exchange failed:
+            // discard the whole jar for this host and fall through to a
+            // fresh KE (its keys are stale once cookies stop working).
+            jar_drop(p->host);
+            Log_Append("nts: %s jarred cookie rejected; full KE", p->label);
+        }
+    }
+
+    // --- Path B: full NTS-KE handshake -------------------------------------
     NtsKeResult ke;
     if (Nts_DoKeEx(p, &ke, rot) != 0 || !ke.ok || ke.cookie_count == 0) {
         if (rot) memset(rot, 0, sizeof *rot);
+        mbedtls_platform_zeroize(&ke, sizeof ke);
         return 0;
+    }
+
+    // Only a fully enrolled KE (matched an existing pin, or a first-run /
+    // scheduled CA enrollment) may seed a reusable jar. A rotation-
+    // pending KE is unverified until the aggregator corroborates it, so
+    // its cookies are used once and never jarred.
+    int enrolled = !(rot && rot->pending);
+    if (enrolled && ke.cookie_count > 1) {
+        jar_store(p->host, ke.c2s_key, ke.s2c_key, ke.ntp_host, ke.ntp_port,
+                  (const uint8_t (*)[NTSKE_MAX_COOKIE_LEN])&ke.cookies[1],
+                  &ke.cookie_len[1], ke.cookie_count - 1);
+    } else {
+        jar_drop(p->host);
     }
 
     const char *host = ke.ntp_host[0] ? ke.ntp_host : p->host;
     uint16_t    port = ke.ntp_port    ? ke.ntp_port : 123;
-
-    // Phase 2: build the authenticated SNTP request.
-    uint8_t hdr[48];
-    memset(hdr, 0, sizeof hdr);
-    hdr[0] = 0x23;   // LI=0, VN=4, Mode=3 (client)
-
-    uint8_t uid[NTS_UNIQUE_ID_LEN], nonce[NTS_NONCE_LEN];
-    if (BCryptGenRandom(NULL, uid, sizeof uid,
-                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) goto fail;
-    if (BCryptGenRandom(NULL, nonce, sizeof nonce,
-                        BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) goto fail;
-
-    uint8_t pkt[NTS_UDP_MAX_PKT];
-    size_t  pkt_len = 0;
-    if (NtsEf_BuildRequest(hdr, uid, nonce,
-                           ke.cookies[0], ke.cookie_len[0],
-                           0 /* no placeholder cookies */,
-                           ke.c2s_key,
-                           pkt, sizeof pkt, &pkt_len) != 0) goto fail;
-
-    // Phase 3: UDP exchange with QPC-bracketed timing.
-    WSADATA wsa;
-    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) goto fail;
-
-    int           rc = 0;
-    SOCKET        s  = INVALID_SOCKET;
-
-    // Dual-stack DoH, with the same NTS-only system-DNS fallback as
-    // tcp_connect. The host here is the NTS-KE host or an override the
-    // server sent via NTSKE_REC_NTPV4_SERVER; either way the SNTP
-    // exchange is AEAD-authenticated with c2s/s2c keys, so a forged DNS
-    // answer that redirects us cannot forge a valid sample -- the
-    // authenticator check drops it. Safe to fall back to OS DNS when
-    // pinned DoH is blocked.
-    char ip[NET_IP_STRLEN];
-    int  fam = AF_UNSPEC;
-    if (Dns_ResolveEx(host, ip, &fam) != 0) {
-        if (Dns_ResolveSystem(host, ip, &fam) != 0) goto udp_done;
+    harvest_cnt = 0;
+    int rc = nts_udp_exchange(host, port, ke.c2s_key, ke.s2c_key,
+                              ke.cookies[0], ke.cookie_len[0],
+                              out_ntpUtcMs, out_qpcAtT4, out_rttMs,
+                              harvest, harvest_lens, &harvest_cnt);
+    if (rc == 1 && enrolled) {
+        jar_add_cookies(p->host, (const uint8_t (*)[NTSKE_MAX_COOKIE_LEN])harvest,
+                        harvest_lens, harvest_cnt);
     }
+    Log_Append("nts: %s full KE %s (%u cookies)", p->label,
+               rc ? "ok" : "exchange failed", (unsigned)ke.cookie_count);
 
-    struct sockaddr_storage sa;
-    int salen = 0;
-    if (Net_ParseIp(ip, port, &sa, &salen) == AF_UNSPEC) goto udp_done;
-
-    s = Net_DgramSocket(fam, NTS_UDP_TIMEOUT_MS);
-    if (s == INVALID_SOCKET) goto udp_done;
-
-    int64_t qpcT1 = Clock_Qpc();
-    int sent = sendto(s, (const char *)pkt, (int)pkt_len, 0,
-                      (struct sockaddr *)&sa, salen);
-    if (sent != (int)pkt_len) goto udp_done;
-
-    uint8_t reply[NTS_UDP_MAX_PKT];
-    int recvd = recv(s, (char *)reply, (int)sizeof reply, 0);
-    int64_t qpcT4 = Clock_Qpc();
-    if (recvd <= 0) goto udp_done;
-
-    // Phase 4: authenticate + parse. ParseResponse does the SIV check,
-    // enforces the Authenticator is the final extension, and matches
-    // our UID in constant time. If anything's off we drop the sample.
-    uint8_t new_cookies[NTSKE_MAX_COOKIES][NTSKE_MAX_COOKIE_LEN];
-    size_t  new_lens[NTSKE_MAX_COOKIES];
-    size_t  new_cnt = 0;
-    if (NtsEf_ParseResponse(reply, (size_t)recvd, uid, ke.s2c_key,
-                            new_cookies, new_lens, &new_cnt) != 0) goto udp_done;
-
-    int64_t t2_ms = 0, t3_ms = 0;
-    if (!parse_sntp_reply(reply, (size_t)recvd, &t2_ms, &t3_ms)) goto udp_done;
-
-    int64_t qpcFreq = Clock_QpcFreq();
-    if (qpcFreq <= 0) goto udp_done;
-    int64_t rtt = ((qpcT4 - qpcT1) * 1000LL + qpcFreq / 2) / qpcFreq;
-    if (rtt < 0) rtt = 0;
-    int64_t serverProc = t3_ms - t2_ms;
-    if (serverProc < 0) serverProc = 0;
-    int64_t netRtt = rtt - serverProc;
-    if (netRtt < 0) netRtt = 0;
-
-    *out_ntpUtcMs = t3_ms + netRtt / 2;
-    *out_qpcAtT4  = qpcT4;
-    *out_rttMs    = (uint32_t)(rtt > 0x7fffffff ? 0x7fffffff : rtt);
-    rc = 1;
-
-    // Newly harvested cookies are discarded in this stateless model;
-    // the next cycle performs a fresh KE and gets new ones. See
-    // nts.h commentary. Zeroise any key material we've touched.
-    mbedtls_platform_zeroize(new_cookies, sizeof new_cookies);
-
-udp_done:
-    if (s != INVALID_SOCKET) closesocket(s);
-    WSACleanup();
-    mbedtls_platform_zeroize(uid,   sizeof uid);
-    mbedtls_platform_zeroize(nonce, sizeof nonce);
-    mbedtls_platform_zeroize(pkt,   sizeof pkt);
-    mbedtls_platform_zeroize(&ke,   sizeof ke);
-    // Rotation evidence from the KE is only meaningful when the whole
-    // authenticated sample succeeded.
+    mbedtls_platform_zeroize(harvest, sizeof harvest);
+    mbedtls_platform_zeroize(&ke, sizeof ke);
     if (rc == 0 && rot) memset(rot, 0, sizeof *rot);
     return rc;
-
-fail:
-    mbedtls_platform_zeroize(&ke, sizeof ke);
-    if (rot) memset(rot, 0, sizeof *rot);
-    return 0;
 }
