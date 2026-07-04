@@ -15,6 +15,7 @@
 #include "app_paths.h"
 #include "cert_verify_win.h"
 #include "logbuf.h"
+#include "clock.h"
 
 // Version 2: multiple E-lines may share one endpoint key (kind, label,
 // host, port); together they form that endpoint's SPKI set, ordered
@@ -50,6 +51,21 @@ static void EnsureCs(void)
 
 static int64_t NowUnixSeconds(void)
 {
+    // Prefer the disciplined clock -- the whole point of Lunar is not
+    // to trust the OS clock, and a badly-wrong system clock would
+    // otherwise force-expire every pin (or never renew them). Falls
+    // back to the system clock only before the first sync of a run,
+    // when pin enrollment necessarily happens anyway.
+    //
+    // Note: Windows CA chain validation (cert_verify_win.c) still uses
+    // the system clock internally for notBefore/notAfter -- that part
+    // is outside our control -- so this hardens only the expiry/renewal
+    // bookkeeping we own.
+    int64_t discMs = 0;
+    if (Clock_NowUtcMs(&discMs) && discMs > 0) {
+        return discMs / 1000;
+    }
+
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
     ULARGE_INTEGER u;
