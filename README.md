@@ -9,7 +9,7 @@ tell you the true time, how certain it is, and **when your PC's own
 clock is wrong and by how much**. It is fail-honest: it never silently
 lies, and it never goes dark just because the network did.
 
-Current version: **0.20.0** — single-sourced from the top-level
+Current version: **0.20.1** — single-sourced from the top-level
 [`VERSION`](VERSION) file (the build injects it into the exe's version
 resource and `build/version.h`).
 

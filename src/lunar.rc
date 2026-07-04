@@ -11,7 +11,7 @@
 // -------------------------------------------------------------------
 
 #ifndef LUNAR_VERSION_STR
-#define LUNAR_VERSION_STR "0.20.0"
+#define LUNAR_VERSION_STR "0.20.1"
 #endif
 #ifndef LUNAR_VERSION_MAJOR
 #define LUNAR_VERSION_MAJOR 0
@@ -20,7 +20,7 @@
 #define LUNAR_VERSION_MINOR 20
 #endif
 #ifndef LUNAR_VERSION_PATCH
-#define LUNAR_VERSION_PATCH 0
+#define LUNAR_VERSION_PATCH 1
 #endif
 
 1 ICON "..\\assets\\icon.ico"
