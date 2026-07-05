@@ -797,6 +797,15 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
     size_t nCore = PickCoreSources(chosenCore,
                                    NTP_CORE_COUNT * NTP_CORE_SLOT_ATTEMPTS);
 
+    // Conditional in-cycle core retry: once the clock is already TRUST_OK the
+    // 3/4-of-4 majority absorbs a one-off packet loss, so one attempt per core
+    // slot suffices; while re-anchoring (not yet OK) keep the full replacement
+    // retry. If a healthy single-attempt cycle does drop below OK, the next
+    // cycle sees that here and restores the retry. The NTS slots ALWAYS keep
+    // their full retry -- the authenticated pair is the trust floor.
+    size_t coreAttempts =
+        (Clock_Trust() >= TRUST_OK) ? 1u : (size_t)NTP_CORE_SLOT_ATTEMPTS;
+
     for (int i = 0; i < NTP_CORE_COUNT; i++) {
         WorkerCtx *ctx = (WorkerCtx *)calloc(1, sizeof *ctx);
         if (!ctx) {
@@ -806,7 +815,7 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
         ctx->refs = 1;
         core_ctx[i] = ctx;
         ctx->slot = i;
-        for (size_t attempt = 0; attempt < NTP_CORE_SLOT_ATTEMPTS; attempt++) {
+        for (size_t attempt = 0; attempt < coreAttempts; attempt++) {
             size_t idx = attempt * NTP_CORE_COUNT + (size_t)i;
             if (idx < nCore) {
                 ctx->candidates[ctx->candidate_count++] = chosenCore[idx];

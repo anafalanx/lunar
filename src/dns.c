@@ -464,7 +464,13 @@ int Dns_Intersect(const char (*set_a)[16], size_t n_a,
 // hostnames. Eviction: oldest expiring slot wins on insert collision.
 
 #define DNS_CACHE_N     32
-#define DNS_TTL_FLOOR   60U
+// Resolved IPs are cached at least this long so a resolve is not repeated on
+// every poll. The floor sits well above the relaxed 5-min poll ceiling so a
+// steady-state cycle reuses the cached IP instead of doing a fresh pinned-DoH
+// handshake each time. Safe against a rotated/dead IP because the NTS TCP
+// connect path invalidates a host's entry on connect failure (Dns_Invalidate),
+// and unauthenticated core SNTP survives one dead source on the 3/4 majority.
+#define DNS_TTL_FLOOR   900U
 #define DNS_TTL_CEIL    3600U
 
 typedef struct {
@@ -543,6 +549,21 @@ void Dns_CacheClear(void)
     cache_cs_ensure();
     EnterCriticalSection(&g_cache_cs);
     memset(g_cache, 0, sizeof g_cache);
+    LeaveCriticalSection(&g_cache_cs);
+}
+
+// Drop any cached entry for `host` so the next resolve does a fresh lookup.
+// Called when a connection to the cached IP fails, so a rotated/dead address
+// is not reused for the full TTL floor.
+void Dns_Invalidate(const char *host)
+{
+    if (!host || !host[0]) return;
+    cache_cs_ensure();
+    EnterCriticalSection(&g_cache_cs);
+    for (int i = 0; i < DNS_CACHE_N; i++) {
+        if (g_cache[i].host[0] && strcmp(g_cache[i].host, host) == 0)
+            g_cache[i].host[0] = 0;
+    }
     LeaveCriticalSection(&g_cache_cs);
 }
 

@@ -213,8 +213,15 @@ static SOCKET tcp_connect(const char *host, uint16_t port)
     int salen = 0;
     if (Net_ParseIp(ip, port, &sa, &salen) == AF_UNSPEC) return INVALID_SOCKET;
 
-    return Net_ConnectStream(&sa, salen,
-                             NTS_CONNECT_TIMEOUT_MS, NTS_IO_TIMEOUT_MS);
+    SOCKET s = Net_ConnectStream(&sa, salen,
+                                 NTS_CONNECT_TIMEOUT_MS, NTS_IO_TIMEOUT_MS);
+    if (s == INVALID_SOCKET) {
+        // The address (possibly a long-cached DoH result) did not connect --
+        // drop its cache entry so the next attempt re-resolves rather than
+        // riding the full TTL floor on a rotated/dead IP.
+        Dns_Invalidate(host);
+    }
+    return s;
 }
 
 // ---------------------------------------------------------------------------

@@ -142,6 +142,11 @@ int Dns_ResolveSystem(const char *host, char *out_ip, int *out_family);
 // Clear the entire in-memory cache. Primarily for tests.
 void Dns_CacheClear(void);
 
+// Drop any cached entry for `host` (e.g. after a connect to the cached IP
+// failed) so the next resolve does a fresh lookup instead of reusing a
+// possibly rotated/dead address for the full TTL floor.
+void Dns_Invalidate(const char *host);
+
 // --- Pool introspection (for tests + random picks) --------------------------
 
 typedef struct {
