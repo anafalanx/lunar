@@ -12,6 +12,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <windows.h>
+#include <shellapi.h>   /* Shell_NotifyIcon (system tray) */
+#include <commctrl.h>   /* SetWindowSubclass (marshal the tray callback) */
 #include <tcl.h>
 
 #include <string.h>
@@ -217,6 +219,155 @@ static int TzSuggest_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
     return TCL_OK;
 }
 
+/* ---- system tray -------------------------------------------------------
+ * The tray callback arrives in the Tk window's message dispatch (Tk pumps
+ * the message queue on the Tcl thread), so -- exactly like els's windrop --
+ * we never eval Tcl inline: we Tcl_QueueEvent and run ::lunar::tray_event at
+ * a safe point in the event loop. */
+#define LUNAR_TRAY_MSG (WM_APP + 17)
+#define LUNAR_TRAY_UID 0x4C55       /* 'LU' */
+
+static Tcl_Interp *g_uiInterp = NULL;   /* set at tray_add, used on same thread */
+static int g_trayActive = 0;
+
+typedef struct TrayEvent { Tcl_Event ev; char kind[16]; } TrayEvent;
+
+static int TrayEventProc(Tcl_Event *evPtr, [[maybe_unused]] int flags) {
+    TrayEvent *te = (TrayEvent *)evPtr;
+    if (g_uiInterp) {
+        Tcl_Obj *cmd = Tcl_NewListObj(0, NULL);
+        Tcl_IncrRefCount(cmd);
+        Tcl_ListObjAppendElement(g_uiInterp, cmd, Tcl_NewStringObj("::lunar::tray_event", -1));
+        Tcl_ListObjAppendElement(g_uiInterp, cmd, Tcl_NewStringObj(te->kind, -1));
+        if (Tcl_EvalObjEx(g_uiInterp, cmd, TCL_EVAL_GLOBAL) != TCL_OK) {
+            Tcl_BackgroundException(g_uiInterp, TCL_ERROR);
+        }
+        Tcl_DecrRefCount(cmd);
+    }
+    return 1;
+}
+static void tray_queue(const char *kind) {
+    TrayEvent *te = (TrayEvent *)Tcl_Alloc(sizeof(TrayEvent));
+    te->ev.proc = TrayEventProc;
+    te->ev.nextPtr = NULL;
+    lstrcpynA(te->kind, kind, (int)sizeof te->kind);
+    Tcl_QueueEvent((Tcl_Event *)te, TCL_QUEUE_TAIL);
+}
+static LRESULT CALLBACK TraySubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                     UINT_PTR uid, [[maybe_unused]] DWORD_PTR ref) {
+    if (msg == LUNAR_TRAY_MSG) {
+        switch (LOWORD(lp)) {
+            case WM_LBUTTONUP:
+            case WM_LBUTTONDBLCLK: tray_queue("activate"); break;
+            case WM_RBUTTONUP:
+            case WM_CONTEXTMENU:   tray_queue("menu");     break;
+            default: break;
+        }
+        return 0;
+    }
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, TraySubclass, uid);
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+static void tray_fill(NOTIFYICONDATAW *nid, HWND hwnd, const char *tip) {
+    memset(nid, 0, sizeof *nid);
+    nid->cbSize = sizeof *nid;
+    nid->hWnd = hwnd;
+    nid->uID = LUNAR_TRAY_UID;
+    nid->uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid->uCallbackMessage = LUNAR_TRAY_MSG;
+    nid->hIcon = LoadIconW(GetModuleHandleW(NULL), L"lunar");
+    if (!nid->hIcon) nid->hIcon = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
+    if (tip) MultiByteToWideChar(CP_UTF8, 0, tip, -1, nid->szTip,
+                                 (int)(sizeof nid->szTip / sizeof nid->szTip[0]));
+}
+
+/* lunar::tray_add hwnd tooltip -- show/replace the tray icon. */
+static int TrayAdd_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
+                       int objc, Tcl_Obj *const objv[]) {
+    if (objc != 3) { Tcl_WrongNumArgs(ip, 1, objv, "hwnd tooltip"); return TCL_ERROR; }
+    Tcl_WideInt h;
+    if (Tcl_GetWideIntFromObj(ip, objv[1], &h) != TCL_OK) return TCL_ERROR;
+    HWND hwnd = (HWND)(intptr_t)h;
+    if (!IsWindow(hwnd)) { Tcl_SetObjResult(ip, Tcl_NewStringObj("not a window", -1)); return TCL_OK; }
+    g_uiInterp = ip;
+    SetWindowSubclass(hwnd, TraySubclass, LUNAR_TRAY_UID, 0);
+    NOTIFYICONDATAW nid;
+    tray_fill(&nid, hwnd, Tcl_GetString(objv[2]));
+    Shell_NotifyIconW(g_trayActive ? NIM_MODIFY : NIM_ADD, &nid);
+    g_trayActive = 1;
+    Tcl_SetObjResult(ip, Tcl_NewObj());
+    return TCL_OK;
+}
+/* lunar::tray_tip hwnd tooltip -- update the tooltip. */
+static int TrayTip_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
+                       int objc, Tcl_Obj *const objv[]) {
+    if (objc != 3) { Tcl_WrongNumArgs(ip, 1, objv, "hwnd tooltip"); return TCL_ERROR; }
+    if (!g_trayActive) { Tcl_SetObjResult(ip, Tcl_NewObj()); return TCL_OK; }
+    Tcl_WideInt h;
+    if (Tcl_GetWideIntFromObj(ip, objv[1], &h) != TCL_OK) return TCL_ERROR;
+    NOTIFYICONDATAW nid;
+    tray_fill(&nid, (HWND)(intptr_t)h, Tcl_GetString(objv[2]));
+    Shell_NotifyIconW(NIM_MODIFY, &nid);
+    Tcl_SetObjResult(ip, Tcl_NewObj());
+    return TCL_OK;
+}
+/* lunar::tray_remove hwnd -- remove the tray icon. */
+static int TrayRemove_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
+                          int objc, Tcl_Obj *const objv[]) {
+    if (objc != 2) { Tcl_WrongNumArgs(ip, 1, objv, "hwnd"); return TCL_ERROR; }
+    if (g_trayActive) {
+        Tcl_WideInt h;
+        if (Tcl_GetWideIntFromObj(ip, objv[1], &h) != TCL_OK) return TCL_ERROR;
+        NOTIFYICONDATAW nid;
+        memset(&nid, 0, sizeof nid);
+        nid.cbSize = sizeof nid; nid.hWnd = (HWND)(intptr_t)h; nid.uID = LUNAR_TRAY_UID;
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+        g_trayActive = 0;
+    }
+    Tcl_SetObjResult(ip, Tcl_NewObj());
+    return TCL_OK;
+}
+
+/* lunar::run_at_startup ?0|1? -- query (no arg) or set the HKCU Run entry.
+ * Returns 1/0 on query, "" on set. The Run key is the source of truth. */
+static int RunAtStartup_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
+                            int objc, Tcl_Obj *const objv[]) {
+    static const wchar_t *kSub = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+    static const wchar_t *kVal = L"Lunar";
+    if (objc == 1) {
+        int on = 0; HKEY k;
+        if (RegOpenKeyExW(HKEY_CURRENT_USER, kSub, 0, KEY_QUERY_VALUE, &k) == ERROR_SUCCESS) {
+            if (RegQueryValueExW(k, kVal, NULL, NULL, NULL, NULL) == ERROR_SUCCESS) on = 1;
+            RegCloseKey(k);
+        }
+        Tcl_SetObjResult(ip, Tcl_NewIntObj(on));
+        return TCL_OK;
+    }
+    if (objc != 2) { Tcl_WrongNumArgs(ip, 1, objv, "?0|1?"); return TCL_ERROR; }
+    int enable;
+    if (Tcl_GetBooleanFromObj(ip, objv[1], &enable) != TCL_OK) return TCL_ERROR;
+    HKEY k;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kSub, 0, NULL, 0, KEY_SET_VALUE,
+                        NULL, &k, NULL) != ERROR_SUCCESS) {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("cannot open Run key", -1));
+        return TCL_OK;
+    }
+    if (enable) {
+        wchar_t exe[MAX_PATH]; DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
+        if (n > 0 && n < MAX_PATH) {
+            wchar_t q[MAX_PATH + 2];
+            int qn = wsprintfW(q, L"\"%s\"", exe);
+            RegSetValueExW(k, kVal, 0, REG_SZ, (const BYTE *)q,
+                           (DWORD)((qn + 1) * (int)sizeof(wchar_t)));
+        }
+    } else {
+        RegDeleteValueW(k, kVal);
+    }
+    RegCloseKey(k);
+    Tcl_SetObjResult(ip, Tcl_NewObj());
+    return TCL_OK;
+}
+
 /* lunar::update -- {available 0|1 version X.Y.Z}. */
 static int Update_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
                       int objc, Tcl_Obj *const objv[]) {
@@ -243,6 +394,10 @@ int Lunarx_Init(Tcl_Interp *ip) {
     Tcl_CreateObjCommand(ip, "::lunar::tz_list",      TzList_Cmd,      nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::tz_version",   TzVersion_Cmd,   nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::tz_suggest",   TzSuggest_Cmd,   nullptr, nullptr);
+    Tcl_CreateObjCommand(ip, "::lunar::tray_add",     TrayAdd_Cmd,     nullptr, nullptr);
+    Tcl_CreateObjCommand(ip, "::lunar::tray_tip",     TrayTip_Cmd,     nullptr, nullptr);
+    Tcl_CreateObjCommand(ip, "::lunar::tray_remove",  TrayRemove_Cmd,  nullptr, nullptr);
+    Tcl_CreateObjCommand(ip, "::lunar::run_at_startup", RunAtStartup_Cmd, nullptr, nullptr);
     if (Tcl_PkgProvide(ip, "lunarx", "0.1") != TCL_OK) return TCL_ERROR;
     return TCL_OK;
 }

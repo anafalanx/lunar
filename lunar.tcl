@@ -120,10 +120,11 @@ proc lunar::fmt_delta {ms} {
 # two shells can be swapped without losing anything. The PRESENCE of the tz=
 # key -- even empty, meaning explicit UTC -- counts as a deliberate choice;
 # only then does first-run OS-zone suggestion stop.
-set ::lunar::cfg [dict create fmt24 1]
-set ::lunar::cfg_extra {}       ;# unowned lines, kept in file order
+set ::lunar::cfg [dict create fmt24 1 tray 0 startup 0]
+set ::lunar::cfg_extra {}       ;# unowned lines (chimes/unmin/confirm), kept in file order
 set ::lunar::tz "UTC"           ;# the active display zone
 set ::lunar::tz_chosen 0
+set ::lunar::tray_tip_last ""
 
 proc lunar::settings_load {} {
     set path [file join [lunar::datadir] settings.dat]
@@ -134,7 +135,9 @@ proc lunar::settings_load {} {
         if {$line eq ""} continue
         if {![regexp {^([a-z0-9]+)=(.*)$} $line -> k v]} continue
         switch $k {
-            fmt24   { dict set ::lunar::cfg fmt24 [expr {$v ? 1 : 0}] }
+            fmt24   { dict set ::lunar::cfg fmt24   [expr {$v ? 1 : 0}] }
+            tray    { dict set ::lunar::cfg tray    [expr {$v ? 1 : 0}] }
+            startup { dict set ::lunar::cfg startup [expr {$v ? 1 : 0}] }
             tz      { set ::lunar::tz_chosen 1 ; dict set ::lunar::cfg tz $v }
             default { lappend ::lunar::cfg_extra $line }
         }
@@ -146,6 +149,8 @@ proc lunar::settings_save {} {
     if {[catch {file mkdir $dir}]} { return }
     set lines $::lunar::cfg_extra
     lappend lines "fmt24=[dict get $::lunar::cfg fmt24]"
+    lappend lines "tray=[dict get $::lunar::cfg tray]"
+    lappend lines "startup=[dict get $::lunar::cfg startup]"
     lappend lines "tz=[expr {$::lunar::tz eq "UTC" ? "" : $::lunar::tz}]"
     set path [file join $dir settings.dat]
     set tmp  "$path.new"
@@ -278,6 +283,7 @@ proc lunar::build {} {
     bind .sb.update <Button-1> { catch { exec {*}[auto_execok start] "" \
         "https://github.com/anafalanx/lunar/releases/latest" & } }
     wm protocol . WM_DELETE_WINDOW lunar::quit
+    lunar::tray_setup
 }
 
 # ---- Settings dialog ---------------------------------------------------------
@@ -316,6 +322,12 @@ proc lunar::settings_dlg {} {
     checkbutton $c.fmt24 -bg $P -fg $::lunar::INK -font lunarUI -anchor w \
         -activebackground $P -selectcolor $P \
         -text "Use 24-hour clock" -variable ::lunar::set_fmt24
+    checkbutton $c.tray -bg $P -fg $::lunar::INK -font lunarUI -anchor w \
+        -activebackground $P -selectcolor $P \
+        -text "Minimize to the notification area (tray)" -variable ::lunar::set_tray
+    checkbutton $c.startup -bg $P -fg $::lunar::INK -font lunarUI -anchor w \
+        -activebackground $P -selectcolor $P \
+        -text "Start Lunar when you sign in" -variable ::lunar::set_startup
     frame $c.btns -bg $P
     ttk::button $c.btns.ok     -style Dialog.TButton -text "OK"     -command lunar::settings_ok
     ttk::button $c.btns.cancel -style Dialog.TButton -text "Cancel" -command {destroy .set}
@@ -325,12 +337,16 @@ proc lunar::settings_dlg {} {
     pack $c.zhdr  -fill x -pady {0 6}
     pack $c.zf    -fill x -pady {0 6}
     pack $c.zl    -fill x
-    pack $c.zprev -fill x -pady {4 0}
-    pack $c.fmt24 -fill x -pady {14 0}
-    pack $c.btns  -fill x -pady {18 0}
+    pack $c.zprev   -fill x -pady {4 0}
+    pack $c.fmt24   -fill x -pady {14 0}
+    pack $c.tray    -fill x -pady {4 0}
+    pack $c.startup -fill x -pady {4 0}
+    pack $c.btns    -fill x -pady {18 0}
 
     set ::lunar::set_filter ""
-    set ::lunar::set_fmt24 [dict get $::lunar::cfg fmt24]
+    set ::lunar::set_fmt24   [dict get $::lunar::cfg fmt24]
+    set ::lunar::set_tray    [dict get $::lunar::cfg tray]
+    set ::lunar::set_startup [dict get $::lunar::cfg startup]
     trace add variable ::lunar::set_filter write {apply {{args} {lunar::settings_fill}}}
     bind $c.zl.list <<ListboxSelect>> lunar::settings_preview
     bind .set <Escape> {destroy .set}
@@ -399,6 +415,14 @@ proc lunar::settings_ok {} {
     set ::lunar::tz_chosen 1
     dict set ::lunar::cfg tz [expr {$::lunar::tz eq "UTC" ? "" : $::lunar::tz}]
     dict set ::lunar::cfg fmt24 [expr {$::lunar::set_fmt24 ? 1 : 0}]
+    dict set ::lunar::cfg tray  [expr {$::lunar::set_tray ? 1 : 0}]
+    # the registry Run key is the source of truth for run-at-startup
+    if {[llength [info commands ::lunar::run_at_startup]]} {
+        catch { ::lunar::run_at_startup [expr {$::lunar::set_startup ? 1 : 0}] }
+        dict set ::lunar::cfg startup [::lunar::run_at_startup]
+    } else {
+        dict set ::lunar::cfg startup [expr {$::lunar::set_startup ? 1 : 0}]
+    }
     lunar::settings_save
     destroy .set
 }
@@ -411,7 +435,60 @@ proc lunar::repoll {} {
     after $::lunar::poll_ms lunar::repoll
 }
 
+# ---- system tray + window state --------------------------------------------
+proc lunar::hwnd {} { return [winfo id .] }
+
+proc lunar::restore {} {
+    wm deiconify .
+    raise .
+    catch { focus -force . }
+}
+
+# Called from the C tray subclass (via ::lunar::tray_event) at a safe point.
+proc lunar::tray_event {kind} {
+    switch $kind {
+        activate { lunar::restore }
+        menu     { lunar::tray_menu }
+    }
+}
+
+proc lunar::tray_menu {} {
+    catch {destroy .traymenu}
+    menu .traymenu -tearoff 0
+    .traymenu add command -label "Restore"    -command lunar::restore
+    .traymenu add command -label "Sync now"   -command { catch { ::lunar::syncnow } }
+    .traymenu add command -label "Settings…"  -command lunar::settings_dlg
+    .traymenu add separator
+    .traymenu add command -label "Exit Lunar" -command lunar::quit
+    # a tray popup needs the owning window foregrounded or it won't dismiss
+    catch { focus -force . }
+    tk_popup .traymenu [winfo pointerx .] [winfo pointery .]
+}
+
+# minimize-to-tray: when enabled, a minimize withdraws the window (leaving only
+# the tray icon). Guarded on iconic state so withdrawing can't re-enter.
+proc lunar::on_unmap {} {
+    if {[dict get $::lunar::cfg tray] && [wm state .] eq "iconic"} {
+        wm withdraw .
+    }
+}
+
+proc lunar::tray_setup {} {
+    if {![llength [info commands ::lunar::tray_add]]} return
+    catch { ::lunar::tray_add [lunar::hwnd] "Lunar" }
+    bind . <Unmap> { after idle lunar::on_unmap }
+}
+
+proc lunar::tray_tip_update {text} {
+    if {$text eq $::lunar::tray_tip_last} return
+    set ::lunar::tray_tip_last $text
+    if {[llength [info commands ::lunar::tray_tip]]} {
+        catch { ::lunar::tray_tip [lunar::hwnd] $text }
+    }
+}
+
 proc lunar::quit {} {
+    catch { if {[llength [info commands ::lunar::tray_remove]]} { ::lunar::tray_remove [lunar::hwnd] } }
     catch { if {[llength [info commands ::lunar::shutdown]]} { ::lunar::shutdown } }
     destroy .
 }
@@ -478,6 +555,13 @@ proc lunar::render {st} {
     if {[llength [info commands ::lunar::sources]]} {
         lunar::render_sources [::lunar::sources]
     }
+
+    # live tray tooltip (HH:MM so it only changes once a minute; throttled)
+    set tip "Lunar · $txt"
+    if {$hasTime && [info exists lt]} {
+        append tip " · [format %02d:%02d [dict get $lt hour] [dict get $lt minute]] [dict get $lt abbr]"
+    }
+    lunar::tray_tip_update $tip
 }
 
 proc lunar::render_sources {srcs} {
@@ -517,6 +601,11 @@ proc lunar::selftest {reportPath} {
             set ok 0 ; set msg "tz resolve failed: $lt"
         }
     }
+    if {[llength [info commands ::lunar::run_at_startup]]} {
+        append txt "startup=[::lunar::run_at_startup]\n"
+    }
+    # build added a real tray icon; remove it so headless checks leave nothing
+    catch { if {[llength [info commands ::lunar::tray_remove]]} { ::lunar::tray_remove [winfo id .] } }
     append txt "status=[expr {$ok ? {ok} : {FAIL}}]\n"
     if {!$ok} { append txt "error=$msg\n" }
     if {$reportPath ne ""} {
@@ -532,6 +621,11 @@ proc lunar::main {} {
         return
     }
     lunar::settings_load
+    # the registry Run key is authoritative for run-at-startup (the user may
+    # have toggled it via Task Manager/msconfig outside Lunar)
+    if {[llength [info commands ::lunar::run_at_startup]]} {
+        dict set ::lunar::cfg startup [::lunar::run_at_startup]
+    }
     lunar::tz_startup
     lunar::build
     # Route uncaught async errors to the log + a status note, never a modal
