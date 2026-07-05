@@ -130,6 +130,7 @@ set ::lunar::tray_tip_last ""
 set ::lunar::armed [lrepeat 12 0]   ;# the 12 five-minute marks (:00..:55)
 set ::lunar::prev_min -1            ;# last displayed integer minute (chime edge)
 set ::lunar::prewarm_min -1         ;# armed mark we've already pre-warmed for
+set ::lunar::sources_open 0         ;# SOURCES panel disclosure (default closed)
 
 proc lunar::settings_load {} {
     set path [file join [lunar::datadir] settings.dat]
@@ -290,8 +291,8 @@ proc lunar::fmt_utcoff {offSec} {
 # ---- the dashboard ----------------------------------------------------------
 proc lunar::build {} {
     wm title . "Lunar $::lunar::version"
-    wm geometry . 540x640
-    wm minsize . 460 520
+    wm geometry . 540x430
+    wm minsize . 460 380
     lunar::init_style
     . configure -background $::lunar::PAGE
     catch { wm iconphoto . -default [image create photo -file [file join [file dirname [info script]] resources icon.png]] }
@@ -319,24 +320,31 @@ proc lunar::build {} {
 
     set P $::lunar::PAGE
     frame .face -bg $P
-    label .face.time  -bg $P -fg $::lunar::INK   -font lunarBig   -text "--:--:--"
     label .face.date  -bg $P -fg $::lunar::MUTED -font lunarDate  -text ""
-    label .face.state -bg $P -fg $::lunar::MUTED -font lunarState -text "starting…"
-    label .face.bound -bg $P -fg $::lunar::MUTED -font lunarSmall -text ""
-    pack .face.time  -pady {26 0}
-    pack .face.date  -pady {6 0}
-    pack .face.state -pady {18 0}
-    pack .face.bound -pady {3 0}
+    label .face.time  -bg $P -fg $::lunar::INK   -font lunarBig   -text "--:--:--"
+    # trust state and the error-bound window share one line to save height
+    frame .face.status -bg $P
+    label .face.status.state -bg $P -fg $::lunar::MUTED -font lunarState -text "starting…"
+    label .face.status.bound -bg $P -fg $::lunar::MUTED -font lunarSmall -text ""
+    pack .face.status.state -side left -anchor s
+    pack .face.status.bound -side left -anchor s -padx {10 0} -pady {0 2}
+    pack .face.date   -pady {24 0}
+    pack .face.time   -pady {2 0}
+    pack .face.status -pady {16 0}
 
     # sources section: hairline + muted header + one fixed row per slot,
     # updated in place each tick (no rebuilding, so no flicker).
     frame .src -bg $P
     frame .src.hair -height 1 -bg $::lunar::HAIR
-    label .src.hdr  -bg $P -fg $::lunar::MUTED -font lunarHdr -anchor w -text "SOURCES"
+    # clickable disclosure header; the rows live in .src.rows and are shown
+    # or hidden by lunar::toggle_sources (default: collapsed).
+    label .src.hdr  -bg $P -fg $::lunar::MUTED -font lunarHdr -anchor w \
+        -text "▸ SOURCES" -cursor hand2
+    frame .src.rows -bg $P
     pack .src.hair -fill x -pady {0 8}
     pack .src.hdr  -fill x -padx 24 -pady {0 2}
     for {set i 0} {$i < 6} {incr i} {
-        set r [frame .src.r$i -bg $P]
+        set r [frame .src.rows.r$i -bg $P]
         label $r.dot  -bg $P -fg $::lunar::MUTED -font lunarMono  -text "●" -width 2
         label $r.name -bg $P -fg $::lunar::INK   -font lunarSmall -anchor w -text "—"
         label $r.off  -bg $P -fg $::lunar::MUTED -font lunarMono  -anchor e -width 9 -text ""
@@ -345,6 +353,10 @@ proc lunar::build {} {
         grid columnconfigure $r 1 -weight 1
         pack $r -fill x -padx 24
     }
+    bind .src.hdr <Button-1> lunar::toggle_sources
+    bind .src.hdr <Enter> { .src.hdr configure -fg $::lunar::INK }
+    bind .src.hdr <Leave> { .src.hdr configure -fg $::lunar::MUTED }
+    # default state is collapsed: .src.rows is intentionally not packed here
 
     # status bar: hairline + muted labels, clickable zone indicator (els idiom)
     frame .sb -bg $::lunar::CHROME
@@ -377,6 +389,24 @@ proc lunar::build {} {
         "https://github.com/anafalanx/lunar/releases/latest" & } }
     wm protocol . WM_DELETE_WINDOW lunar::quit
     lunar::tray_setup
+}
+
+# Collapsible SOURCES panel: show/hide the rows, flip the disclosure glyph,
+# and grow/shrink the window to fit (preserving its width + position).
+proc lunar::toggle_sources {} {
+    regexp {^(\d+)x(\d+)(.*)$} [wm geometry .] -> w h pos
+    if {$::lunar::sources_open} {
+        pack forget .src.rows
+        set ::lunar::sources_open 0
+        .src.hdr configure -text "▸ SOURCES"
+        set nh 430
+    } else {
+        pack .src.rows -fill x -after .src.hdr -pady {2 0}
+        set ::lunar::sources_open 1
+        .src.hdr configure -text "▾ SOURCES"
+        set nh 580
+    }
+    catch { wm geometry . ${w}x${nh}${pos} }
 }
 
 # ---- menu actions: copy time, always-on-top, About, log viewer --------------
@@ -722,7 +752,7 @@ proc lunar::tick {} {
             set now [clock seconds]
             .face.time  configure -text [clock format $now -format %H:%M:%S]
             .face.date  configure -text [clock format $now -format "%A, %d %B %Y"]
-            .face.state configure -text "no engine" -fg $::lunar::MUTED
+            .face.status.state configure -text "no engine" -fg $::lunar::MUTED
         }
     } err opts]} {
         catch { lunar::log "\[tick\] [dict get $opts -errorinfo]" }
@@ -744,16 +774,16 @@ proc lunar::render {st} {
             .sb.zone configure -text \
                 "$::lunar::tz · [dict get $lt abbr] ([lunar::fmt_utcoff [dict get $lt offSec]])"
         }
-        .face.bound configure -text [lunar::fmt_bound [dict get $st boundMs]]
+        .face.status.bound configure -text [lunar::fmt_bound [dict get $st boundMs]]
     } else {
         .face.time  configure -text "--:--:--"
         .face.date  configure -text ""
-        .face.bound configure -text ""
+        .face.status.bound configure -text ""
         .sb.zone    configure -text $::lunar::tz
     }
 
     lassign [lunar::state_display $state $synced] txt col
-    .face.state configure -text $txt -fg $col
+    .face.status.state configure -text $txt -fg $col
 
     if {[dict get $st sysDeltaValid]} {
         .sb.sys configure -text "PC clock: [lunar::fmt_delta [dict get $st sysDeltaMs]] vs Lunar"
@@ -793,7 +823,7 @@ proc lunar::render {st} {
 
 proc lunar::render_sources {srcs} {
     for {set i 0} {$i < 6} {incr i} {
-        set r .src.r$i
+        set r .src.rows.r$i
         if {![winfo exists $r]} continue
         set s [lindex $srcs $i]
         if {$s eq "" || ![dict get $s ok]} {
@@ -907,6 +937,7 @@ proc lunar::main {} {
     if {[info exists ::env(LUNAR_OPEN_SETTINGS)] && $::env(LUNAR_OPEN_SETTINGS) ne ""} { after 400 lunar::settings_dlg }
     if {[info exists ::env(LUNAR_OPEN_ABOUT)]    && $::env(LUNAR_OPEN_ABOUT)    ne ""} { after 400 lunar::about_dlg }
     if {[info exists ::env(LUNAR_OPEN_LOG)]      && $::env(LUNAR_OPEN_LOG)      ne ""} { after 400 lunar::log_dlg }
+    if {[info exists ::env(LUNAR_OPEN_SOURCES)] && $::env(LUNAR_OPEN_SOURCES) ne ""} { after 400 lunar::toggle_sources }
     # LUNAR_BEEP=<n>: on launch, run the real prewarm->chime sequence n times
     # (prewarm ~300ms before each chime, ~1s apart), for audio testing
     # (cold-device reliability, overlap-drop). Default 1.
