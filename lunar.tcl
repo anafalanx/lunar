@@ -8,7 +8,7 @@
 package require Tk
 
 namespace eval lunar {
-    variable version "0.21.0-dev"
+    variable version "0.50"
     variable poll_ms 60000   ;# ask the engine to re-sync at most this often
     variable log_active 0    ;# reentry latch so logging can't recurse into bgerror
 }

@@ -105,13 +105,17 @@ def find_tool(name: str) -> Path:
 # (the build dir is on the app include path).
 
 def read_version() -> str:
-    """Return the MAJOR.MINOR.PATCH version string from the VERSION file."""
+    """Return the MAJOR.MINOR version string from the VERSION file.
+
+    Lunar uses a two-part version (like els: 0.50), so the exe's four-part
+    Windows resource/manifest fields are this padded with zeros (0.50.0.0).
+    """
     try:
         v = VERSION_FILE.read_text(encoding="utf-8").strip()
     except OSError as e:
         die(f"cannot read {VERSION_FILE}: {e}")
-    if not re.fullmatch(r"\d+\.\d+\.\d+", v):
-        die(f"VERSION file contains {v!r}; expected MAJOR.MINOR.PATCH")
+    if not re.fullmatch(r"\d+\.\d+", v):
+        die(f"VERSION file contains {v!r}; expected MAJOR.MINOR (e.g. 0.50)")
     return v
 
 
@@ -121,11 +125,14 @@ def check_manifest_version(version: str) -> None:
     lunar.rc embeds src/lunar.manifest verbatim as RT_MANIFEST, so unlike
     the .rc version fields (overridden by windres -D) the manifest's
     assemblyIdentity version is NOT templated by the build. This guard
-    locks its four-part identity (X.Y.Z.0) to VERSION so it can never
-    silently ship stale again.
+    locks its four-part identity (VERSION padded with zeros, e.g.
+    0.50.0.0) so it can never silently ship stale again.
     """
     manifest = SRC / "lunar.manifest"
-    want = f"{version}.0"
+    parts = version.split(".")
+    while len(parts) < 4:
+        parts.append("0")
+    want = ".".join(parts[:4])
     try:
         text = manifest.read_text(encoding="utf-8")
     except OSError as e:
@@ -148,7 +155,9 @@ def write_version_header(build_dir: Path = BUILD,
     """
     if version is None:
         version = read_version()
-    major, minor, patch = (int(p) for p in version.split("."))
+    parts = [int(p) for p in version.split(".")]
+    major, minor = parts[0], parts[1]
+    patch = parts[2] if len(parts) > 2 else 0
     build_dir.mkdir(parents=True, exist_ok=True)
     header = build_dir / "version.h"
     text = (
@@ -331,7 +340,9 @@ def main() -> None:
     windres = find_tool("windres")
 
     version = read_version()
-    v_major, v_minor, v_patch = version.split(".")
+    _vp = version.split(".")
+    v_major, v_minor = _vp[0], _vp[1]
+    v_patch = _vp[2] if len(_vp) > 2 else "0"
     check_manifest_version(version)
     write_version_header(BUILD, version)
     log(f"Version {version} (from VERSION)")

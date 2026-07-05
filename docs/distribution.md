@@ -62,7 +62,8 @@ set LUNAR_SIGN_CMD=signtool sign /a /tr http://time.certum.pl /td sha256 /fd sha
 
 ## 2. Release checklist
 
-1. **Bump `VERSION`** at the repo root (plain `X.Y.Z`).
+1. **Bump `VERSION`** at the repo root (two-part `X.Y`, e.g. `0.50`; the
+   exe's four-part Windows resource fields are this padded with zeros).
 2. **Regenerate tzdata if stale** — check IANA for a newer release than
    the embedded one (`src/tz_embed.c`) and regenerate if so.
 3. **Build**: `python scripts/build.py --no-desktop`.
@@ -73,7 +74,7 @@ set LUNAR_SIGN_CMD=signtool sign /a /tr http://time.certum.pl /td sha256 /fd sha
 5. **Sign + verify**: connect SimplySign, then sign the built
    `build/Lunar.exe` with the command in §1 and verify it. Note the
    printed SHA-256 of the signed exe.
-6. **GitHub Release**: tag `vX.Y` (or `vX.Y.Z`), upload the signed
+6. **GitHub Release**: tag `vX.Y` (matching VERSION), upload the signed
    `Lunar.exe` as the release asset, and paste its SHA-256 into the
    notes. Lunar ships as a single self-contained exe — the exe *is* the
    artifact, no installer or archive required.

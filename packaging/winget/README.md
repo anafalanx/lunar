@@ -17,21 +17,21 @@ until real GitHub Releases exist, because winget requires:
 
 ## Generating real manifests from these templates
 
-For version `X.Y.Z` with release asset `Lunar.exe`:
+For version `X.Y` with release asset `Lunar.exe`:
 
 1. Compute the exe hash:
    `certutil -hashfile dist/Lunar.exe SHA256`
 2. In all three `Lunar.Lunar.*.yaml` files, replace:
-   - `{VERSION}` -> `X.Y.Z`
+   - `{VERSION}` -> `X.Y`
    - `{SHA256}`  -> the exe hash (uppercase or lowercase both accepted)
 3. Copy the three files into a winget-pkgs fork under
-   `manifests/l/Lunar/Lunar/X.Y.Z/`.
-4. Validate locally: `winget validate manifests/l/Lunar/Lunar/X.Y.Z` and
+   `manifests/l/Lunar/Lunar/X.Y/`.
+4. Validate locally: `winget validate manifests/l/Lunar/Lunar/X.Y` and
    test-install with
-   `winget install --manifest manifests/l/Lunar/Lunar/X.Y.Z`
+   `winget install --manifest manifests/l/Lunar/Lunar/X.Y`
    (requires enabling `LocalManifestFiles` in winget settings).
 5. Open a PR against microsoft/winget-pkgs. Subsequent versions can use
-   `wingetcreate update Lunar.Lunar -u <new exe url> -v X.Y.Z` instead of
+   `wingetcreate update Lunar.Lunar -u <new exe url> -v X.Y` instead of
    hand-editing.
 
 ## Files
