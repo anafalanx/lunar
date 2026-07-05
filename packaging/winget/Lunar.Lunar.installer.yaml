@@ -1,7 +1,7 @@
 # Installer manifest (template). Replace {VERSION} and {SHA256} before
 # submitting. Lunar ships as a single signed portable exe; {SHA256} is
-# the SHA-256 of the release Lunar.exe (release.py / signtool print it,
-# or:  certutil -hashfile Lunar.exe SHA256).
+# the SHA-256 of the release Lunar.exe (`tools/tasks.tcl sign` and signtool
+# print it, or:  certutil -hashfile Lunar.exe SHA256).
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.6.0.schema.json
 PackageIdentifier: Lunar.Lunar
 PackageVersion: "{VERSION}"

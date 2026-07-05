@@ -10,18 +10,20 @@ PackageName: Lunar
 PackageUrl: https://github.com/anafalanx/lunar
 License: MIT
 LicenseUrl: https://github.com/anafalanx/lunar/blob/main/LICENSE
-ShortDescription: A minimalist analog clock for Windows.
+ShortDescription: A trusted-time dashboard for Windows.
 Description: >-
-  Lunar is a minimalist analog desktop clock for Windows. Single-file
-  native executable (Direct2D rendering, static C runtime), with
-  authenticated network time sync (NTS), time-zone awareness, and
-  optional chimes. No installer, no runtime dependencies.
+  Lunar is a minimalist digital time dashboard for Windows. It keeps its
+  own cryptographically-attested timescale — disciplined by authenticated
+  NTS consensus, never the OS clock — and shows the true time, how certain
+  it is, and when your PC's own clock is wrong. A single self-contained,
+  Authenticode-signed executable (C engine + statically-linked Tcl/Tk):
+  no installer, no runtime dependencies.
 Tags:
   - clock
-  - analog-clock
   - time
   - ntp
   - nts
+  - time-sync
   - desktop
 ManifestType: defaultLocale
 ManifestVersion: 1.6.0
