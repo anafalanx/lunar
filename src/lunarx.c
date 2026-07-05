@@ -50,25 +50,46 @@ static const char *auth_name(NtpAuthMode m) {
 
 #define PUT(d, k, v) Tcl_DictObjPut(ip, (d), Tcl_NewStringObj((k), -1), (v))
 
-/* ---- chime (ported verbatim from the Win32 shell's PlayBeep) -----------
- * A single 880 Hz / 250 ms sine chime rendered to an in-memory WAV and
- * played async, volume-compensated against the system master slider. */
+/* ---- chime -------------------------------------------------------------
+ * An 880 Hz / 250 ms sine chime, volume-compensated against the system
+ * master slider, played from an in-memory WAV.
+ *
+ * Reliability (why this is more than a PlaySound one-liner): Windows parks
+ * an idle render endpoint in device power state D3. The first sound after
+ * that idle forces a D3->D0 wake whose documented exit latency is up to
+ * 35-300 ms (PortCls IAdapterPowerManagement3::D3ExitLatencyChanged), during
+ * which the codec/amp are still ramping and the mixer drops the leading
+ * samples -- so the tone's onset is clipped to a click. (This is exactly why
+ * the very first mark-chime clicked but every Test press right after played
+ * cleanly: the endpoint was warm by then.) To render the tone into an awake,
+ * settled endpoint we prepend ~300 ms of digital silence: the wake/settle
+ * lands on the silence, and the 880 Hz section starts only once the device
+ * is streaming. The play runs SND_SYNC on a short-lived worker thread from a
+ * PRIVATE heap buffer (so the buffer is valid for the whole play and
+ * concurrent chimes can't corrupt it), gated by a busy flag so an
+ * overlapping request is dropped rather than cancelling the one in flight
+ * (PlaySound is process-global-single-sound: a second play would otherwise
+ * truncate the first). SND_NODEFAULT keeps a cold-open failure from
+ * substituting the Windows 'ding'. */
 extern float Sysvol_Get(void);   /* sysvol.c (compiled into the engine) */
 
 #define BEEP_SAMPLE_RATE 44100
-#define BEEP_FRAMES      (BEEP_SAMPLE_RATE / 4)          /* 250 ms */
-#define BEEP_FREQ_HZ     880.0f                          /* A5 */
+#define BEEP_PREWARM_MS  300                              /* covers the worst-case D3->D0 wake */
+#define BEEP_TONE_MS     250
+#define BEEP_PREWARM_FRAMES (BEEP_SAMPLE_RATE * BEEP_PREWARM_MS / 1000)
+#define BEEP_TONE_FRAMES    (BEEP_SAMPLE_RATE * BEEP_TONE_MS / 1000)
+#define BEEP_TOTAL_FRAMES   (BEEP_PREWARM_FRAMES + BEEP_TONE_FRAMES)
+#define BEEP_FREQ_HZ     880.0f                           /* A5 */
 #define BEEP_TARGET_SPEAKER_AMPLITUDE 0.276f
-#define BEEP_DATA_BYTES  (BEEP_FRAMES * 2)
+#define BEEP_DATA_BYTES  (BEEP_TOTAL_FRAMES * 2)
 #define BEEP_BUF_BYTES   (44 + BEEP_DATA_BYTES)
 
-static unsigned char g_wav[BEEP_BUF_BYTES];
 static void WriteLE16(unsigned char *p, uint16_t v) { p[0]=v&0xFF; p[1]=(v>>8)&0xFF; }
 static void WriteLE32(unsigned char *p, uint32_t v) {
     p[0]=v&0xFF; p[1]=(v>>8)&0xFF; p[2]=(v>>16)&0xFF; p[3]=(v>>24)&0xFF;
 }
-static void BuildWav(float freqHz, float amplitude) {
-    unsigned char *p = g_wav;
+static void BuildWav(unsigned char *buf, float freqHz, float amplitude) {
+    unsigned char *p = buf;
     memcpy(p, "RIFF", 4);               p += 4;
     WriteLE32(p, 36 + BEEP_DATA_BYTES); p += 4;
     memcpy(p, "WAVE", 4);               p += 4;
@@ -82,13 +103,15 @@ static void BuildWav(float freqHz, float amplitude) {
     WriteLE16(p, 16);                   p += 2;
     memcpy(p, "data", 4);               p += 4;
     WriteLE32(p, BEEP_DATA_BYTES);      p += 4;
+    /* Leading silence warms a D3-parked endpoint before the tone renders. */
+    for (int i = 0; i < BEEP_PREWARM_FRAMES; i++) { WriteLE16(p, 0); p += 2; }
     const float TAU = 6.28318530717958647692f;
     const float attackFrames  = BEEP_SAMPLE_RATE * 0.010f;
     const float releaseFrames = BEEP_SAMPLE_RATE * 0.030f;
-    for (int i = 0; i < BEEP_FRAMES; i++) {
+    for (int i = 0; i < BEEP_TONE_FRAMES; i++) {
         float env = 1.0f;
-        if (i < attackFrames)                     env = (float)i / attackFrames;
-        else if (i > BEEP_FRAMES - releaseFrames) env = (BEEP_FRAMES - i) / releaseFrames;
+        if (i < attackFrames)                          env = (float)i / attackFrames;
+        else if (i > BEEP_TONE_FRAMES - releaseFrames) env = (BEEP_TONE_FRAMES - i) / releaseFrames;
         float s = sinf(TAU * freqHz * (float)i / BEEP_SAMPLE_RATE) * env * amplitude;
         int v = (int)(s * 32767.0f);
         if (v >  32767) v =  32767;
@@ -97,15 +120,52 @@ static void BuildWav(float freqHz, float amplitude) {
         p += 2;
     }
 }
-static void PlayBeepImpl(void) {
+
+static volatile LONG g_beepBusy   = 0;      /* 1 while a chime is playing */
+static HANDLE        g_beepThread  = nullptr; /* current worker (UI-thread only) */
+
+static DWORD WINAPI BeepThread([[maybe_unused]] LPVOID arg) {
+    /* Read the volume here (not on the UI thread) so the amplitude reflects
+     * the endpoint at render time and the COM/audio touch doesn't jitter
+     * the UI. Sysvol_Get returns 0.0 when muted; skip in that case. */
     float v = Sysvol_Get();
-    if (v <= 0.01f) return;
-    float amp = BEEP_TARGET_SPEAKER_AMPLITUDE / v;
-    if (amp > 0.90f) amp = 0.90f;
-    if (amp < 0.05f) amp = 0.05f;
-    BuildWav(BEEP_FREQ_HZ, amp);
-    PlaySoundW((LPCWSTR)g_wav, NULL, SND_MEMORY | SND_ASYNC);
+    if (v > 0.01f) {
+        float amp = BEEP_TARGET_SPEAKER_AMPLITUDE / v;
+        if (amp > 0.90f) amp = 0.90f;
+        if (amp < 0.05f) amp = 0.05f;
+        unsigned char *buf = (unsigned char *)HeapAlloc(GetProcessHeap(), 0, BEEP_BUF_BYTES);
+        if (buf) {
+            BuildWav(buf, BEEP_FREQ_HZ, amp);
+            PlaySoundW((LPCWSTR)buf, NULL, SND_MEMORY | SND_SYNC | SND_NODEFAULT);
+            HeapFree(GetProcessHeap(), 0, buf);
+        }
+    }
+    InterlockedExchange(&g_beepBusy, 0);
+    return 0;
 }
+
+static void PlayBeepImpl(void) {
+    /* Drop an overlapping request instead of queuing or truncating: if a
+     * chime is already in flight (rapid Test clicks, or a Test press during
+     * a mark chime), ignore the new one. */
+    if (InterlockedCompareExchange(&g_beepBusy, 1, 0) != 0) return;
+    /* busy just went 0->1, so any previous worker has finished; reap it. */
+    if (g_beepThread) { CloseHandle(g_beepThread); g_beepThread = nullptr; }
+    HANDLE t = CreateThread(nullptr, 0, BeepThread, nullptr, 0, nullptr);
+    if (!t) { InterlockedExchange(&g_beepBusy, 0); return; }
+    g_beepThread = t;
+}
+
+/* Stop any in-flight chime and reap its worker. Called on the shutdown
+ * paths so process teardown cannot race the play thread freeing its
+ * buffer. UI-thread only (same as PlayBeepImpl), so g_beepThread is safe. */
+static void Beep_Shutdown(void) {
+    PlaySoundW(nullptr, nullptr, 0);   /* abort any in-flight SND_SYNC play */
+    HANDLE t = g_beepThread;
+    if (t) { WaitForSingleObject(t, 1500); CloseHandle(t); g_beepThread = nullptr; }
+    InterlockedExchange(&g_beepBusy, 0);
+}
+
 /* lunar::beep -- play the chime once. */
 static int Beep_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
                     int objc, Tcl_Obj *const objv[]) {
@@ -145,6 +205,7 @@ static int SyncNow_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
 static int Shutdown_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
                         int objc, Tcl_Obj *const objv[]) {
     if (objc != 1) { Tcl_WrongNumArgs(ip, 1, objv, ""); return TCL_ERROR; }
+    Beep_Shutdown();
     Ntp_Shutdown();
     Clock_Shutdown();
     Log_FlushToDisk(NULL);
@@ -366,6 +427,7 @@ static LRESULT CALLBACK TraySubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
          * disciplined rate + the diagnostic log NOW (we run on the Tk
          * thread, so calling the engine directly is safe). No Ntp_Shutdown
          * -- its worker drain could eat the seconds Windows grants us. */
+        Beep_Shutdown();
         Clock_Shutdown();
         Log_FlushToDisk(NULL);
         return 0;

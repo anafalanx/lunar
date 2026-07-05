@@ -869,6 +869,12 @@ proc lunar::main {} {
     if {[info exists ::env(LUNAR_OPEN_SETTINGS)] && $::env(LUNAR_OPEN_SETTINGS) ne ""} { after 400 lunar::settings_dlg }
     if {[info exists ::env(LUNAR_OPEN_ABOUT)]    && $::env(LUNAR_OPEN_ABOUT)    ne ""} { after 400 lunar::about_dlg }
     if {[info exists ::env(LUNAR_OPEN_LOG)]      && $::env(LUNAR_OPEN_LOG)      ne ""} { after 400 lunar::log_dlg }
+    # LUNAR_BEEP=<n>: fire the chime n times ~700ms apart on launch, for
+    # audio testing (cold-device reliability, overlap-drop). Default 1.
+    if {[info exists ::env(LUNAR_BEEP)] && $::env(LUNAR_BEEP) ne ""} {
+        set n [expr {[string is integer -strict $::env(LUNAR_BEEP)] ? $::env(LUNAR_BEEP) : 1}]
+        for {set b 0} {$b < $n} {incr b} { after [expr {600 + $b * 700}] { catch { ::lunar::beep } } }
+    }
 }
 
 lunar::main
