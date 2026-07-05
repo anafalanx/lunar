@@ -361,6 +361,17 @@ proc task_shot {args} {
     }
 }
 
+# uishot -- capture a deterministic (stubbed-engine) UI state for review.
+# States: collapsed (default) | expanded. See tools/uishot.tcl.
+proc task_uishot {args} {
+    need gcc tclsh
+    if {![llength $args]} { error "usage: z uishot <out.png> \[collapsed|expanded]" }
+    if {![file exists [P build cap.dll]]} { puts "building capture extension..." ; task_build-ext }
+    set out   [lindex $args 0]
+    set state [expr {[llength $args] > 1 ? [lindex $args 1] : "collapsed"}]
+    stream [tclsh] [P tools shot.tcl] [wish] [P tools uishot.tcl] $out $state
+}
+
 # ---- dispatch -----------------------------------------------------------
 set cmd [lindex $argv 0]
 if {$cmd eq ""} { set cmd help }

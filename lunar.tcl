@@ -291,8 +291,8 @@ proc lunar::fmt_utcoff {offSec} {
 # ---- the dashboard ----------------------------------------------------------
 proc lunar::build {} {
     wm title . "Lunar $::lunar::version"
-    wm geometry . 540x430
-    wm minsize . 460 380
+    wm geometry . 588x430
+    wm minsize . 520 300
     lunar::init_style
     . configure -background $::lunar::PAGE
     catch { wm iconphoto . -default [image create photo -file [file join [file dirname [info script]] resources icon.png]] }
@@ -365,11 +365,16 @@ proc lunar::build {} {
     label .sb.zone   -bg $::lunar::CHROME -fg $::lunar::MUTED -font lunarUI -anchor e -text "" -cursor hand2
     frame .sb.sep1 -width 1 -bg $::lunar::HAIR
     label .sb.update -bg $::lunar::CHROME -fg $::lunar::ACCENT -font lunarUI -anchor e -text "" -cursor hand2
-    pack .sb.hair   -side top -fill x
-    pack .sb.sys    -side left  -padx {12 8} -pady 4
-    pack .sb.zone   -side right -padx {8 12} -pady 4
-    pack .sb.sep1   -side right -padx {2 2}  -pady {7 6} -fill y
-    pack .sb.update -side right -padx {8 2}  -pady 4
+    # Hairline on top; then one gridded row. Grid (not pack -side left/right)
+    # partitions the width, so the right-hand zone stays pinned and fully
+    # visible while the left PC-clock label is bounded to its weighted column
+    # and clips its own (redundant) tail instead of overrunning into the zone.
+    grid .sb.hair   -row 0 -column 0 -columnspan 4 -sticky ew
+    grid .sb.sys    -row 1 -column 0 -sticky ew -padx {12 8} -pady {6 7}
+    grid .sb.update -row 1 -column 1 -sticky e  -padx {8 2}  -pady {6 7}
+    grid .sb.sep1   -row 1 -column 2 -sticky ns -padx {2 2}  -pady {8 9}
+    grid .sb.zone   -row 1 -column 3 -sticky e  -padx {8 14} -pady {6 7}
+    grid columnconfigure .sb 0 -weight 1
     bind .sb.zone <Button-1> lunar::settings_dlg
     bind .sb.zone <Enter> { .sb.zone configure -fg $::lunar::INK }
     bind .sb.zone <Leave> { .sb.zone configure -fg $::lunar::MUTED }
@@ -378,35 +383,55 @@ proc lunar::build {} {
     # the slack so the status bar stays pinned to the bottom and nothing in the
     # face gets squeezed out.
     frame .gap -bg $P
-    grid .face -row 0 -column 0 -sticky ew
-    grid .src  -row 1 -column 0 -sticky ew -pady {0 12}
-    grid .gap  -row 2 -column 0 -sticky nsew
-    grid .sb   -row 3 -column 0 -sticky ew
-    grid rowconfigure    . 2 -weight 1
-    grid columnconfigure . 0 -weight 1
+    # Status bar is packed to the bottom FIRST, so it can never be clipped no
+    # matter how tall the content above grows; the expanding gap frame takes
+    # any slack between the sources and the status bar. lunar::fit_height then
+    # snaps the window to the content so there is neither a clipped bar nor a
+    # yawning gap in either panel state.
+    pack .sb   -side bottom -fill x
+    pack .face -side top -fill x
+    pack .src  -side top -fill x -pady {0 12}
+    pack .gap  -side top -fill both -expand 1
 
     bind .sb.update <Button-1> { catch { exec {*}[auto_execok start] "" \
         "https://github.com/anafalanx/lunar/releases/latest" & } }
     wm protocol . WM_DELETE_WINDOW lunar::quit
     lunar::tray_setup
+    after idle { catch { lunar::fit_height } }   ;# snap to content once realized
+}
+
+# Snap the window height to exactly fit its current content (preserving width
+# and position). Used after any change that alters content height, so the
+# status bar is always visible and there is never a large empty gap.
+proc lunar::fit_height {} {
+    # Defer until the window is actually mapped: before that, [winfo width]
+    # and the geometry string report placeholder sizes, and we'd clamp the
+    # width down to the minimum (chopping the big time readout).
+    if {![winfo ismapped .]} { after 60 lunar::fit_height ; return }
+    update idletasks
+    set w    [winfo width .]        ;# real current width (never a bogus 1x1)
+    # content height + a small margin so the expanding gap frame keeps a
+    # consistent band of breathing room above the bottom status bar (rather
+    # than the dense source rows butting straight against it when expanded).
+    set need [expr {[winfo reqheight .] + 14}]
+    set pos ""
+    regexp {([+-]\d+[+-]\d+)$} [wm geometry .] pos
+    catch { wm geometry . ${w}x${need}${pos} }
 }
 
 # Collapsible SOURCES panel: show/hide the rows, flip the disclosure glyph,
-# and grow/shrink the window to fit (preserving its width + position).
+# and resize the window to fit the new content.
 proc lunar::toggle_sources {} {
-    regexp {^(\d+)x(\d+)(.*)$} [wm geometry .] -> w h pos
     if {$::lunar::sources_open} {
         pack forget .src.rows
         set ::lunar::sources_open 0
         .src.hdr configure -text "▸ SOURCES"
-        set nh 430
     } else {
         pack .src.rows -fill x -after .src.hdr -pady {2 0}
         set ::lunar::sources_open 1
         .src.hdr configure -text "▾ SOURCES"
-        set nh 580
     }
-    catch { wm geometry . ${w}x${nh}${pos} }
+    lunar::fit_height
 }
 
 # ---- menu actions: copy time, always-on-top, About, log viewer --------------
@@ -786,7 +811,7 @@ proc lunar::render {st} {
     .face.status.state configure -text $txt -fg $col
 
     if {[dict get $st sysDeltaValid]} {
-        .sb.sys configure -text "PC clock: [lunar::fmt_delta [dict get $st sysDeltaMs]] vs Lunar"
+        .sb.sys configure -text "System: [lunar::fmt_delta [dict get $st sysDeltaMs]]"
     } else {
         .sb.sys configure -text ""
     }
