@@ -23,6 +23,8 @@
 #include "update_check.h"
 #include "tz.h"
 #include "tz_winmap.h"
+#include "logbuf.h"
+#include "version.h"
 
 static const char *trust_name(TrustState s) {
     switch (s) {
@@ -70,13 +72,39 @@ static int SyncNow_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
     return TCL_OK;
 }
 
-/* lunar::shutdown -- drain workers + persist rate before the process exits. */
+/* lunar::shutdown -- drain workers, persist rate + the diagnostic log
+ * before the process exits (crash-survival parity with the Win32 shell). */
 static int Shutdown_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
                         int objc, Tcl_Obj *const objv[]) {
     if (objc != 1) { Tcl_WrongNumArgs(ip, 1, objv, ""); return TCL_ERROR; }
     Ntp_Shutdown();
     Clock_Shutdown();
+    Log_FlushToDisk(NULL);
     Tcl_SetObjResult(ip, Tcl_NewObj());
+    return TCL_OK;
+}
+
+/* lunar::log_text -- the whole in-memory event log, oldest first, as one
+ * \r\n-delimited string (what the Log viewer shows). */
+static int LogText_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
+                       int objc, Tcl_Obj *const objv[]) {
+    if (objc != 1) { Tcl_WrongNumArgs(ip, 1, objv, ""); return TCL_ERROR; }
+    size_t need = Log_Snapshot(NULL, 0);
+    char *buf = (char *)Tcl_Alloc(need + 1);
+    size_t n = Log_Snapshot(buf, need + 1);
+    Tcl_SetObjResult(ip, Tcl_NewStringObj(buf, (Tcl_Size)n));
+    Tcl_Free(buf);
+    return TCL_OK;
+}
+
+/* lunar::about -- {version X tzdata Y} for the About box. */
+static int About_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
+                     int objc, Tcl_Obj *const objv[]) {
+    if (objc != 1) { Tcl_WrongNumArgs(ip, 1, objv, ""); return TCL_ERROR; }
+    Tcl_Obj *d = Tcl_NewDictObj();
+    PUT(d, "version", Tcl_NewStringObj(LUNAR_VERSION_STR, -1));
+    PUT(d, "tzdata",  Tcl_NewStringObj(Tz_Version(), -1));
+    Tcl_SetObjResult(ip, d);
     return TCL_OK;
 }
 
@@ -398,6 +426,8 @@ int Lunarx_Init(Tcl_Interp *ip) {
     Tcl_CreateObjCommand(ip, "::lunar::tray_tip",     TrayTip_Cmd,     nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::tray_remove",  TrayRemove_Cmd,  nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::run_at_startup", RunAtStartup_Cmd, nullptr, nullptr);
+    Tcl_CreateObjCommand(ip, "::lunar::log_text",     LogText_Cmd,     nullptr, nullptr);
+    Tcl_CreateObjCommand(ip, "::lunar::about",        About_Cmd,       nullptr, nullptr);
     if (Tcl_PkgProvide(ip, "lunarx", "0.1") != TCL_OK) return TCL_ERROR;
     return TCL_OK;
 }

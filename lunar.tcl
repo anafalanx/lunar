@@ -60,6 +60,8 @@ font create lunarState -family {Segoe UI Semibold} -size 11
 font create lunarMono  -family Consolas   -size 9
 font create lunarHdr   -family {Segoe UI Semibold} -size 8
 font create lunarUIb   -family {Segoe UI} -size 9 -weight bold
+font create lunarTitle -family {Segoe UI Light} -size 32
+set ::lunar::ontop 0
 
 proc lunar::init_style {} {
     set s ttk::style
@@ -224,6 +226,27 @@ proc lunar::build {} {
     . configure -background $::lunar::PAGE
     catch { wm iconphoto . -default [image create photo -file [file join [file dirname [info script]] resources icon.png]] }
 
+    # menubar
+    menu .menu -tearoff 0
+    . configure -menu .menu
+    menu .menu.lunar -tearoff 0
+    .menu add cascade -label "Lunar" -menu .menu.lunar
+    .menu.lunar add command -label "Sync now"     -accelerator "Ctrl+R" -command { catch { ::lunar::syncnow } }
+    .menu.lunar add command -label "Copy time"    -accelerator "Ctrl+C" -command lunar::copy_time
+    .menu.lunar add separator
+    .menu.lunar add command -label "Settings…"    -accelerator "Ctrl+," -command lunar::settings_dlg
+    .menu.lunar add separator
+    .menu.lunar add command -label "About Lunar"  -command lunar::about_dlg
+    .menu.lunar add separator
+    .menu.lunar add command -label "Exit"         -command lunar::quit
+    menu .menu.view -tearoff 0
+    .menu add cascade -label "View" -menu .menu.view
+    .menu.view add command     -label "Event log…"     -command lunar::log_dlg
+    .menu.view add checkbutton -label "Always on top" -variable ::lunar::ontop -command lunar::apply_ontop
+    bind . <Control-r>     { catch { ::lunar::syncnow } ; break }
+    bind . <Control-c>     { lunar::copy_time ; break }
+    bind . <Control-comma> { lunar::settings_dlg ; break }
+
     set P $::lunar::PAGE
     frame .face -bg $P
     label .face.time  -bg $P -fg $::lunar::INK   -font lunarBig   -text "--:--:--"
@@ -284,6 +307,99 @@ proc lunar::build {} {
         "https://github.com/anafalanx/lunar/releases/latest" & } }
     wm protocol . WM_DELETE_WINDOW lunar::quit
     lunar::tray_setup
+}
+
+# ---- menu actions: copy time, always-on-top, About, log viewer --------------
+proc lunar::apply_ontop {} { catch { wm attributes . -topmost $::lunar::ontop } }
+
+proc lunar::copy_time {} {
+    if {![llength [info commands ::lunar::status]]} return
+    set st [::lunar::status]
+    if {![dict get $st hasTime]} { lunar::status_note "no trusted time yet" ; return }
+    if {[catch { ::lunar::localtime [dict get $st utcMs] $::lunar::tz } lt]} return
+    set off [dict get $lt offSec]
+    set sign [expr {$off < 0 ? "-" : "+"}] ; set a [expr {abs($off)}]
+    set iso [format "%04d-%02d-%02dT%02d:%02d:%02d%s%02d:%02d" \
+        [dict get $lt year] [dict get $lt month] [dict get $lt day] \
+        [dict get $lt hour] [dict get $lt minute] [dict get $lt second] \
+        $sign [expr {$a / 3600}] [expr {($a % 3600) / 60}]]
+    clipboard clear ; clipboard append $iso
+    lunar::status_note "copied $iso"
+}
+
+proc lunar::about_dlg {} {
+    catch {destroy .about}
+    set P $::lunar::PAGE
+    toplevel .about -bg $P
+    wm withdraw .about
+    wm title .about "About Lunar" ; wm transient .about . ; wm resizable .about 0 0
+    set a [dict create version $::lunar::version tzdata "?"]
+    if {[llength [info commands ::lunar::about]]} { set a [::lunar::about] }
+    frame .about.c -bg $P ; pack .about.c -padx 40 -pady 30
+    label .about.c.name -bg $P -fg $::lunar::INK   -font lunarTitle -text "Lunar"
+    label .about.c.ver  -bg $P -fg $::lunar::MUTED -font lunarUI    -text "version [dict get $a version]"
+    label .about.c.tag  -bg $P -fg $::lunar::MUTED -font lunarUI    -text "Trustworthy network time for Windows."
+    label .about.c.tz   -bg $P -fg $::lunar::MUTED -font lunarSmall -text "embedded tzdata [dict get $a tzdata]  ·  MIT licensed"
+    pack .about.c.name -pady {0 4}
+    pack .about.c.ver  -pady {0 0}
+    pack .about.c.tag  -pady {10 0}
+    pack .about.c.tz   -pady {12 0}
+    bind .about <Escape> {destroy .about}
+    lunar::bindtree .about <Button-1> {destroy .about}
+    update idletasks
+    set x [expr {[winfo rootx .] + ([winfo width .]  - [winfo reqwidth .about])  / 2}]
+    set y [expr {[winfo rooty .] + ([winfo height .] - [winfo reqheight .about]) / 3}]
+    wm geometry .about +$x+$y ; wm deiconify .about ; focus .about
+}
+# bind an event to a widget and all its descendants (els helper)
+proc lunar::bindtree {w seq script} {
+    bind $w $seq $script
+    foreach c [winfo children $w] { lunar::bindtree $c $seq $script }
+}
+
+proc lunar::log_dlg {} {
+    if {[winfo exists .log]} { raise .log ; focus .log ; lunar::log_refresh ; return }
+    set P $::lunar::PAGE
+    toplevel .log -bg $P
+    wm title .log "Lunar — Event Log" ; wm geometry .log 760x480 ; wm transient .log .
+    frame .log.f -bg $P ; pack .log.f -fill both -expand 1 -padx 10 -pady 10
+    text .log.f.t -bg $P -fg $::lunar::INK -font lunarMono -wrap none \
+        -borderwidth 1 -relief solid -highlightthickness 0 -padx 8 -pady 6 \
+        -yscrollcommand {.log.f.vs set} -xscrollcommand {.log.f.hs set}
+    ttk::scrollbar .log.f.vs -orient vertical   -command {.log.f.t yview}
+    ttk::scrollbar .log.f.hs -orient horizontal -command {.log.f.t xview}
+    grid .log.f.t  -row 0 -column 0 -sticky nsew
+    grid .log.f.vs -row 0 -column 1 -sticky ns
+    grid .log.f.hs -row 1 -column 0 -sticky ew
+    grid rowconfigure    .log.f 0 -weight 1
+    grid columnconfigure .log.f 0 -weight 1
+    frame .log.b -bg $P ; pack .log.b -fill x -padx 10 -pady {0 10}
+    ttk::button .log.b.copy  -style Dialog.TButton -text "Copy all" -command lunar::log_copy
+    ttk::button .log.b.close -style Dialog.TButton -text "Close"    -command {destroy .log}
+    pack .log.b.close -side right
+    pack .log.b.copy  -side right -padx {0 8}
+    bind .log <Escape> {destroy .log}
+    lunar::log_refresh
+    lunar::log_refresh_loop
+}
+proc lunar::log_refresh {} {
+    if {![winfo exists .log.f.t] || ![llength [info commands ::lunar::log_text]]} return
+    set atbottom [expr {[lindex [.log.f.t yview] 1] > 0.999}]
+    .log.f.t configure -state normal
+    .log.f.t delete 1.0 end
+    .log.f.t insert end [::lunar::log_text]
+    .log.f.t configure -state disabled
+    if {$atbottom} { .log.f.t see end }
+}
+proc lunar::log_refresh_loop {} {
+    if {![winfo exists .log]} return
+    lunar::log_refresh
+    after 1000 lunar::log_refresh_loop
+}
+proc lunar::log_copy {} {
+    if {![llength [info commands ::lunar::log_text]]} return
+    clipboard clear ; clipboard append [::lunar::log_text]
+    lunar::status_note "log copied to clipboard"
 }
 
 # ---- Settings dialog ---------------------------------------------------------
@@ -621,6 +737,11 @@ proc lunar::main {} {
         return
     }
     lunar::settings_load
+    # single-source the version from the engine (VERSION -> version.h) so the
+    # title bar and About agree
+    if {[llength [info commands ::lunar::about]]} {
+        set ::lunar::version [dict get [::lunar::about] version]
+    }
     # the registry Run key is authoritative for run-at-startup (the user may
     # have toggled it via Task Manager/msconfig outside Lunar)
     if {[llength [info commands ::lunar::run_at_startup]]} {
@@ -641,10 +762,10 @@ proc lunar::main {} {
         after $::lunar::poll_ms lunar::repoll
     }
     after 100 lunar::tick
-    # dev hook: open the Settings dialog on launch, for screenshots/testing
-    if {[info exists ::env(LUNAR_OPEN_SETTINGS)] && $::env(LUNAR_OPEN_SETTINGS) ne ""} {
-        after 400 lunar::settings_dlg
-    }
+    # dev hooks: open a dialog on launch, for screenshots/testing
+    if {[info exists ::env(LUNAR_OPEN_SETTINGS)] && $::env(LUNAR_OPEN_SETTINGS) ne ""} { after 400 lunar::settings_dlg }
+    if {[info exists ::env(LUNAR_OPEN_ABOUT)]    && $::env(LUNAR_OPEN_ABOUT)    ne ""} { after 400 lunar::about_dlg }
+    if {[info exists ::env(LUNAR_OPEN_LOG)]      && $::env(LUNAR_OPEN_LOG)      ne ""} { after 400 lunar::log_dlg }
 }
 
 lunar::main
