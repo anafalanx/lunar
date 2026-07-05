@@ -59,6 +59,7 @@ font create lunarSmall -family {Segoe UI} -size 9
 font create lunarState -family {Segoe UI Semibold} -size 11
 font create lunarMono  -family Consolas   -size 9
 font create lunarHdr   -family {Segoe UI Semibold} -size 8
+font create lunarUIb   -family {Segoe UI} -size 9 -weight bold
 
 proc lunar::init_style {} {
     set s ttk::style
@@ -67,6 +68,25 @@ proc lunar::init_style {} {
     $s configure . -background $bg -foreground $ink -font lunarUI \
         -borderwidth 0 -focuscolor $bg -troughcolor $::lunar::PAGE \
         -bordercolor $hair -darkcolor $bg -lightcolor $bg
+    # entries: flat, page-coloured field, hairline border; focus = a firmer
+    # grey, never red (els: red is reserved for the accent). Dialogs sit on
+    # PAGE, so give dialog widgets a Page background variant too.
+    $s configure TEntry -relief flat -borderwidth 1 -padding {6 4} \
+        -fieldbackground $::lunar::PAGE -foreground $ink -insertcolor $ink \
+        -bordercolor $hair -lightcolor $hair -darkcolor $hair
+    $s map TEntry -bordercolor [list focus "#A6ACB4"] \
+        -lightcolor [list focus "#A6ACB4"] -darkcolor [list focus "#A6ACB4"]
+    # dialog buttons read as buttons even before hover (els Dialog.TButton)
+    $s configure Dialog.TButton -background $::lunar::PAGE -foreground $ink \
+        -borderwidth 1 -relief solid -padding {10 5} -anchor center \
+        -bordercolor $hair -lightcolor $hair -darkcolor $hair
+    $s map Dialog.TButton -background [list pressed $hair active "#DEDEDE"] \
+        -foreground [list disabled $::lunar::MUTED]
+    # a traditional scrollbar, arrow size in POINTS so it scales per-DPI
+    $s configure Vertical.TScrollbar -troughcolor $::lunar::PAGE \
+        -background #BCBCBC -arrowcolor #4A4A4A -bordercolor #9A9A9A \
+        -relief raised -borderwidth 1 -arrowsize 12p
+    $s map Vertical.TScrollbar -background [list active #A4A4A4 disabled $::lunar::PAGE]
 }
 
 # ---- state -> (label, colour) ----------------------------------------------
@@ -92,6 +112,102 @@ proc lunar::fmt_bound {ms} {
 proc lunar::fmt_delta {ms} {
     set s [expr {$ms / 1000.0}]
     return [format "%+.2f s" $s]
+}
+
+# ---- settings (same file + format + semantics as the Win32 shell) -----------
+# %APPDATA%\Lunar\settings.dat, one key=value per line. Keys this shell does
+# not own (chimes/unmin/confirm/tray/startup) are preserved verbatim so the
+# two shells can be swapped without losing anything. The PRESENCE of the tz=
+# key -- even empty, meaning explicit UTC -- counts as a deliberate choice;
+# only then does first-run OS-zone suggestion stop.
+set ::lunar::cfg [dict create fmt24 1]
+set ::lunar::cfg_extra {}       ;# unowned lines, kept in file order
+set ::lunar::tz "UTC"           ;# the active display zone
+set ::lunar::tz_chosen 0
+
+proc lunar::settings_load {} {
+    set path [file join [lunar::datadir] settings.dat]
+    if {[catch {open $path r} fh]} { return }
+    set raw [read $fh] ; close $fh
+    foreach line [split $raw \n] {
+        set line [string trimright $line \r]
+        if {$line eq ""} continue
+        if {![regexp {^([a-z0-9]+)=(.*)$} $line -> k v]} continue
+        switch $k {
+            fmt24   { dict set ::lunar::cfg fmt24 [expr {$v ? 1 : 0}] }
+            tz      { set ::lunar::tz_chosen 1 ; dict set ::lunar::cfg tz $v }
+            default { lappend ::lunar::cfg_extra $line }
+        }
+    }
+}
+
+proc lunar::settings_save {} {
+    set dir [lunar::datadir]
+    if {[catch {file mkdir $dir}]} { return }
+    set lines $::lunar::cfg_extra
+    lappend lines "fmt24=[dict get $::lunar::cfg fmt24]"
+    lappend lines "tz=[expr {$::lunar::tz eq "UTC" ? "" : $::lunar::tz}]"
+    set path [file join $dir settings.dat]
+    set tmp  "$path.new"
+    if {[catch {
+        set fh [open $tmp w] ; fconfigure $fh -translation lf
+        puts $fh [join $lines \n] ; close $fh
+        file rename -force $tmp $path
+    } err]} {
+        catch { file delete -force $tmp }
+        lunar::log "\[settings\] save failed: $err"
+    }
+}
+
+# Resolve the display zone at startup: an explicit (valid) choice wins, else
+# suggest the OS zone by NAME (not trusting the OS clock), else UTC.
+proc lunar::tz_startup {} {
+    set have_engine [llength [info commands ::lunar::localtime]]
+    if {$::lunar::tz_chosen} {
+        set want [dict get $::lunar::cfg tz]
+        if {$want eq ""} { set want "UTC" }
+        if {!$have_engine || ![catch { ::lunar::localtime 0 $want }]} {
+            set ::lunar::tz $want
+            return
+        }
+        lunar::log "\[tz\] configured zone '$want' not in embedded index; using UTC"
+        set ::lunar::tz "UTC"
+        return
+    }
+    if {$have_engine && [llength [info commands ::lunar::tz_suggest]]} {
+        set sug [::lunar::tz_suggest]
+        if {$sug ne "" && ![catch { ::lunar::localtime 0 $sug }]} {
+            set ::lunar::tz $sug
+            lunar::log "\[tz\] first run: suggesting OS zone $sug"
+        }
+    }
+}
+
+# ---- wall-clock formatting off the embedded tzdata --------------------------
+set ::lunar::DAYS   {Sunday Monday Tuesday Wednesday Thursday Friday Saturday}
+set ::lunar::MONTHS {January February March April May June July \
+                     August September October November December}
+
+proc lunar::fmt_time {lt} {
+    set h [dict get $lt hour]
+    if {[dict get $::lunar::cfg fmt24]} {
+        return [format "%02d:%02d:%02d" $h [dict get $lt minute] [dict get $lt second]]
+    }
+    set ap [expr {$h >= 12 ? "PM" : "AM"}]
+    set h [expr {$h % 12}] ; if {$h == 0} { set h 12 }
+    return [format "%d:%02d:%02d %s" $h [dict get $lt minute] [dict get $lt second] $ap]
+}
+proc lunar::fmt_date {lt} {
+    set wd [lindex $::lunar::DAYS   [dict get $lt wday]]
+    set mo [lindex $::lunar::MONTHS [expr {[dict get $lt month] - 1}]]
+    return "$wd, [format %02d [dict get $lt day]] $mo [dict get $lt year]"
+}
+proc lunar::fmt_utcoff {offSec} {
+    set sign [expr {$offSec < 0 ? "-" : "+"}]
+    set a [expr {abs($offSec)}]
+    set h [expr {$a / 3600}] ; set m [expr {($a % 3600) / 60}]
+    if {$m} { return "UTC$sign$h:[format %02d $m]" }
+    return "UTC$sign$h"
 }
 
 # ---- the dashboard ----------------------------------------------------------
@@ -132,14 +248,21 @@ proc lunar::build {} {
         pack $r -fill x -padx 24
     }
 
-    # status bar: hairline + muted labels (els idiom)
+    # status bar: hairline + muted labels, clickable zone indicator (els idiom)
     frame .sb -bg $::lunar::CHROME
     frame .sb.hair -height 1 -bg $::lunar::HAIR
     label .sb.sys    -bg $::lunar::CHROME -fg $::lunar::MUTED -font lunarUI -anchor w -text ""
+    label .sb.zone   -bg $::lunar::CHROME -fg $::lunar::MUTED -font lunarUI -anchor e -text "" -cursor hand2
+    frame .sb.sep1 -width 1 -bg $::lunar::HAIR
     label .sb.update -bg $::lunar::CHROME -fg $::lunar::ACCENT -font lunarUI -anchor e -text "" -cursor hand2
     pack .sb.hair   -side top -fill x
     pack .sb.sys    -side left  -padx {12 8} -pady 4
-    pack .sb.update -side right -padx {8 12} -pady 4
+    pack .sb.zone   -side right -padx {8 12} -pady 4
+    pack .sb.sep1   -side right -padx {2 2}  -pady {7 6} -fill y
+    pack .sb.update -side right -padx {8 2}  -pady 4
+    bind .sb.zone <Button-1> lunar::settings_dlg
+    bind .sb.zone <Enter> { .sb.zone configure -fg $::lunar::INK }
+    bind .sb.zone <Leave> { .sb.zone configure -fg $::lunar::MUTED }
 
     # face + sources take their natural height; a page-coloured spacer absorbs
     # the slack so the status bar stays pinned to the bottom and nothing in the
@@ -155,6 +278,129 @@ proc lunar::build {} {
     bind .sb.update <Button-1> { catch { exec {*}[auto_execok start] "" \
         "https://github.com/anafalanx/lunar/releases/latest" & } }
     wm protocol . WM_DELETE_WINDOW lunar::quit
+}
+
+# ---- Settings dialog ---------------------------------------------------------
+# els dialog idiom: a plain toplevel over PAGE, built off-screen, centered over
+# the main window, Escape closes. Zone picker = filter entry + listbox with a
+# live "current time in selected zone" preview off the disciplined clock.
+proc lunar::settings_dlg {} {
+    catch {destroy .set}
+    set P $::lunar::PAGE
+    toplevel .set -bg $P
+    wm withdraw .set
+    wm title .set "Lunar Settings"
+    wm transient .set .
+    wm resizable .set 0 0
+
+    frame .set.card -bg $P
+    pack  .set.card -padx 26 -pady 20
+    set c .set.card
+
+    label $c.zhdr -bg $P -fg $::lunar::INK -font lunarUIb -anchor w -text "Display time zone"
+    frame $c.zf -bg $P
+    label $c.zf.l -bg $P -fg $::lunar::MUTED -font lunarUI -text "Filter:"
+    ttk::entry $c.zf.e -font lunarUI -width 32 -textvariable ::lunar::set_filter
+    pack $c.zf.l -side left -padx {0 6}
+    pack $c.zf.e -side left -fill x -expand 1
+    frame $c.zl -bg $P
+    listbox $c.zl.list -height 9 -font lunarUI -bg $P -fg $::lunar::INK \
+        -selectbackground "#D6E2F2" -selectforeground $::lunar::INK \
+        -borderwidth 1 -relief solid -highlightthickness 0 -exportselection 0 \
+        -yscrollcommand [list $c.zl.vs set]
+    ttk::scrollbar $c.zl.vs -orient vertical -command [list $c.zl.list yview]
+    pack $c.zl.vs   -side right -fill y
+    pack $c.zl.list -side left -fill both -expand 1
+    label $c.zprev -bg $P -fg $::lunar::MUTED -font lunarUI -anchor w -text ""
+
+    checkbutton $c.fmt24 -bg $P -fg $::lunar::INK -font lunarUI -anchor w \
+        -activebackground $P -selectcolor $P \
+        -text "Use 24-hour clock" -variable ::lunar::set_fmt24
+    frame $c.btns -bg $P
+    ttk::button $c.btns.ok     -style Dialog.TButton -text "OK"     -command lunar::settings_ok
+    ttk::button $c.btns.cancel -style Dialog.TButton -text "Cancel" -command {destroy .set}
+    pack $c.btns.cancel -side right
+    pack $c.btns.ok     -side right -padx {0 8}
+
+    pack $c.zhdr  -fill x -pady {0 6}
+    pack $c.zf    -fill x -pady {0 6}
+    pack $c.zl    -fill x
+    pack $c.zprev -fill x -pady {4 0}
+    pack $c.fmt24 -fill x -pady {14 0}
+    pack $c.btns  -fill x -pady {18 0}
+
+    set ::lunar::set_filter ""
+    set ::lunar::set_fmt24 [dict get $::lunar::cfg fmt24]
+    trace add variable ::lunar::set_filter write {apply {{args} {lunar::settings_fill}}}
+    bind $c.zl.list <<ListboxSelect>> lunar::settings_preview
+    bind .set <Escape> {destroy .set}
+    lunar::settings_fill
+
+    update idletasks
+    set x [expr {[winfo rootx .] + ([winfo width .]  - [winfo reqwidth .set]) / 2}]
+    set y [expr {[winfo rooty .] + ([winfo height .] - [winfo reqheight .set]) / 3}]
+    wm geometry .set +$x+$y
+    wm deiconify .set
+    focus $c.zf.e
+    lunar::settings_preview_loop
+}
+
+# repopulate the zone list from the filter; keep the active zone selected
+proc lunar::settings_fill {} {
+    set lb .set.card.zl.list
+    if {![winfo exists $lb]} return
+    set pat [string tolower [string trim $::lunar::set_filter]]
+    $lb delete 0 end
+    set sel -1 ; set i 0
+    set zones [expr {[llength [info commands ::lunar::tz_list]] ? [::lunar::tz_list] : {UTC}}]
+    foreach z $zones {
+        if {$pat ne "" && ![string match "*$pat*" [string tolower $z]]} continue
+        $lb insert end $z
+        if {$z eq $::lunar::tz} { set sel $i }
+        incr i
+    }
+    if {$sel >= 0} { $lb selection set $sel ; $lb see $sel }
+    lunar::settings_preview
+}
+
+proc lunar::settings_sel {} {
+    set lb .set.card.zl.list
+    if {![winfo exists $lb]} { return "" }
+    set s [$lb curselection]
+    if {$s eq ""} { return "" }
+    return [$lb get [lindex $s 0]]
+}
+
+proc lunar::settings_preview {} {
+    set pv .set.card.zprev
+    if {![winfo exists $pv]} return
+    set z [lunar::settings_sel]
+    if {$z eq ""} { $pv configure -text "" ; return }
+    set txt "Current time: —"
+    if {[llength [info commands ::lunar::status]]} {
+        set st [::lunar::status]
+        if {[dict get $st hasTime] &&
+            ![catch { ::lunar::localtime [dict get $st utcMs] $z } lt]} {
+            set txt "Current time: [lunar::fmt_time $lt]  [dict get $lt abbr] ([lunar::fmt_utcoff [dict get $lt offSec]])"
+        }
+    }
+    $pv configure -text $txt
+}
+
+proc lunar::settings_preview_loop {} {
+    if {![winfo exists .set]} return
+    lunar::settings_preview
+    after 500 lunar::settings_preview_loop
+}
+
+proc lunar::settings_ok {} {
+    set z [lunar::settings_sel]
+    if {$z ne ""} { set ::lunar::tz $z }
+    set ::lunar::tz_chosen 1
+    dict set ::lunar::cfg tz [expr {$::lunar::tz eq "UTC" ? "" : $::lunar::tz}]
+    dict set ::lunar::cfg fmt24 [expr {$::lunar::set_fmt24 ? 1 : 0}]
+    lunar::settings_save
+    destroy .set
 }
 
 # nudge the engine to re-sync periodically (defined at top level, not inside
@@ -194,14 +440,21 @@ proc lunar::render {st} {
     set hasTime [dict get $st hasTime]
 
     if {$hasTime} {
-        set secs [expr {[dict get $st utcMs] / 1000}]
-        .face.time configure -text [clock format $secs -format %H:%M:%S]
-        .face.date configure -text [clock format $secs -format "%A, %d %B %Y"]
+        # break the disciplined UTC down in the DISPLAY zone via the embedded
+        # tzdata (never Tcl's [clock], which trusts the OS zone database)
+        set utcMs [dict get $st utcMs]
+        if {![catch { ::lunar::localtime $utcMs $::lunar::tz } lt]} {
+            .face.time configure -text [lunar::fmt_time $lt]
+            .face.date configure -text [lunar::fmt_date $lt]
+            .sb.zone configure -text \
+                "$::lunar::tz · [dict get $lt abbr] ([lunar::fmt_utcoff [dict get $lt offSec]])"
+        }
         .face.bound configure -text [lunar::fmt_bound [dict get $st boundMs]]
     } else {
         .face.time  configure -text "--:--:--"
         .face.date  configure -text ""
         .face.bound configure -text ""
+        .sb.zone    configure -text $::lunar::tz
     }
 
     lassign [lunar::state_display $state $synced] txt col
@@ -254,6 +507,16 @@ proc lunar::selftest {reportPath} {
     set txt "lunar-selftest\nversion=$::lunar::version\ntk=[package present Tk]\n"
     append txt "engine=[expr {[llength [info commands ::lunar::status]] ? {yes} : {no}}]\n"
     append txt "toplevel=[winfo exists .face.time]\n"
+    if {[llength [info commands ::lunar::tz_list]]} {
+        append txt "tzcount=[llength [::lunar::tz_list]]\n"
+        append txt "tzversion=[::lunar::tz_version]\n"
+        # a known zone must resolve and disagree with UTC in summer
+        if {![catch { ::lunar::localtime 1751500000000 Europe/Brussels } lt]} {
+            append txt "tzresolve=[dict get $lt abbr]/[dict get $lt offSec]\n"
+        } else {
+            set ok 0 ; set msg "tz resolve failed: $lt"
+        }
+    }
     append txt "status=[expr {$ok ? {ok} : {FAIL}}]\n"
     if {!$ok} { append txt "error=$msg\n" }
     if {$reportPath ne ""} {
@@ -268,6 +531,8 @@ proc lunar::main {} {
         lunar::selftest [lindex $::argv [expr {$i + 1}]]
         return
     }
+    lunar::settings_load
+    lunar::tz_startup
     lunar::build
     # Route uncaught async errors to the log + a status note, never a modal
     # dialog (els's production bgerror pattern). Installed after build.
@@ -282,6 +547,10 @@ proc lunar::main {} {
         after $::lunar::poll_ms lunar::repoll
     }
     after 100 lunar::tick
+    # dev hook: open the Settings dialog on launch, for screenshots/testing
+    if {[info exists ::env(LUNAR_OPEN_SETTINGS)] && $::env(LUNAR_OPEN_SETTINGS) ne ""} {
+        after 400 lunar::settings_dlg
+    }
 }
 
 lunar::main

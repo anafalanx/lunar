@@ -14,9 +14,13 @@
 #include <windows.h>
 #include <tcl.h>
 
+#include <string.h>
+
 #include "clock.h"
 #include "ntp.h"
 #include "update_check.h"
+#include "tz.h"
+#include "tz_winmap.h"
 
 static const char *trust_name(TrustState s) {
     switch (s) {
@@ -128,6 +132,91 @@ static int Sources_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
     return TCL_OK;
 }
 
+/* One-entry TzId cache: the UI resolves the same zone name every tick.
+ * Commands only ever run on the Tk thread, so no locking. */
+static char g_tzCacheName[64];
+static TzId g_tzCacheId = TZ_ID_INVALID;
+
+static TzId tz_resolve(const char *name) {
+    if (!name || !name[0]) return TZ_ID_INVALID;
+    if (g_tzCacheId != TZ_ID_INVALID &&
+        strcmp(name, g_tzCacheName) == 0) return g_tzCacheId;
+    TzId id = Tz_FindByName(name);
+    if (id != TZ_ID_INVALID && strlen(name) < sizeof g_tzCacheName) {
+        strcpy(g_tzCacheName, name);
+        g_tzCacheId = id;
+    }
+    return id;
+}
+
+/* lunar::localtime utcMs zone -- break a UTC instant into wall-clock
+ * components for an embedded IANA zone (never the OS). Errors on a zone
+ * missing from the embedded index so the caller can fall back. */
+static int LocalTime_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
+                         int objc, Tcl_Obj *const objv[]) {
+    if (objc != 3) { Tcl_WrongNumArgs(ip, 1, objv, "utcMs zone"); return TCL_ERROR; }
+    Tcl_WideInt utcMs;
+    if (Tcl_GetWideIntFromObj(ip, objv[1], &utcMs) != TCL_OK) return TCL_ERROR;
+    const char *zone = Tcl_GetString(objv[2]);
+
+    TzId id = tz_resolve(zone);
+    if (id == TZ_ID_INVALID) {
+        Tcl_SetObjResult(ip, Tcl_ObjPrintf("unknown zone \"%s\"", zone));
+        return TCL_ERROR;
+    }
+    TzifLocal lt;
+    if (!Tz_LocalFromUtcMs(id, (int64_t)utcMs, &lt)) {
+        Tcl_SetObjResult(ip, Tcl_ObjPrintf("cannot resolve %s", zone));
+        return TCL_ERROR;
+    }
+    Tcl_Obj *d = Tcl_NewDictObj();
+    PUT(d, "year",   Tcl_NewIntObj(lt.year));
+    PUT(d, "month",  Tcl_NewIntObj(lt.month));
+    PUT(d, "day",    Tcl_NewIntObj(lt.mday));
+    PUT(d, "hour",   Tcl_NewIntObj(lt.hour));
+    PUT(d, "minute", Tcl_NewIntObj(lt.minute));
+    PUT(d, "second", Tcl_NewIntObj(lt.second));
+    PUT(d, "wday",   Tcl_NewIntObj(lt.wday));
+    PUT(d, "isDst",  Tcl_NewIntObj(lt.isDst));
+    PUT(d, "offSec", Tcl_NewIntObj(lt.utcOffsetSec));
+    PUT(d, "abbr",   Tcl_NewStringObj(lt.abbr, -1));
+    Tcl_SetObjResult(ip, d);
+    return TCL_OK;
+}
+
+/* lunar::tz_list -- every embedded canonical zone name. */
+static int TzList_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
+                      int objc, Tcl_Obj *const objv[]) {
+    if (objc != 1) { Tcl_WrongNumArgs(ip, 1, objv, ""); return TCL_ERROR; }
+    Tcl_Obj *list = Tcl_NewListObj(0, NULL);
+    int n = Tz_Count();
+    for (int i = 0; i < n; i++) {
+        const char *name = Tz_AtIndex(i);
+        if (name) Tcl_ListObjAppendElement(ip, list, Tcl_NewStringObj(name, -1));
+    }
+    Tcl_SetObjResult(ip, list);
+    return TCL_OK;
+}
+
+/* lunar::tz_version -- the embedded tzdata release ("2026b"). */
+static int TzVersion_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
+                         int objc, Tcl_Obj *const objv[]) {
+    if (objc != 1) { Tcl_WrongNumArgs(ip, 1, objv, ""); return TCL_ERROR; }
+    Tcl_SetObjResult(ip, Tcl_NewStringObj(Tz_Version(), -1));
+    return TCL_OK;
+}
+
+/* lunar::tz_suggest -- the OS zone mapped to an embedded IANA name, or "".
+ * Reading the zone NAME is not trusting the OS clock. */
+static int TzSuggest_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
+                         int objc, Tcl_Obj *const objv[]) {
+    if (objc != 1) { Tcl_WrongNumArgs(ip, 1, objv, ""); return TCL_ERROR; }
+    char sug[64] = "";
+    if (!TzWinmap_CurrentIana(sug, sizeof sug)) sug[0] = 0;
+    Tcl_SetObjResult(ip, Tcl_NewStringObj(sug, -1));
+    return TCL_OK;
+}
+
 /* lunar::update -- {available 0|1 version X.Y.Z}. */
 static int Update_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
                       int objc, Tcl_Obj *const objv[]) {
@@ -150,6 +239,10 @@ int Lunarx_Init(Tcl_Interp *ip) {
     Tcl_CreateObjCommand(ip, "::lunar::status",       Status_Cmd,      nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::sources",      Sources_Cmd,     nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::update_status", Update_Cmd,     nullptr, nullptr);
+    Tcl_CreateObjCommand(ip, "::lunar::localtime",    LocalTime_Cmd,   nullptr, nullptr);
+    Tcl_CreateObjCommand(ip, "::lunar::tz_list",      TzList_Cmd,      nullptr, nullptr);
+    Tcl_CreateObjCommand(ip, "::lunar::tz_version",   TzVersion_Cmd,   nullptr, nullptr);
+    Tcl_CreateObjCommand(ip, "::lunar::tz_suggest",   TzSuggest_Cmd,   nullptr, nullptr);
     if (Tcl_PkgProvide(ip, "lunarx", "0.1") != TCL_OK) return TCL_ERROR;
     return TCL_OK;
 }
