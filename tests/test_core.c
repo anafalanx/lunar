@@ -1,12 +1,19 @@
-// test_core.c -- C unit tests for Lunar's pure logic.
+// test_core.c -- C unit tests for Lunar's pure engine logic.
 //
-// We compile this as a single translation unit that re-includes the whole
-// of lunar.c with LUNAR_NO_MAIN defined, so we can reach its static
-// helpers directly. ntp.c and sysvol.c are linked in because lunar.c
-// references their exported entry points.
+// Exercises the engine libraries directly through their public headers;
+// the .c files under test are linked in by tests/run_tests.py. The UI
+// shell is Tcl/Tk (lunar.tcl) and is covered separately via `z check`.
 
-#define LUNAR_NO_MAIN
-#include "../src/lunar.c"
+#include "../src/clock.h"
+#include "../src/ntp.h"
+#include "../src/logbuf.h"
+#include "../src/tz.h"
+#include "../src/tz_winmap.h"
+#include "../src/siv.h"
+#include "../src/nts.h"
+#include "../src/nts_ke.h"
+#include "../src/nts_ef.h"
+#include "../src/app_paths.h"
 #include "../src/tzif.h"
 #include "../src/dns.h"
 #include "../src/netutil.h"
@@ -54,18 +61,6 @@ static int g_pass = 0, g_fail = 0;
 // LE byte writers (trivial but catches a bad refactor)
 // ---------------------------------------------------------------------------
 
-static void test_le_writers(void) {
-    unsigned char b[8] = { 0 };
-    WriteLE16(b, 0xBEEF);
-    CHECK_EQ_INT(b[0], 0xEF);
-    CHECK_EQ_INT(b[1], 0xBE);
-    WriteLE32(b, 0xDEADBEEFu);
-    CHECK_EQ_INT(b[0], 0xEF);
-    CHECK_EQ_INT(b[1], 0xBE);
-    CHECK_EQ_INT(b[2], 0xAD);
-    CHECK_EQ_INT(b[3], 0xDE);
-}
-
 // ---------------------------------------------------------------------------
 // WAV builder: RIFF header + PCM properties
 // ---------------------------------------------------------------------------
@@ -75,47 +70,6 @@ static uint16_t rd16(const unsigned char *p) {
 }
 static uint32_t rd32(const unsigned char *p) {
     return (uint32_t)(p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24));
-}
-
-static void test_wav_header(void) {
-    BuildWav(880.0f, 0.5f);
-    const unsigned char *w = g_wav;
-    CHECK(memcmp(w + 0,  "RIFF", 4) == 0);
-    CHECK_EQ_INT(rd32(w + 4),  36 + BEEP_DATA_BYTES);
-    CHECK(memcmp(w + 8,  "WAVE", 4) == 0);
-    CHECK(memcmp(w + 12, "fmt ", 4) == 0);
-    CHECK_EQ_INT(rd32(w + 16), 16);
-    CHECK_EQ_INT(rd16(w + 20), 1);                                  // PCM
-    CHECK_EQ_INT(rd16(w + 22), 1);                                  // mono
-    CHECK_EQ_INT(rd32(w + 24), BEEP_SAMPLE_RATE);
-    CHECK_EQ_INT(rd32(w + 28), BEEP_SAMPLE_RATE * 2);               // byte rate
-    CHECK_EQ_INT(rd16(w + 32), 2);                                  // block align
-    CHECK_EQ_INT(rd16(w + 34), 16);                                 // bits
-    CHECK(memcmp(w + 36, "data", 4) == 0);
-    CHECK_EQ_INT(rd32(w + 40), BEEP_DATA_BYTES);
-    CHECK_EQ_INT(BEEP_FRAMES, BEEP_SAMPLE_RATE / 4);
-    CHECK(BEEP_TARGET_SPEAKER_AMPLITUDE > 0.27f);
-    CHECK(BEEP_TARGET_SPEAKER_AMPLITUDE < 0.28f);
-
-    // Envelope: first sample must be zero (attack starts at 0), last
-    // sample must be zero (release ends at 0), peak must exceed 50% of
-    // the requested amplitude somewhere in the middle.
-    int16_t s0    = (int16_t)rd16(w + 44);
-    int16_t sLast = (int16_t)rd16(w + 44 + (BEEP_FRAMES - 1) * 2);
-    CHECK_EQ_INT(s0, 0);
-    // Release envelope lands on zero at the last frame, allowing for
-    // one-LSB float-to-int16 rounding.
-    CHECK(abs(sLast) <= 1);
-
-    int peak = 0;
-    for (int i = 0; i < BEEP_FRAMES; i++) {
-        int16_t s = (int16_t)rd16(w + 44 + i * 2);
-        int a = abs(s);
-        if (a > peak) peak = a;
-    }
-    // amp=0.5 -> peak around 0.5 * 32767 = ~16384; require at least 12000.
-    CHECK(peak > 12000);
-    CHECK(peak <= 32767);
 }
 
 // ---------------------------------------------------------------------------
@@ -211,65 +165,9 @@ static void test_tz_lookup(void) {
 // Hit testing on hour markers
 // ---------------------------------------------------------------------------
 
-static void test_hit_test(void) {
-    const float cx = 200.0f, cy = 200.0f, S = 400.0f;
-    // Radius at which ticks sit, approximately.
-    const float margin = 0.04f * S;
-    const float radius = 0.5f * S - margin;
-    const float rMid   = radius - 0.035f * S; // inside the hit band
-    for (int h = 0; h < 12; h++) {
-        float a = h * 30.0f - 90.0f;   // 0 = 12 o'clock in our code uses atan2(dx,-dy)
-        // Use the same polar convention the app uses: 0 deg is up, clockwise.
-        float ang = (h * 30.0f) * DEG2RAD;
-        float x = cx + rMid * sinf(ang);
-        float y = cy - rMid * cosf(ang);
-        int idx = HitTestHour(x, y, cx, cy, S);
-        CHECK_EQ_INT(idx, h);
-        (void)a;
-    }
-    // Center miss
-    CHECK_EQ_INT(HitTestHour(cx, cy, cx, cy, S), -1);
-    // Far outside
-    CHECK_EQ_INT(HitTestHour(cx + 10 * S, cy, cx, cy, S), -1);
-    // Midway between two hour ticks (angle = 15 deg between 12 and 1)
-    {
-        float ang = 15.0f * DEG2RAD;
-        float x = cx + rMid * sinf(ang);
-        float y = cy - rMid * cosf(ang);
-        CHECK_EQ_INT(HitTestHour(x, y, cx, cy, S), -1);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Armed persistence round-trip
 // ---------------------------------------------------------------------------
-
-static void test_armed_roundtrip(void) {
-    // Redirect APPDATA to a scratch directory under build/. ArmedPath
-    // now uses _wgetenv(L"APPDATA"), so we must set the wide env too.
-    wchar_t scratchW[MAX_PATH + 32];
-    {
-        wchar_t cwd[MAX_PATH]; GetCurrentDirectoryW(MAX_PATH, cwd);
-        _snwprintf(scratchW, MAX_PATH + 32, L"%ls\\build\\test_scratch", cwd);
-        _wmkdir(scratchW);
-    }
-    wchar_t envsetW[MAX_PATH + 48];
-    _snwprintf(envsetW, MAX_PATH + 48, L"APPDATA=%ls", scratchW);
-    _wputenv(envsetW);
-
-    int in[12]  = { 1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 0, 1 };
-    int out[12] = { 0 };
-    SaveArmed(in);
-    LoadArmed(out);
-    for (int i = 0; i < 12; i++) CHECK_EQ_INT(out[i], in[i]);
-
-    // Round-trip of all-zero and all-one too, to catch bit-packing bugs.
-    int z[12]  = { 0 };
-    int z2[12] = { 1,1,1,1,1,1,1,1,1,1,1,1 };
-    int o[12]  = { 0 };
-    SaveArmed(z);  LoadArmed(o);  for (int i = 0; i < 12; i++) CHECK_EQ_INT(o[i], z[i]);
-    SaveArmed(z2); LoadArmed(o);  for (int i = 0; i < 12; i++) CHECK_EQ_INT(o[i], z2[i]);
-}
 
 // ---------------------------------------------------------------------------
 // NTP packet parsing -- run the byte math the way ntp.c does, against a
@@ -313,87 +211,6 @@ static void test_ntp_timestamp_math(void) {
     t2_ms += 250; t3_ms += 250;
     off = ((t2_ms - t1) + (t3_ms - t4)) / 2;
     CHECK_EQ_INT(off, 250);
-}
-
-// ---------------------------------------------------------------------------
-// Hand geometry: verify tip and base points land where expected.
-// ---------------------------------------------------------------------------
-
-static void test_hand_geometry(void) {
-    // Need a factory.
-    HRESULT hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
-                                   &IID_ID2D1Factory, NULL, (void **)&g_d2d);
-    CHECK(SUCCEEDED(hr));
-    if (FAILED(hr)) return;
-
-    float len = 200.0f, baseW = 20.0f, tipW = 10.0f;
-    ID2D1PathGeometry *g = BuildHand(len, baseW, tipW);
-    CHECK(g != NULL);
-    if (!g) return;
-
-    D2D1_RECT_F bounds;
-    hr = ID2D1PathGeometry_GetBounds(g, NULL, &bounds);
-    CHECK(SUCCEEDED(hr));
-    // Tip at y = -len, base at y = +baseW (backLen == baseW).
-    CHECK(fabsf(bounds.top    - (-len))  < 0.01f);
-    CHECK(fabsf(bounds.bottom - (+baseW)) < 0.01f);
-    // Widest at the base: baseW / 2 on each side.
-    CHECK(fabsf(bounds.left  - (-baseW * 0.5f)) < 0.01f);
-    CHECK(fabsf(bounds.right - (+baseW * 0.5f)) < 0.01f);
-
-    ID2D1PathGeometry_Release(g);
-    ID2D1Factory_Release(g_d2d);
-    g_d2d = NULL;
-}
-
-// ---------------------------------------------------------------------------
-// Minute-step guard: the fixed behaviour from C2/C3 should accept small
-// forward steps and reject large jumps.
-// ---------------------------------------------------------------------------
-//
-// We can't call Tick() directly (it touches the window), so we
-// re-implement the exact guard as it exists in lunar.c and assert its
-// output on a known sequence. Any future divergence between this test
-// and Tick() is a red flag to revisit both.
-
-static int sim_beeps_on_crossing(float prev, float cur, const int armed[12]) {
-    int beeps = 0;
-    int prevFloor = (int)floorf(prev);
-    int curFloor  = (int)floorf(cur);
-    int delta     = curFloor - prevFloor;
-    if (delta < 0) delta += 60;
-    if (delta >= 1 && delta <= 2) {
-        for (int k = 1; k <= delta; k++) {
-            int mm = (prevFloor + k) % 60;
-            if (mm % 5 != 0) continue;
-            int idx = mm / 5;
-            if (!armed[idx]) continue;
-            beeps++;
-        }
-    }
-    return beeps;
-}
-
-static void test_minute_guard(void) {
-    int all_armed[12] = { 1,1,1,1,1,1,1,1,1,1,1,1 };
-    int no_armed [12] = { 0 };
-
-    // Normal sub-minute tick: no beep.
-    CHECK_EQ_INT(sim_beeps_on_crossing(10.4f, 10.6f, all_armed), 0);
-    // Cross exactly one armed 5-minute marker (minute 10 -> 15).
-    CHECK_EQ_INT(sim_beeps_on_crossing(14.9f, 15.1f, all_armed), 1);
-    CHECK_EQ_INT(sim_beeps_on_crossing(14.9f, 15.1f, no_armed),  0);
-    // 59 -> 00 wrap with armed-zero (hour chime).
-    CHECK_EQ_INT(sim_beeps_on_crossing(59.9f, 0.1f, all_armed), 1);
-    // Two-minute catch-up across 14 -> 16: hits 15 only.
-    CHECK_EQ_INT(sim_beeps_on_crossing(14.5f, 16.5f, all_armed), 1);
-    // DST spring-forward: jump of 60 -- MUST be rejected.
-    CHECK_EQ_INT(sim_beeps_on_crossing(1.9f, 2.0f + 60.0f, all_armed), 0);
-    // Any jump of 3 minutes or more rejected.
-    CHECK_EQ_INT(sim_beeps_on_crossing(10.0f, 13.5f, all_armed), 0);
-    // Backward jump (DST fall-back or manual wind-back): wraps to +59,
-    // still rejected because delta > 2.
-    CHECK_EQ_INT(sim_beeps_on_crossing(30.0f, 29.5f, all_armed), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -2300,178 +2117,6 @@ static void test_breakdown_leap_years(void) {
 }
 
 // ---------------------------------------------------------------------------
-// UpdateTimezone label formatting
-// ---------------------------------------------------------------------------
-//
-// We force a disciplined clock at a known UTC instant, set g_tzIana,
-// call UpdateTimezone(), and check g_tzLabel directly.  Covers the
-// full-hour, half-hour, and negative-offset branches of the format
-// string.
-
-static void force_clock_at(int64_t utcMs) {
-    // Align the disciplined clock so Clock_NowUtcMs() returns utcMs
-    // (approximately).  Reset first so Clock_OnPollCycle's >200 ms
-    // "local oscillator fault" guard doesn't trip when the test
-    // jumps between instants years apart.
-    Clock_Shutdown();
-    Clock_Init();
-    Clock_OnPollCycle(TRUST_OK, utcMs, Clock_Qpc(), 0);
-}
-
-static void test_tz_label_format(void) {
-    // Make sure the clock is disciplined at a known instant so
-    // UpdateTimezone can compute offset/abbr branches.
-    force_clock_at(make_utc_ms(2026, 6, 15, 12, 0, 0));
-    CHECK(Clock_IsDisciplined());
-
-    // UTC -> bare "UTC" (no offset suffix).
-    g_tzIana[0] = 0;
-    UpdateTimezone();
-    CHECK_EQ_STR(g_tzLabel, "UTC");
-    CHECK_EQ_INT(g_tzId, TZ_ID_UTC);
-
-    // Europe/Berlin summer (2026-07-01 12:00Z): CEST +02:00.  Title
-    // label uses the IANA name rather than the DST abbreviation so
-    // users see the same string they picked in Settings.  Also append
-    // ", DST" when daylight saving is in effect.
-    force_clock_at(make_utc_ms(2026, 7, 1, 12, 0, 0));
-    snprintf(g_tzIana, sizeof g_tzIana, "Europe/Berlin");
-    UpdateTimezone();
-    CHECK_EQ_STR(g_tzLabel, "Europe/Berlin (UTC+2, DST)");
-
-    // America/New_York winter (2026-01-15 12:00Z): EST -05:00, no DST.
-    force_clock_at(make_utc_ms(2026, 1, 15, 12, 0, 0));
-    snprintf(g_tzIana, sizeof g_tzIana, "America/New_York");
-    UpdateTimezone();
-    CHECK_EQ_STR(g_tzLabel, "America/New_York (UTC-5)");
-
-    // Asia/Kolkata: +05:30 exercises the half-hour branch; no DST.
-    force_clock_at(make_utc_ms(2026, 6, 15, 12, 0, 0));
-    snprintf(g_tzIana, sizeof g_tzIana, "Asia/Kolkata");
-    UpdateTimezone();
-    CHECK_EQ_STR(g_tzLabel, "Asia/Kolkata (UTC+5:30)");
-
-    // Asia/Kathmandu: +05:45 (45-minute offset, edge of format).
-    snprintf(g_tzIana, sizeof g_tzIana, "Asia/Kathmandu");
-    UpdateTimezone();
-    CHECK(strstr(g_tzLabel, "(UTC+5:45)") != NULL);
-
-    // Invalid name -> falls back to UTC and clears g_tzIana.
-    snprintf(g_tzIana, sizeof g_tzIana, "Bogus/Nowhere");
-    UpdateTimezone();
-    CHECK_EQ_STR(g_tzLabel, "UTC");
-    CHECK_EQ_INT(g_tzIana[0], 0);
-    CHECK_EQ_INT(g_tzId, TZ_ID_UTC);
-}
-
-// ---------------------------------------------------------------------------
-// Settings load / save round-trip
-// ---------------------------------------------------------------------------
-
-static void redirect_appdata_to_scratch(void) {
-    wchar_t scratchW[MAX_PATH + 32];
-    wchar_t cwd[MAX_PATH]; GetCurrentDirectoryW(MAX_PATH, cwd);
-    _snwprintf(scratchW, MAX_PATH + 32, L"%ls\\build\\test_scratch", cwd);
-    _wmkdir(scratchW);
-    wchar_t envsetW[MAX_PATH + 48];
-    _snwprintf(envsetW, MAX_PATH + 48, L"APPDATA=%ls", scratchW);
-    _wputenv(envsetW);
-}
-
-static void wipe_settings_file(void) {
-    wchar_t path[MAX_PATH]; SettingsPathW(path, MAX_PATH);
-    if (path[0]) _wremove(path);
-}
-
-static void test_settings_roundtrip(void) {
-    redirect_appdata_to_scratch();
-    wipe_settings_file();
-
-    // Seed known values and save.
-    g_chimesEnabled     = 0;
-    g_unminimizeOnChime = 1;
-    g_confirmOnClose    = 1;
-    snprintf(g_tzIana, sizeof g_tzIana, "Europe/Paris");
-    SaveSettings();
-
-    // Perturb memory state, then reload from disk.
-    g_chimesEnabled     = 1;
-    g_unminimizeOnChime = 0;
-    g_confirmOnClose    = 0;
-    g_tzIana[0] = 0;
-    LoadSettings();
-
-    CHECK_EQ_INT(g_chimesEnabled,     0);
-    CHECK_EQ_INT(g_unminimizeOnChime, 1);
-    CHECK_EQ_INT(g_confirmOnClose,    1);
-    CHECK_EQ_STR(g_tzIana, "Europe/Paris");
-
-    // UTC (empty string) must survive the round-trip too.
-    g_tzIana[0] = 0;
-    SaveSettings();
-    snprintf(g_tzIana, sizeof g_tzIana, "Polluted/Value");
-    LoadSettings();
-    CHECK_EQ_INT(g_tzIana[0], 0);
-}
-
-static void test_settings_legacy_v1(void) {
-    // A pre-v2 settings file has no '=' separators and stored only the
-    // three int flags on a single line.  LoadSettings must accept it
-    // and leave g_tzIana empty (no tz field existed back then).
-    redirect_appdata_to_scratch();
-    wchar_t path[MAX_PATH]; SettingsPathW(path, MAX_PATH);
-    FILE *f = _wfopen(path, L"wb");
-    CHECK(f != NULL);
-    if (!f) return;
-    fputs("0 1 1\n", f);
-    fclose(f);
-
-    g_chimesEnabled     = 1;
-    g_unminimizeOnChime = 0;
-    g_confirmOnClose    = 0;
-    snprintf(g_tzIana, sizeof g_tzIana, "Pre/Existing");
-    LoadSettings();
-
-    CHECK_EQ_INT(g_chimesEnabled,     0);
-    CHECK_EQ_INT(g_unminimizeOnChime, 1);
-    CHECK_EQ_INT(g_confirmOnClose,    1);
-    // The v1 loader never touches tz -- whatever was in memory stays.
-    CHECK_EQ_STR(g_tzIana, "Pre/Existing");
-}
-
-static void test_settings_invalid_tz(void) {
-    // A settings file with an unknown IANA name must load the string
-    // verbatim (users deserve a stable feedback loop) and then have
-    // UpdateTimezone fall back to UTC, clearing the in-memory name.
-    redirect_appdata_to_scratch();
-    wchar_t path[MAX_PATH]; SettingsPathW(path, MAX_PATH);
-    FILE *f = _wfopen(path, L"wb");
-    CHECK(f != NULL);
-    if (!f) return;
-    fputs("chimes=1\nunmin=0\nconfirm=0\ntz=Atlantis/Capital\n", f);
-    fclose(f);
-
-    Log_Reset();   // isolate this test's log assertions from prior volume
-    g_tzIana[0] = 0;
-    LoadSettings();
-    CHECK_EQ_STR(g_tzIana, "Atlantis/Capital");
-
-    // Resolver must reject, fall back to UTC, and wipe the in-memory
-    // name (see UpdateTimezone contract).
-    UpdateTimezone();
-    CHECK_EQ_INT(g_tzId, TZ_ID_UTC);
-    CHECK_EQ_INT(g_tzIana[0], 0);
-    CHECK_EQ_STR(g_tzLabel, "UTC");
-
-    // Fallback must also surface in the log buffer so users/operators
-    // can see why the setting was ignored.
-    char snap[4096];
-    Log_Snapshot(snap, sizeof snap);
-    CHECK(strstr(snap, "tz: IANA name Atlantis/Capital") != NULL);
-    CHECK(strstr(snap, "falling back to UTC")           != NULL);
-}
-
-// ---------------------------------------------------------------------------
 // POSIX TZ footer hardening: hostile or malformed strings must neither
 // overflow nor hang.  Exercised through tzif_resolve on synthetic TZif
 // blobs so we cover the same code path as the real resolver.
@@ -3155,14 +2800,8 @@ static void test_app_data_path(void) {
 // ---------------------------------------------------------------------------
 
 int main(void) {
-    test_le_writers();
-    test_wav_header();
     test_tz_lookup();
-    test_hit_test();
-    test_armed_roundtrip();
     test_ntp_timestamp_math();
-    test_hand_geometry();
-    test_minute_guard();
     test_ntp_header_validation();
     test_clock_discipline();
     test_clock_display_states();
@@ -3198,10 +2837,6 @@ int main(void) {
     test_tz_all_zones_smoke();
     test_tzif_malformed();
     test_breakdown_leap_years();
-    test_tz_label_format();
-    test_settings_roundtrip();
-    test_settings_legacy_v1();
-    test_settings_invalid_tz();
     test_posix_footer_hardening();
 
     test_dns_pool_pins();

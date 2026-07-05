@@ -48,17 +48,15 @@ Steps to sign a release:
 > reputation builds. Keeping the same cert and always timestamping is
 > what makes that reputation stick.
 
-### The `LUNAR_SIGN_CMD` hook
+### The `sign` build task
 
-`scripts/release.py` runs `LUNAR_SIGN_CMD` (with `{exe}` replaced by the
-staged exe path) after the build and before hashing, then verifies with
-`signtool verify /pa`. If `LUNAR_SIGN_CMD` is unset it prints a prominent
-UNSIGNED warning and continues — dev dry-runs stay friction-free, real
-releases must set it:
-
-```
-set LUNAR_SIGN_CMD=signtool sign /a /tr http://time.certum.pl /td sha256 /fd sha256 /v {exe}
-```
+`tools/tasks.tcl sign` (aka `z sign`) runs the §1 `signtool` command on
+`dist/lunar.exe` and then verifies it with `signtool verify /pa`, so a
+release sign-off is a single task. SimplySign Desktop must be connected
+first (so the cert is available to `signtool /a`). Authenticode appends
+its certificate table at the end of the file, beside the appended zipfs
+image, so re-run `tools/tasks.tcl check` on the signed exe afterwards to
+confirm it still loads (status must stay `ok`).
 
 ## 2. Release checklist
 
@@ -66,18 +64,23 @@ set LUNAR_SIGN_CMD=signtool sign /a /tr http://time.certum.pl /td sha256 /fd sha
    exe's four-part Windows resource fields are this padded with zeros).
 2. **Regenerate tzdata if stale** — check IANA for a newer release than
    the embedded one (`src/tz_embed.c`) and regenerate if so.
-3. **Build**: `python scripts/build.py --no-desktop`.
-4. **Test**: `python tests/run_tests.py` (unit) and
-   `python tests/test_smoke.py` (launches a real window; needs a desktop
-   session). Both must be green — CI must also be green on the release
-   commit.
-5. **Sign + verify**: connect SimplySign, then sign the built
-   `build/Lunar.exe` with the command in §1 and verify it. Note the
-   printed SHA-256 of the signed exe.
+3. **Build**: `tclsh90.exe tools/tasks.tcl build` (needs the static
+   Tcl/Tk 9 payload — see the README Build section). Produces
+   `dist/lunar.exe`.
+4. **Test**: `python tests/run_tests.py` (C engine unit tests) and
+   `tclsh90.exe tools/tasks.tcl check` (headless self-test of the built
+   exe). Both must be green — CI must also be green on the release commit.
+5. **Sign + verify**: connect SimplySign, then `tclsh90.exe
+   tools/tasks.tcl sign` (or the §1 `signtool` command) on
+   `dist/lunar.exe`, and verify it. Note the printed SHA-256 of the
+   signed exe.
 6. **GitHub Release**: tag `vX.Y` (matching VERSION), upload the signed
-   `Lunar.exe` as the release asset, and paste its SHA-256 into the
-   notes. Lunar ships as a single self-contained exe — the exe *is* the
-   artifact, no installer or archive required.
+   exe as the release asset **cased as `Lunar.exe`** (the build emits
+   lowercase `dist/lunar.exe`; stage a correctly-cased copy —
+   `cp dist/lunar.exe stage/Lunar.exe` — because the download URL is
+   case-sensitive and winget/update expect `Lunar.exe`), and paste its
+   SHA-256 into the notes. Lunar ships as a single self-contained exe —
+   the exe *is* the artifact, no installer or archive required.
 7. **Round-trip**: download the published asset, re-run
    `signtool verify /pa /all /v` and compare SHA-256 against the notes.
 8. **winget PR** (optional): instantiate `packaging/winget/` templates

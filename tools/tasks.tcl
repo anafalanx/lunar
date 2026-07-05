@@ -161,8 +161,9 @@ set ::SYSLIBS {
     -loleaut32 -lwinspool -lcrypt32 -lbcrypt -lwtsapi32 -lwinmm
 }
 
-# The kept C engine (every src/*.c except the old Win32 shell lunar.c and the
-# Tk entry lunar_main.c / wrapper lunarx.c, which are handled separately).
+# The C engine (every engine src/*.c). The Tk shell glue -- entry point
+# lunar_main.c and the ::lunar command wrapper lunarx.c -- is compiled
+# separately below.
 set ::ENGINE_SRCS {
     app_paths sysvol netutil ntp clock logbuf tz tzif tz_embed tz_winmap
     tz_winmap_gen siv nts_ke nts_ef pinned_tls cert_verify_win pin_store

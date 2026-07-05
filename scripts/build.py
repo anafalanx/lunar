@@ -1,19 +1,20 @@
-"""Build a single-file Lunar.exe and copy it to the desktop.
+"""Build Lunar's vendored mbedTLS archive and generate build/version.h.
 
 Usage (from project root):
 
     python scripts/build.py
-    python scripts/build.py --no-desktop
-    python scripts/build.py --dest <path>
 
-Requires MSYS2 UCRT64 with `gcc` and `windres`. Renders with Direct2D +
-DirectWrite on a plain Win32 HWND; the resulting exe has no third-party
-runtime dependencies.
+This used to build the native Direct2D `Lunar.exe`. Since 0.50 the product
+is the Tcl/Tk shell, built by `tools/tasks.tcl` (`z build`), which reuses
+the two helpers here: `build_mbedtls_archive()` compiles the vendored
+mbedTLS 3.6.6 sources into a hash-cached static archive, and
+`write_version_header()` renders `build/version.h` from the top-level
+VERSION file. `tests/run_tests.py` imports the same helpers for the C unit
+tests. Requires MSYS2 UCRT64 with `gcc` and `ar`.
 """
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import os
 import re
@@ -27,7 +28,6 @@ from pathlib import Path
 # ---- paths -----------------------------------------------------------------
 
 ROOT = Path(__file__).resolve().parent.parent
-SRC = ROOT / "src"
 BUILD = ROOT / "build"
 VERSION_FILE = ROOT / "VERSION"
 DEFAULT_MSYS2_DIR = Path(r"C:\msys64")
@@ -99,10 +99,10 @@ def find_tool(name: str) -> Path:
 
 # ---- version single-sourcing -------------------------------------------------
 #
-# The top-level VERSION file is the single source of truth. build.py
-# forwards it to windres (-D defines consumed by src/lunar.rc) and
-# generates build/version.h so C sources can #include "version.h"
-# (the build dir is on the app include path).
+# The top-level VERSION file is the single source of truth. This module
+# renders build/version.h so C sources can #include "version.h" (the build
+# dir is on the app include path); tools/genres.tcl separately forwards the
+# same VERSION to windres for the Tk exe's resource/manifest fields.
 
 def read_version() -> str:
     """Return the MAJOR.MINOR version string from the VERSION file.
@@ -119,39 +119,13 @@ def read_version() -> str:
     return v
 
 
-def check_manifest_version(version: str) -> None:
-    """Fail the build if src/lunar.manifest has drifted from VERSION.
-
-    lunar.rc embeds src/lunar.manifest verbatim as RT_MANIFEST, so unlike
-    the .rc version fields (overridden by windres -D) the manifest's
-    assemblyIdentity version is NOT templated by the build. This guard
-    locks its four-part identity (VERSION padded with zeros, e.g.
-    0.50.0.0) so it can never silently ship stale again.
-    """
-    manifest = SRC / "lunar.manifest"
-    parts = version.split(".")
-    while len(parts) < 4:
-        parts.append("0")
-    want = ".".join(parts[:4])
-    try:
-        text = manifest.read_text(encoding="utf-8")
-    except OSError as e:
-        die(f"cannot read {manifest}: {e}")
-    m = re.search(r'name="Lunar"\s+version="([0-9.]+)"', text)
-    if not m:
-        die(f"{manifest}: cannot find the Lunar assemblyIdentity version")
-    if m.group(1) != want:
-        die(f"{manifest}: assemblyIdentity version {m.group(1)!r} != "
-            f"{want!r} (VERSION is {version}); bump the manifest to match")
-
-
 def write_version_header(build_dir: Path = BUILD,
                          version: str | None = None) -> Path:
     """Generate <build_dir>/version.h from the VERSION file.
 
-    Standalone (no other build state needed) so tests/run_tests.py can
-    reuse it once lunar.c starts including version.h. Only rewrites the
-    file when the content changes, to keep mtimes stable for caching.
+    Standalone (no other build state needed) so tools/tasks.tcl and
+    tests/run_tests.py can both reuse it. Only rewrites the file when the
+    content changes, to keep mtimes stable for caching.
     """
     if version is None:
         version = read_version()
@@ -175,17 +149,6 @@ def write_version_header(build_dir: Path = BUILD,
             and header.read_text(encoding="utf-8") == text):
         header.write_text(text, encoding="utf-8", newline="\n")
     return header
-
-
-def desktop_dir() -> Path | None:
-    profile = os.environ.get("USERPROFILE")
-    if not profile:
-        return None
-    for rel in ("OneDrive/Desktop", "Desktop"):
-        d = Path(profile, *rel.split("/"))
-        if d.is_dir():
-            return d
-    return None
 
 
 # ---- mbedTLS vendored build -------------------------------------------------
@@ -317,122 +280,21 @@ def build_mbedtls_archive(gcc: Path) -> Path:
 
 
 # ---- main ------------------------------------------------------------------
+#
+# Standalone entry point: render version.h and (re)build the mbedTLS
+# archive. The Tk exe itself is built by tools/tasks.tcl, which calls the
+# same two helpers; this main() exists so the prerequisites can be primed
+# (or cache-warmed) from the command line.
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Build Lunar.exe.")
-    ap.add_argument(
-        "--no-desktop", action="store_true",
-        help="Do not copy the exe to the desktop.",
-    )
-    ap.add_argument(
-        "--dest", type=Path, default=None,
-        help="Copy the exe to this directory instead of the desktop.",
-    )
-    args = ap.parse_args()
-
     BUILD.mkdir(exist_ok=True)
-
-    exe = BUILD / "Lunar.exe"
-    res = BUILD / "lunar.res"
-
-    gcc = find_tool("gcc")
-    windres = find_tool("windres")
-
     version = read_version()
-    _vp = version.split(".")
-    v_major, v_minor = _vp[0], _vp[1]
-    v_patch = _vp[2] if len(_vp) > 2 else "0"
-    check_manifest_version(version)
     write_version_header(BUILD, version)
-    log(f"Version {version} (from VERSION)")
-
-    # Build the vendored mbedTLS 3.6.6 archive first (cached on a hash
-    # of config + sources; subsequent builds are instant).
-    mbedtls_archive = build_mbedtls_archive(gcc)
-
-    log("Compiling resource")
-    run(
-        windres,
-        # The backslash-escaped quotes survive windres's preprocessor
-        # invocation, so lunar.rc sees a proper C string literal. A bare
-        # -DLUNAR_VERSION_STR="X.Y.Z" loses its quotes on the way to
-        # the preprocessor and breaks the .rc parse.
-        f'-DLUNAR_VERSION_STR=\\"{version}\\"',
-        f"-DLUNAR_VERSION_MAJOR={v_major}",
-        f"-DLUNAR_VERSION_MINOR={v_minor}",
-        f"-DLUNAR_VERSION_PATCH={v_patch}",
-        SRC / "lunar.rc", "-O", "coff", "-o", res,
-    )
-
-    log("Compiling + linking Lunar.exe")
-    run(
-        gcc,
-        "-O2", "-Wall", "-Wextra", "-std=c23",
-        "-mwindows", "-static-libgcc", "-static",
-        # -ffunction-sections + -fdata-sections + -Wl,--gc-sections
-        # make the linker strip unused functions/data, so pulling in
-        # mbedTLS's ~3 MB static archive only costs us the parts we
-        # actually reference. TLS 1.3 client + X.509 verify + AES-GCM
-        # + ChaCha20-Poly1305 + SHA-256 should land around ~400 KB.
-        "-ffunction-sections", "-fdata-sections",
-        # mbedTLS include paths so our src/*.c can #include <mbedtls/...>.
-        # We do NOT set WIN32_LEAN_AND_MEAN or _WIN32_WINNT globally --
-        # lunar.c manages its own Win32 header defines and needs the
-        # default mingw-w64 _WIN32_WINNT (Win10) for Dynamic TZ APIs.
-        f"-I{MBEDTLS_DIR / 'include'}",
-        f"-I{ROOT / 'third_party'}",
-        # Build dir holds the generated version.h (see write_version_header).
-        f"-I{BUILD}",
-        "-DMBEDTLS_CONFIG_FILE=<lunar_mbedtls_config.h>",
-        "-o", str(exe),
-        str(SRC / "lunar.c"),
-        str(SRC / "app_paths.c"),
-        str(SRC / "sysvol.c"),
-        str(SRC / "netutil.c"),
-        str(SRC / "ntp.c"),
-        str(SRC / "clock.c"),
-        str(SRC / "logbuf.c"),
-        str(SRC / "tz.c"),
-        str(SRC / "tzif.c"),
-        str(SRC / "tz_embed.c"),
-        str(SRC / "tz_winmap.c"),
-        str(SRC / "tz_winmap_gen.c"),
-        str(SRC / "siv.c"),
-        str(SRC / "nts_ke.c"),
-        str(SRC / "nts_ef.c"),
-        str(SRC / "pinned_tls.c"),
-        str(SRC / "cert_verify_win.c"),
-        str(SRC / "pin_store.c"),
-        str(SRC / "update_check.c"),
-        str(SRC / "nts.c"),
-        str(SRC / "dns.c"),
-        str(res),
-        # Static archive goes AFTER the objects so the linker sees the
-        # undefined symbols first; standard GCC link-order rule.
-        str(mbedtls_archive),
-        "-Wl,--gc-sections",
-        # Direct2D + DirectWrite for rendering; winmm for PlaySound;
-        # ole32 for COM plumbing that sysvol.c and D2D rely on;
-        # ws2_32 for SNTP; uxtheme for native title-bar theming;
-        # advapi32 for mbedTLS's entropy source (CryptGenRandom) and
-        # crypt32 for Windows certificate-chain validation / DPAPI.
-        "-ld2d1", "-ldwrite", "-lwinmm",
-        "-luser32", "-lkernel32", "-lgdi32", "-lcomctl32", "-lshell32",
-        "-luxtheme", "-lole32", "-lws2_32", "-ldwmapi", "-ladvapi32", "-lcrypt32",
-        "-lbcrypt", "-lwtsapi32",
-    )
-    log(f"{exe}  ({exe.stat().st_size / 1048576:.2f} MB)")
-
-    # ---- deploy ------------------------------------------------------------
-    if args.no_desktop:
-        return
-    target = args.dest if args.dest else desktop_dir()
-    if target is None or not target.is_dir():
-        die("desktop directory not found; try --dest <path>")
-    final = target / exe.name
-    shutil.copy2(exe, final)
-    log(f"Copied to {final}")
+    log(f"Version {version} (from VERSION)  ->  {BUILD / 'version.h'}")
+    gcc = find_tool("gcc")
+    archive = build_mbedtls_archive(gcc)
+    log(f"Prerequisites ready: {archive}")
 
 
 if __name__ == "__main__":

@@ -79,7 +79,8 @@ key writing, weak curves, weak hashes, and deprecated APIs.
    `scripts/build.py` (the `MBEDTLS_DIR` constant), and in
    `lunar_mbedtls_config.h`'s header comment.
 5. Build. The cache-key hash of the archive will change, triggering
-   a full recompile of the vendored tree. Run tests and smoke.
+   a full recompile of the vendored tree. Run the tests
+   (`python tests/run_tests.py`) and a self-test (`tools/tasks.tcl check`).
 6. Commit as a single commit titled "Bump mbedTLS to X.Y.Z".
 
 ----------------------------------------------------------------------

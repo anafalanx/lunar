@@ -9,7 +9,7 @@
 <details>
 <summary><sub><i>Primer 0 — orientation: what problem is this clock solving?</i></sub></summary>
 
-<sub>Lunar is an analog desktop clock that refuses to display the Windows system clock. The Windows clock can be wrong (user edit, malware, CMOS battery, drift, broken `w32time`, VM sleep/wake). Lunar reads the true time directly from Internet time servers, keeps its own monotonic running clock locally, and renders a red **INOP** ("inoperative") state whenever it cannot verify the time. The sync-and-adjustment mechanism analysed below is the safety-critical core: it is what lets the clock claim "trusted time" and what lets it refuse to lie.</i></sub>
+<sub>Lunar is a digital desktop clock that refuses to display the Windows system clock. The Windows clock can be wrong (user edit, malware, CMOS battery, drift, broken `w32time`, VM sleep/wake). Lunar reads the true time directly from Internet time servers, keeps its own monotonic running clock locally, and renders a red **INOP** ("inoperative") state whenever it cannot verify the time. The sync-and-adjustment mechanism analysed below is the safety-critical core: it is what lets the clock claim "trusted time" and what lets it refuse to lie.</i></sub>
 
 </details>
 
@@ -64,7 +64,7 @@
 
 <sub><b>Anchor</b>. A pair <code>(qpc, utc)</code> that pins "this QPC moment corresponded to this UTC". Projecting forward uses <code>utc + (qpc_now − qpc_anchor) · (1 + ppm/1e6)</code>.</sub>
 
-<sub><b>Display lease</b> and <b>snap</b>. A trusted poll grants a short lease during which the dial may render from the disciplined anchor. If the lease expires before another trusted poll renews it, the UI renders INOP. <i>Snap</i> = rebase the anchor instantly to the accepted trusted sample; Lunar favors correctness over smoothing.</sub>
+<sub><b>Display lease</b> and <b>snap</b>. A trusted poll grants a short lease during which the display may render from the disciplined anchor. If the lease expires before another trusted poll renews it, the UI renders INOP. <i>Snap</i> = rebase the anchor instantly to the accepted trusted sample; Lunar favors correctness over smoothing.</sub>
 
 <sub><b>INOP</b> (inoperative). Aviation-inspired term: when the instrument cannot guarantee correct data, it says so instead of guessing. Lunar renders a red "INOP" state rather than display an untrusted time.</sub>
 
@@ -240,7 +240,7 @@ We rely fully on the TLS 1.3 client-hello entropy + NTS cookie for replay protec
 
 4. **Disk integrity on `discipline.dat`** (S5). Wrap the file in DPAPI (`CryptProtectData`). Reject tampered files, fall back to 0-ppm bootstrap, log.
 
-5. **Display freshness hardening** (C4). Keep the display lease short, trip INOP on UI timer/resume gaps, and keep render fallbacks that paint INOP if the normal Direct2D path cannot present a fresh dial.
+5. **Display freshness hardening** (C4). Keep the display lease short, trip INOP on UI timer/resume gaps, and keep render fallbacks that paint INOP if the normal render path cannot present a fresh display.
 
 6. **Adversarial-input test suite** (C7). Table-driven tests that feed `Clock_OnSyncedNtpUtc` crafted sequences: steady drift, step change, sleep-wake (QPC gap), alternating-bias attack, slow bias-drift attack. Assert: monotonicity, convergence, bounded rate excursion, no snap-storm.
 

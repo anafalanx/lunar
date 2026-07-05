@@ -41,13 +41,13 @@ def main() -> int:
     # Ensure the mbedTLS static archive is built (cached after first run).
     mbedtls_archive = build_mbedtls_archive(gcc)
 
-    # lunar.c includes the generated version header; make sure it exists
-    # even when tests run before a full build.
+    # The engine sources include the generated version header; make sure
+    # it exists even when tests run before a full build.
     write_version_header(ROOT / "build", read_version())
 
     exe = BUILD / "test_core.exe"
     src = [
-        TESTS / "test_core.c",   # #includes ../src/lunar.c with LUNAR_NO_MAIN
+        TESTS / "test_core.c",   # engine unit tests; links the .c files below
         SRC  / "app_paths.c",
         SRC  / "sysvol.c",
         SRC  / "netutil.c",
@@ -86,10 +86,12 @@ def main() -> int:
         *[str(p) for p in src],
         str(mbedtls_archive),
         "-Wl,--gc-sections",
-        "-ld2d1", "-ldwrite", "-lwinmm",
-        "-luser32", "-lkernel32", "-lgdi32", "-lcomctl32", "-lshell32",
-        "-luxtheme", "-lole32", "-lws2_32", "-ldwmapi", "-ladvapi32", "-lcrypt32",
-        "-lbcrypt", "-lwtsapi32",
+        # Engine link deps only (the Direct2D/DirectWrite shell is retired):
+        # winmm (sysvol), ole32 (sysvol COM), ws2_32 (sockets), crypt32 +
+        # bcrypt (cert verify / entropy), advapi32, wtsapi32.
+        "-lwinmm",
+        "-luser32", "-lkernel32", "-lole32", "-lws2_32", "-ladvapi32",
+        "-lcrypt32", "-lbcrypt", "-lwtsapi32",
     ]
     print("==> Compiling tests")
     print("   ", " ".join(cmd))

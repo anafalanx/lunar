@@ -23,22 +23,10 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-python
 
-      - name: Build
-        run: python scripts/build.py --no-desktop
-
-      - name: Unit tests
+      # The shipped product is the Tcl/Tk shell (see tools/tasks.tcl), which
+      # links a static Tcl/Tk 9 payload that isn't available on hosted
+      # runners -- so CI can't produce the exe. It exercises what it can:
+      # run_tests.py compiles the vendored mbedTLS archive and the full C
+      # engine from source, then runs the unit-test suite against it.
+      - name: Engine unit tests
         run: python tests/run_tests.py
-
-      # The smoke test launches a real window. GitHub Windows runners
-      # usually have an interactive desktop session, but window creation
-      # can be flaky in hosted configs, so this step never blocks the run.
-      - name: Smoke test (best effort)
-        continue-on-error: true
-        run: python tests/test_smoke.py
-
-      - name: Upload Lunar.exe
-        uses: actions/upload-artifact@v4
-        with:
-          name: Lunar.exe
-          path: build/Lunar.exe
-          if-no-files-found: error
