@@ -178,7 +178,8 @@ static NtpSourceResult  g_results[NTP_SOURCE_COUNT];
 static volatile LONG64  g_offsetMs        = 0;   // legacy accessor
 static volatile LONG64  g_lastSuccessTick = 0;   // GetTickCount64() at any-ok
 static volatile LONG64  g_lastSuccessUtc  = 0;   // UTC ms at any-ok
-static volatile LONG64  g_lastSpreadMs    = 0;   // last cycle's spread
+static volatile LONG64  g_lastSpreadMs    = 0;   // last cycle's core spread
+static volatile LONG64  g_lastNtsSpreadMs = 0;   // last cycle's NTS-pair spread
 static volatile LONG    g_running         = 0;
 static volatile LONG    g_shutdownRequested = 0;
 static volatile LONG    g_activeWorkers     = 0;
@@ -836,6 +837,11 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
     // draws from independent pinned providers; Ntp_Concur rejects
     // divergent authenticated samples.
     const NtsProvider *chosenNts[NTP_NTS_COUNT * NTP_NTS_SLOT_ATTEMPTS] = { 0 };
+    // While not currently trusted (acquiring, holdover, or reacquiring after a
+    // suspend/resume), rotate to a fresh operator-diverse NTS pair rather than
+    // reusing the sticky one -- so re-anchor never gambles on a bad or
+    // stale-cookie provider. Sticky reuse resumes once TRUST_OK is held again.
+    if (Clock_Trust() < TRUST_OK) Nts_ForceRepick();
     size_t nNts = Nts_PickProviders(chosenNts,
                                     NTP_NTS_COUNT * NTP_NTS_SLOT_ATTEMPTS);
 
@@ -1396,6 +1402,10 @@ TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
                                              a->qpcAtT4, qpcFreq);
         int64_t ntsDelta = bProjOnA - a->ntpUtcMs;  // b - a at a's qpc
         int64_t ntsAbs   = ntsDelta < 0 ? -ntsDelta : ntsDelta;
+        // Publish the authenticated-pair spread so the poll scheduler can
+        // require the two NTS anchors to agree TIGHTLY (not merely within the
+        // 200 ms gate) before it relaxes the cadence.
+        InterlockedExchange64(&g_lastNtsSpreadMs, (LONG64)ntsAbs);
         if (ntsAbs > CONCUR_THRESHOLD_MS) {
             if (outMaxSpreadMs) *outMaxSpreadMs = ntsAbs;
             return TRUST_INOP;
@@ -1553,6 +1563,10 @@ int64_t Ntp_LastSyncUtcMs(void) {
 
 int64_t Ntp_LastSpreadMs(void) {
     return (int64_t)g_lastSpreadMs;
+}
+
+int64_t Ntp_LastNtsSpreadMs(void) {
+    return (int64_t)g_lastNtsSpreadMs;
 }
 
 int Ntp_GetResults(NtpSourceResult out[NTP_SOURCE_COUNT]) {

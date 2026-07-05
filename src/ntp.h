@@ -80,6 +80,11 @@ int64_t Ntp_LastSyncUtcMs(void);
 // before the first cycle.
 int64_t Ntp_LastSpreadMs(void);
 
+// Largest mutual spread (ms) between the two authenticated NTS anchors on the
+// most recent cycle that had both. The poll scheduler gates cadence-relaxation
+// on this being small, so it only backs off when the trust anchors agree tightly.
+int64_t Ntp_LastNtsSpreadMs(void);
+
 // Copy the latest per-source results out of ntp.c under its lock.
 // Returns the number of sources that ok'd in that cycle (0..NTP_SOURCE_COUNT).
 int     Ntp_GetResults(NtpSourceResult out[NTP_SOURCE_COUNT]);

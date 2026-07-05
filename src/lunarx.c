@@ -306,6 +306,7 @@ static int Status_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
     PUT(d, "sysDeltaMs",    Tcl_NewWideIntObj((Tcl_WideInt)sysDelta));
     PUT(d, "ratePpm",       Tcl_NewIntObj((int)Clock_RatePpm()));
     PUT(d, "spreadMs",      Tcl_NewWideIntObj((Tcl_WideInt)Ntp_LastSpreadMs()));
+    PUT(d, "ntsSpreadMs",   Tcl_NewWideIntObj((Tcl_WideInt)Ntp_LastNtsSpreadMs()));
     PUT(d, "synced",        Tcl_NewIntObj(Ntp_IsSynced() ? 1 : 0));
 
     Tcl_SetObjResult(ip, d);

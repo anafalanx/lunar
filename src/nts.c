@@ -98,6 +98,20 @@ const NtsProvider *Nts_PickProvider(void)
     return &kProviders[r % NTS_PROVIDER_COUNT];
 }
 
+// Sticky provider set: reuse the same operator-diverse draw across consecutive
+// healthy cycles so the providers' cookie jars stay warm (RFC 8915 reuse), and
+// rotate periodically for diversity-over-time. Nts_PickProviders is called once
+// per cycle from the single aggregator thread, so no lock is needed. Rotate on
+// demand (Nts_ForceRepick) whenever the clock is not yet TRUST_OK -- acquiring,
+// holdover, or reacquiring after suspend/resume -- so re-anchor never rides a
+// possibly-bad or stale pair.
+#define NTS_STICKY_ROTATE_CYCLES 8
+static const NtsProvider *g_sticky[NTS_PROVIDER_COUNT];
+static size_t             g_sticky_n   = 0;
+static int                g_sticky_age = 0;
+
+void Nts_ForceRepick(void) { g_sticky_n = 0; }
+
 size_t Nts_PickProviders(const NtsProvider **out, size_t n_want)
 {
     if (!out || n_want == 0) return 0;
@@ -105,6 +119,15 @@ size_t Nts_PickProviders(const NtsProvider **out, size_t n_want)
     size_t n_enabled = NTS_PROVIDER_COUNT;
     for (size_t i = 0; i < n_enabled; i++) enabled[i] = i;
     if (n_want > n_enabled) n_want = n_enabled;
+
+    // Reuse the current sticky set if it matches this request and has not aged
+    // out. This keeps handshakes rare in steady state instead of drawing fresh
+    // (cold-jar) hosts every cycle.
+    if (g_sticky_n == n_want && g_sticky_age < NTS_STICKY_ROTATE_CYCLES) {
+        for (size_t i = 0; i < n_want; i++) out[i] = g_sticky[i];
+        g_sticky_age++;
+        return n_want;
+    }
 
     // Fisher-Yates shuffle over the metadata indices using
     // BCryptGenRandom for each draw. n is small (<= pool size), so
@@ -148,6 +171,16 @@ size_t Nts_PickProviders(const NtsProvider **out, size_t n_want)
             }
         }
         if (!already) out[written++] = p;
+    }
+
+    // Remember this draw as the new sticky set (only when it fully satisfied
+    // the request, so a short/degraded draw is not pinned).
+    if (written == n_want && written <= NTS_PROVIDER_COUNT) {
+        for (size_t i = 0; i < written; i++) g_sticky[i] = out[i];
+        g_sticky_n   = written;
+        g_sticky_age = 0;
+    } else {
+        g_sticky_n = 0;
     }
     return written;
 }
@@ -468,6 +501,13 @@ static int parse_sntp_reply(const uint8_t *pkt, size_t pkt_len,
 
 #define NTS_JAR_SLOTS 12
 
+// Absolute age guard: a jarred cookie set older than this is treated as empty
+// (fall straight to a fresh KE) rather than spending a cookie the server has
+// likely already expired -- e.g. after the laptop slept for hours. RFC 8915
+// cookie lifetimes vary and are not guaranteed multi-hour, so 1 h is a safe
+// floor that never wastes a doomed authenticated round trip on wake.
+#define NTS_JAR_MAX_AGE_MS  (60ULL * 60ULL * 1000ULL)
+
 typedef struct {
     char     host[NTSKE_MAX_NTP_HOST_LEN + 1];   // jar key = provider host
     int      valid;
@@ -479,6 +519,7 @@ typedef struct {
     size_t   cookie_len[NTSKE_MAX_COOKIES];
     uint8_t  cookies[NTSKE_MAX_COOKIES][NTSKE_MAX_COOKIE_LEN];
     uint64_t last_use_tick;
+    uint64_t stored_tick;   // GetTickCount64() when this KE's cookies were jarred
 } NtsJar;
 
 static NtsJar           g_jars[NTS_JAR_SLOTS];
@@ -512,6 +553,12 @@ static int jar_take(const char *host,
     int got = 0;
     EnterCriticalSection(&g_jar_cs);
     NtsJar *j = jar_find(host);
+    if (j && j->cookie_count > 0 &&
+        (GetTickCount64() - j->stored_tick) > NTS_JAR_MAX_AGE_MS) {
+        // Cookies too old to trust the server still honors them; drop the whole
+        // set so this exchange does a fresh KE instead of a doomed round trip.
+        j->cookie_count = 0;
+    }
     if (j && j->cookie_count > 0) {
         memcpy(c2s, j->c2s_key, 32);
         memcpy(s2c, j->s2c_key, 32);
@@ -559,6 +606,7 @@ static void jar_store(const char *host,
         j->cookie_len[i] = lens[i];
         memcpy(j->cookies[i], cookies[i], lens[i]);
     }
+    j->stored_tick = GetTickCount64();   // for the absolute cookie-age guard
     j->valid = 1;
     j->last_use_tick = GetTickCount64();
     LeaveCriticalSection(&g_jar_cs);

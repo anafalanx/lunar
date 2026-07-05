@@ -9,7 +9,12 @@ package require Tk
 
 namespace eval lunar {
     variable version "0.53"
-    variable poll_ms 60000   ;# ask the engine to re-sync at most this often
+    variable poll_ms   60000 ;# BASE cadence: re-sync about this often when OK
+    variable poll_min   8000 ;# FAST floor while acquiring / re-anchoring
+    variable poll_max 300000 ;# RELAXED ceiling once well disciplined (5 min)
+    variable poll_good     0 ;# consecutive converged cycles (drives the relax ramp)
+    variable poll_bad      0 ;# consecutive unhealthy cycles (drives the fast backoff)
+    variable poll_cur  60000 ;# current interval actually scheduled (for the log/About)
     variable log_active 0    ;# reentry latch so logging can't recurse into bgerror
 }
 
@@ -704,8 +709,51 @@ proc lunar::settings_ok {} {
 # main: a `proc lunar::x` created from within a ::lunar-namespace proc would
 # resolve to ::lunar::lunar::x and fail).
 proc lunar::repoll {} {
-    catch { ::lunar::syncnow }
-    after $::lunar::poll_ms lunar::repoll
+    set err [catch { ::lunar::syncnow }]
+    set next [lunar::next_poll_ms $err]
+    set ::lunar::poll_cur $next
+    after $next lunar::repoll
+}
+
+# Adaptive poll cadence (this is the ENTIRE scheduler; the C engine polls only
+# when syncnow calls it). Sync FAST while acquiring or re-anchoring, at the BASE
+# rate while merely OK, and RELAX toward the ceiling only once the clock is well
+# self-regulated -- consecutive cycles that are TRUST_OK, carry a converged drift
+# rate, and where BOTH the core sources and the two NTS anchors agree tightly.
+# Any state drop, sync error, or continuity break (state != ok/degraded) snaps
+# straight back to FAST, then backs off toward BASE so a sustained outage does
+# not hammer the servers. Returns the ms delay until the next poll.
+proc lunar::next_poll_ms {syncErr} {
+    set fast $::lunar::poll_min
+    set base $::lunar::poll_ms
+    set max  $::lunar::poll_max
+    set unhealthy $syncErr
+    set converged 0
+    if {!$syncErr && [llength [info commands ::lunar::status]]} {
+        if {[catch { ::lunar::status } st]} {
+            set unhealthy 1
+        } else {
+            set state [dict get $st state]
+            if {$state ni {ok degraded}} { set unhealthy 1 }
+            if {$state eq "ok" && [dict get $st synced] && [dict get $st ratePpm] != 0} {
+                set cs [dict get $st spreadMs]
+                set ns [dict get $st ntsSpreadMs]
+                if {$cs >= 0 && $cs <= 80 && $ns >= 0 && $ns <= 80} { set converged 1 }
+            }
+        }
+    }
+    if {$unhealthy} {
+        set ::lunar::poll_good 0
+        incr ::lunar::poll_bad
+        set iv [expr {$fast * (1 << min($::lunar::poll_bad - 1, 4))}]  ;# 8,16,32,60,60s
+        return [expr {$iv > $base ? $base : $iv}]
+    }
+    set ::lunar::poll_bad 0
+    if {!$converged} { set ::lunar::poll_good 0 ; return $base }
+    incr ::lunar::poll_good
+    if {$::lunar::poll_good < 3} { return $base }                      ;# confirm before relaxing
+    set iv [expr {$base * (1 << min($::lunar::poll_good - 3, 8))}]     ;# 60,120,240,480...
+    return [expr {$iv > $max ? $max : $iv}]                           ;# capped at 5 min
 }
 
 # ---- system tray + window state --------------------------------------------
@@ -915,6 +963,30 @@ proc lunar::selftest {reportPath} {
         lunar::prewarm_check 3 57 1000    ;# next minute :04 not a mark -> no
         append txt "prewarmfire=$::lunar::_prewarms\n"           ;# want 1
     }
+    # verify the adaptive poll cadence: FAST (8s) when unhealthy, BASE (60s)
+    # when merely OK, RELAXED ramp (120/240/300s, capped) once converged.
+    catch {
+        catch { rename ::lunar::status ::lunar::_realstatus }
+        proc ::lunar::status {} { return $::lunar::_ststub }
+        set ::lunar::poll_good 0 ; set ::lunar::poll_bad 0
+        set ::lunar::_ststub {state holdover synced 0 ratePpm 0 spreadMs 0 ntsSpreadMs 0}
+        set fst [lunar::next_poll_ms 0]                          ;# unhealthy -> 8000
+        set ::lunar::poll_good 0 ; set ::lunar::poll_bad 0
+        set ::lunar::_ststub {state ok synced 1 ratePpm 0 spreadMs 20 ntsSpreadMs 20}
+        set bse [lunar::next_poll_ms 0]                          ;# OK, no rate -> 60000
+        set ::lunar::poll_good 0 ; set ::lunar::poll_bad 0
+        set ::lunar::_ststub {state ok synced 1 ratePpm 13 spreadMs 20 ntsSpreadMs 20}
+        for {set i 1} {$i <= 3} {incr i} { set r3 [lunar::next_poll_ms 0] } ;# confirm x3 -> 60000
+        set r4 [lunar::next_poll_ms 0]                           ;# -> 120000
+        set r5 [lunar::next_poll_ms 0]                           ;# -> 240000
+        set r6 [lunar::next_poll_ms 0]                           ;# -> capped 300000
+        set good [expr {$fst==8000 && $bse==60000 && $r3==60000 && $r4==120000 \
+                        && $r5==240000 && $r6==300000}]
+        if {$good} { set cad ok } else { set cad "BAD $fst $bse $r3 $r4 $r5 $r6" }
+        append txt "pollcadence=$cad\n"
+        catch { rename ::lunar::status {} }
+        catch { rename ::lunar::_realstatus ::lunar::status }
+    }
     # build added a real tray icon; remove it so headless checks leave nothing
     catch { if {[llength [info commands ::lunar::tray_remove]]} { ::lunar::tray_remove [winfo id .] } }
     append txt "status=[expr {$ok ? {ok} : {FAIL}}]\n"
@@ -955,7 +1027,10 @@ proc lunar::main {} {
         if {[catch { ::lunar::engine_start } e opts]} {
             catch { lunar::log "\[engine_start\] [dict get $opts -errorinfo]" }
         }
-        after $::lunar::poll_ms lunar::repoll
+        # engine_start fired cycle #1 now; arm the adaptive scheduler at the
+        # FAST floor so a fresh boot re-polls quickly until it has anchored,
+        # rather than waiting a full base interval.
+        after $::lunar::poll_min lunar::repoll
     }
     after 100 lunar::tick
     # dev hooks: open a dialog on launch, for screenshots/testing

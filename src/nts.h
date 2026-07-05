@@ -85,6 +85,12 @@ const NtsProvider *Nts_PickProvider(void);
 // caller wants operator diversity within one cycle.
 size_t Nts_PickProviders(const NtsProvider **out, size_t n_want);
 
+// Invalidate the sticky provider set so the next Nts_PickProviders draws a
+// fresh operator-diverse pair. The poll aggregator calls this whenever the
+// clock is not currently TRUST_OK (acquiring / holdover / reacquiring), so a
+// re-anchor never reuses a possibly-bad or stale-cookie pair.
+void Nts_ForceRepick(void);
+
 // Perform a full NTS-KE exchange:
 //   TCP connect -> TLS 1.3 handshake (ALPN "ntske/1") -> local SPKI
 //   pin match or Windows CA enrollment -> NTS-KE records -> TLS

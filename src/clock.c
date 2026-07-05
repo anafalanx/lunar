@@ -88,12 +88,16 @@ static int        g_consecutiveLocalFaults = 0;
 //
 // CYCLE_STALE_AFTER_MS: a corroborating cycle older than this no longer
 // keeps the OK/DEGRADED claim alive and the display derives to HOLDOVER.
-// Chosen above the worst-case healthy renewal path (60 s poll interval
-// + 40 s cycle budget = 100 s) so a slow-but-successful cycle never
-// causes a false alarm.
+// Chosen above the worst-case healthy renewal path: the poll scheduler
+// (lunar.tcl) relaxes the cadence up to a 300 s (5 min) ceiling when the
+// clock is well disciplined, and one cycle can take up to the 40 s cycle
+// budget, so a healthy slow renewal lands up to 340 s apart. 360 s clears
+// that with a 20 s margin, so a slow-but-successful relaxed cycle never
+// false-alarms to HOLDOVER, while a genuinely wedged poller is still caught
+// within ~6 min (proportionate to the relaxed cadence).
 #define BOUND_BASE_MS            200
 #define BOUND_DEGRADED_CAP_MS    300
-#define CYCLE_STALE_AFTER_MS  150000
+#define CYCLE_STALE_AFTER_MS  360000
 
 // --- Discipline-loop constants --------------------------------------------
 //
