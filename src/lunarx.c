@@ -14,9 +14,12 @@
 #include <windows.h>
 #include <shellapi.h>   /* Shell_NotifyIcon (system tray) */
 #include <commctrl.h>   /* SetWindowSubclass (marshal the tray callback) */
+#include <mmsystem.h>   /* PlaySoundW (chime) */
 #include <tcl.h>
 
 #include <string.h>
+#include <stdint.h>
+#include <math.h>
 
 #include "clock.h"
 #include "ntp.h"
@@ -46,6 +49,71 @@ static const char *auth_name(NtpAuthMode m) {
 }
 
 #define PUT(d, k, v) Tcl_DictObjPut(ip, (d), Tcl_NewStringObj((k), -1), (v))
+
+/* ---- chime (ported verbatim from the Win32 shell's PlayBeep) -----------
+ * A single 880 Hz / 250 ms sine chime rendered to an in-memory WAV and
+ * played async, volume-compensated against the system master slider. */
+extern float Sysvol_Get(void);   /* sysvol.c (compiled into the engine) */
+
+#define BEEP_SAMPLE_RATE 44100
+#define BEEP_FRAMES      (BEEP_SAMPLE_RATE / 4)          /* 250 ms */
+#define BEEP_FREQ_HZ     880.0f                          /* A5 */
+#define BEEP_TARGET_SPEAKER_AMPLITUDE 0.276f
+#define BEEP_DATA_BYTES  (BEEP_FRAMES * 2)
+#define BEEP_BUF_BYTES   (44 + BEEP_DATA_BYTES)
+
+static unsigned char g_wav[BEEP_BUF_BYTES];
+static void WriteLE16(unsigned char *p, uint16_t v) { p[0]=v&0xFF; p[1]=(v>>8)&0xFF; }
+static void WriteLE32(unsigned char *p, uint32_t v) {
+    p[0]=v&0xFF; p[1]=(v>>8)&0xFF; p[2]=(v>>16)&0xFF; p[3]=(v>>24)&0xFF;
+}
+static void BuildWav(float freqHz, float amplitude) {
+    unsigned char *p = g_wav;
+    memcpy(p, "RIFF", 4);               p += 4;
+    WriteLE32(p, 36 + BEEP_DATA_BYTES); p += 4;
+    memcpy(p, "WAVE", 4);               p += 4;
+    memcpy(p, "fmt ", 4);               p += 4;
+    WriteLE32(p, 16);                   p += 4;
+    WriteLE16(p, 1);                    p += 2;
+    WriteLE16(p, 1);                    p += 2;
+    WriteLE32(p, BEEP_SAMPLE_RATE);     p += 4;
+    WriteLE32(p, BEEP_SAMPLE_RATE * 2); p += 4;
+    WriteLE16(p, 2);                    p += 2;
+    WriteLE16(p, 16);                   p += 2;
+    memcpy(p, "data", 4);               p += 4;
+    WriteLE32(p, BEEP_DATA_BYTES);      p += 4;
+    const float TAU = 6.28318530717958647692f;
+    const float attackFrames  = BEEP_SAMPLE_RATE * 0.010f;
+    const float releaseFrames = BEEP_SAMPLE_RATE * 0.030f;
+    for (int i = 0; i < BEEP_FRAMES; i++) {
+        float env = 1.0f;
+        if (i < attackFrames)                     env = (float)i / attackFrames;
+        else if (i > BEEP_FRAMES - releaseFrames) env = (BEEP_FRAMES - i) / releaseFrames;
+        float s = sinf(TAU * freqHz * (float)i / BEEP_SAMPLE_RATE) * env * amplitude;
+        int v = (int)(s * 32767.0f);
+        if (v >  32767) v =  32767;
+        if (v < -32768) v = -32768;
+        WriteLE16(p, (uint16_t)(int16_t)v);
+        p += 2;
+    }
+}
+static void PlayBeepImpl(void) {
+    float v = Sysvol_Get();
+    if (v <= 0.01f) return;
+    float amp = BEEP_TARGET_SPEAKER_AMPLITUDE / v;
+    if (amp > 0.90f) amp = 0.90f;
+    if (amp < 0.05f) amp = 0.05f;
+    BuildWav(BEEP_FREQ_HZ, amp);
+    PlaySoundW((LPCWSTR)g_wav, NULL, SND_MEMORY | SND_ASYNC);
+}
+/* lunar::beep -- play the chime once. */
+static int Beep_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
+                    int objc, Tcl_Obj *const objv[]) {
+    if (objc != 1) { Tcl_WrongNumArgs(ip, 1, objv, ""); return TCL_ERROR; }
+    PlayBeepImpl();
+    Tcl_SetObjResult(ip, Tcl_NewObj());
+    return TCL_OK;
+}
 
 /* lunar::engine_start -- one-time engine bootstrap. */
 static int EngineStart_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
@@ -293,6 +361,15 @@ static LRESULT CALLBACK TraySubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         }
         return 0;
     }
+    if (msg == WM_ENDSESSION && wp) {
+        /* OS shutdown/logoff bypasses the normal quit path: persist the
+         * disciplined rate + the diagnostic log NOW (we run on the Tk
+         * thread, so calling the engine directly is safe). No Ntp_Shutdown
+         * -- its worker drain could eat the seconds Windows grants us. */
+        Clock_Shutdown();
+        Log_FlushToDisk(NULL);
+        return 0;
+    }
     if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, TraySubclass, uid);
     return DefSubclassProc(hwnd, msg, wp, lp);
 }
@@ -428,6 +505,7 @@ int Lunarx_Init(Tcl_Interp *ip) {
     Tcl_CreateObjCommand(ip, "::lunar::run_at_startup", RunAtStartup_Cmd, nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::log_text",     LogText_Cmd,     nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::about",        About_Cmd,       nullptr, nullptr);
+    Tcl_CreateObjCommand(ip, "::lunar::beep",         Beep_Cmd,        nullptr, nullptr);
     if (Tcl_PkgProvide(ip, "lunarx", "0.1") != TCL_OK) return TCL_ERROR;
     return TCL_OK;
 }

@@ -122,11 +122,13 @@ proc lunar::fmt_delta {ms} {
 # two shells can be swapped without losing anything. The PRESENCE of the tz=
 # key -- even empty, meaning explicit UTC -- counts as a deliberate choice;
 # only then does first-run OS-zone suggestion stop.
-set ::lunar::cfg [dict create fmt24 1 tray 0 startup 0]
-set ::lunar::cfg_extra {}       ;# unowned lines (chimes/unmin/confirm), kept in file order
+set ::lunar::cfg [dict create fmt24 1 tray 0 startup 0 chimes 1 unmin 0]
+set ::lunar::cfg_extra {}       ;# unowned lines (confirm), kept in file order
 set ::lunar::tz "UTC"           ;# the active display zone
 set ::lunar::tz_chosen 0
 set ::lunar::tray_tip_last ""
+set ::lunar::armed [lrepeat 12 0]   ;# the 12 five-minute marks (:00..:55)
+set ::lunar::prev_min -1            ;# last displayed integer minute (chime edge)
 
 proc lunar::settings_load {} {
     set path [file join [lunar::datadir] settings.dat]
@@ -140,6 +142,8 @@ proc lunar::settings_load {} {
             fmt24   { dict set ::lunar::cfg fmt24   [expr {$v ? 1 : 0}] }
             tray    { dict set ::lunar::cfg tray    [expr {$v ? 1 : 0}] }
             startup { dict set ::lunar::cfg startup [expr {$v ? 1 : 0}] }
+            chimes  { dict set ::lunar::cfg chimes  [expr {$v ? 1 : 0}] }
+            unmin   { dict set ::lunar::cfg unmin   [expr {$v ? 1 : 0}] }
             tz      { set ::lunar::tz_chosen 1 ; dict set ::lunar::cfg tz $v }
             default { lappend ::lunar::cfg_extra $line }
         }
@@ -150,6 +154,8 @@ proc lunar::settings_save {} {
     set dir [lunar::datadir]
     if {[catch {file mkdir $dir}]} { return }
     set lines $::lunar::cfg_extra
+    lappend lines "chimes=[dict get $::lunar::cfg chimes]"
+    lappend lines "unmin=[dict get $::lunar::cfg unmin]"
     lappend lines "fmt24=[dict get $::lunar::cfg fmt24]"
     lappend lines "tray=[dict get $::lunar::cfg tray]"
     lappend lines "startup=[dict get $::lunar::cfg startup]"
@@ -163,6 +169,49 @@ proc lunar::settings_save {} {
     } err]} {
         catch { file delete -force $tmp }
         lunar::log "\[settings\] save failed: $err"
+    }
+}
+
+# armed.dat: 12 chars '0'/'1', one per five-minute mark (:00..:55). Same file
+# and format as the Win32 shell, so the two are interchangeable.
+proc lunar::armed_load {} {
+    if {[catch {open [file join [lunar::datadir] armed.dat] r} fh]} return
+    set raw [read $fh] ; close $fh
+    set a {}
+    for {set i 0} {$i < 12} {incr i} {
+        lappend a [expr {[string index $raw $i] eq "1" ? 1 : 0}]
+    }
+    set ::lunar::armed $a
+}
+proc lunar::armed_save {} {
+    set dir [lunar::datadir]
+    if {[catch {file mkdir $dir}]} return
+    set s "" ; foreach v $::lunar::armed { append s [expr {$v ? "1" : "0"}] }
+    set path [file join $dir armed.dat] ; set tmp "$path.new"
+    if {[catch {
+        set fh [open $tmp w] ; fconfigure $fh -translation binary
+        puts -nonewline $fh $s ; close $fh
+        file rename -force $tmp $path
+    }]} { catch {file delete -force $tmp} }
+}
+
+# Chime edge detector (parity with the Win32 shell): fire once when the
+# displayed minute crosses an armed :MM mark, only while the bound is
+# chime-worthy (<30 s) and the minute-step is 1-2 (no cascade after a jump).
+proc lunar::chime_check {curMin boundMs} {
+    set prev $::lunar::prev_min
+    set ::lunar::prev_min $curMin
+    if {$prev < 0 || $curMin == $prev} return
+    set delta [expr {($curMin - $prev + 60) % 60}]
+    if {$delta < 1 || $delta > 2 || $boundMs >= 30000} return
+    set chimes [dict get $::lunar::cfg chimes]
+    set unmin  [dict get $::lunar::cfg unmin]
+    for {set k 1} {$k <= $delta} {incr k} {
+        set mm [expr {($prev + $k) % 60}]
+        if {$mm % 5 != 0} continue
+        if {![lindex $::lunar::armed [expr {$mm / 5}]]} continue
+        if {$chimes && [llength [info commands ::lunar::beep]]} { catch { ::lunar::beep } }
+        if {$unmin && [wm state .] ne "normal"} { lunar::restore }
     }
 }
 
@@ -419,6 +468,24 @@ proc lunar::settings_dlg {} {
     pack  .set.card -padx 26 -pady 20
     set c .set.card
 
+    label $c.chdr -bg $P -fg $::lunar::INK -font lunarUIb -anchor w -text "Chimes"
+    checkbutton $c.chimes -bg $P -fg $::lunar::INK -font lunarUI -anchor w \
+        -activebackground $P -selectcolor $P \
+        -text "Play a chime on armed 5-minute marks" -variable ::lunar::set_chimes
+    checkbutton $c.unmin -bg $P -fg $::lunar::INK -font lunarUI -anchor w \
+        -activebackground $P -selectcolor $P \
+        -text "Un-minimize the window on armed marks" -variable ::lunar::set_unmin
+    frame $c.marks -bg $P
+    label $c.marks.l -bg $P -fg $::lunar::MUTED -font lunarSmall -anchor w -text "Armed marks:"
+    grid $c.marks.l -row 0 -column 0 -columnspan 6 -sticky w -pady {0 2}
+    for {set i 0} {$i < 12} {incr i} {
+        checkbutton $c.marks.m$i -bg $P -fg $::lunar::INK -font lunarMono \
+            -activebackground $P -selectcolor $P -padx 2 \
+            -text [format ":%02d" [expr {$i * 5}]] -variable ::lunar::set_armed($i)
+        grid $c.marks.m$i -row [expr {1 + $i / 6}] -column [expr {$i % 6}] -sticky w -padx {0 6}
+    }
+    ttk::button $c.test -style Dialog.TButton -text "Test chime" -command { catch { ::lunar::beep } }
+
     label $c.zhdr -bg $P -fg $::lunar::INK -font lunarUIb -anchor w -text "Display time zone"
     frame $c.zf -bg $P
     label $c.zf.l -bg $P -fg $::lunar::MUTED -font lunarUI -text "Filter:"
@@ -450,7 +517,12 @@ proc lunar::settings_dlg {} {
     pack $c.btns.cancel -side right
     pack $c.btns.ok     -side right -padx {0 8}
 
-    pack $c.zhdr  -fill x -pady {0 6}
+    pack $c.chdr   -fill x -pady {0 6}
+    pack $c.chimes -fill x
+    pack $c.unmin  -fill x -pady {2 0}
+    pack $c.marks  -fill x -pady {8 0}
+    pack $c.test   -anchor w -pady {8 0}
+    pack $c.zhdr  -fill x -pady {18 6}
     pack $c.zf    -fill x -pady {0 6}
     pack $c.zl    -fill x
     pack $c.zprev   -fill x -pady {4 0}
@@ -463,6 +535,9 @@ proc lunar::settings_dlg {} {
     set ::lunar::set_fmt24   [dict get $::lunar::cfg fmt24]
     set ::lunar::set_tray    [dict get $::lunar::cfg tray]
     set ::lunar::set_startup [dict get $::lunar::cfg startup]
+    set ::lunar::set_chimes  [dict get $::lunar::cfg chimes]
+    set ::lunar::set_unmin   [dict get $::lunar::cfg unmin]
+    for {set i 0} {$i < 12} {incr i} { set ::lunar::set_armed($i) [lindex $::lunar::armed $i] }
     trace add variable ::lunar::set_filter write {apply {{args} {lunar::settings_fill}}}
     bind $c.zl.list <<ListboxSelect>> lunar::settings_preview
     bind .set <Escape> {destroy .set}
@@ -530,8 +605,14 @@ proc lunar::settings_ok {} {
     if {$z ne ""} { set ::lunar::tz $z }
     set ::lunar::tz_chosen 1
     dict set ::lunar::cfg tz [expr {$::lunar::tz eq "UTC" ? "" : $::lunar::tz}]
-    dict set ::lunar::cfg fmt24 [expr {$::lunar::set_fmt24 ? 1 : 0}]
-    dict set ::lunar::cfg tray  [expr {$::lunar::set_tray ? 1 : 0}]
+    dict set ::lunar::cfg fmt24  [expr {$::lunar::set_fmt24 ? 1 : 0}]
+    dict set ::lunar::cfg tray   [expr {$::lunar::set_tray ? 1 : 0}]
+    dict set ::lunar::cfg chimes [expr {$::lunar::set_chimes ? 1 : 0}]
+    dict set ::lunar::cfg unmin  [expr {$::lunar::set_unmin ? 1 : 0}]
+    set a {}
+    for {set i 0} {$i < 12} {incr i} { lappend a [expr {$::lunar::set_armed($i) ? 1 : 0}] }
+    set ::lunar::armed $a
+    lunar::armed_save
     # the registry Run key is the source of truth for run-at-startup
     if {[llength [info commands ::lunar::run_at_startup]]} {
         catch { ::lunar::run_at_startup [expr {$::lunar::set_startup ? 1 : 0}] }
@@ -678,6 +759,13 @@ proc lunar::render {st} {
         append tip " · [format %02d:%02d [dict get $lt hour] [dict get $lt minute]] [dict get $lt abbr]"
     }
     lunar::tray_tip_update $tip
+
+    # chimes on armed marks
+    if {$hasTime && [info exists lt]} {
+        lunar::chime_check [dict get $lt minute] [dict get $st boundMs]
+    } else {
+        set ::lunar::prev_min -1
+    }
 }
 
 proc lunar::render_sources {srcs} {
@@ -720,6 +808,20 @@ proc lunar::selftest {reportPath} {
     if {[llength [info commands ::lunar::run_at_startup]]} {
         append txt "startup=[::lunar::run_at_startup]\n"
     }
+    append txt "beep=[expr {[llength [info commands ::lunar::beep]] ? {yes} : {no}}]\n"
+    append txt "armed=[join $::lunar::armed {}]\n"
+    # verify the chime edge-detector fires on an armed crossing, silently
+    catch {
+        set ::lunar::armed [lreplace $::lunar::armed 1 1 1]   ;# arm :05
+        dict set ::lunar::cfg chimes 1
+        set ::lunar::_chimes 0
+        catch { rename ::lunar::beep ::lunar::_realbeep }
+        proc ::lunar::beep {} { incr ::lunar::_chimes }
+        set ::lunar::prev_min 4 ; lunar::chime_check 5 1000       ;# 4->5, bound ok -> fire
+        set ::lunar::prev_min 5 ; lunar::chime_check 6 1000       ;# 5->6, :06 not a mark
+        set ::lunar::prev_min 4 ; lunar::chime_check 5 60000      ;# bound too big -> no fire
+        append txt "chimefire=$::lunar::_chimes\n"                ;# want 1
+    }
     # build added a real tray icon; remove it so headless checks leave nothing
     catch { if {[llength [info commands ::lunar::tray_remove]]} { ::lunar::tray_remove [winfo id .] } }
     append txt "status=[expr {$ok ? {ok} : {FAIL}}]\n"
@@ -737,6 +839,7 @@ proc lunar::main {} {
         return
     }
     lunar::settings_load
+    lunar::armed_load
     # single-source the version from the engine (VERSION -> version.h) so the
     # title bar and About agree
     if {[llength [info commands ::lunar::about]]} {

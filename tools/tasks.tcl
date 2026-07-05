@@ -158,7 +158,7 @@ proc task_run {args} {
 set ::SYSLIBS {
     -lnetapi32 -lkernel32 -luser32 -ladvapi32 -luserenv -lws2_32
     -lgdi32 -lcomdlg32 -limm32 -lcomctl32 -lshell32 -luuid -lole32
-    -loleaut32 -lwinspool -lcrypt32 -lbcrypt -lwtsapi32
+    -loleaut32 -lwinspool -lcrypt32 -lbcrypt -lwtsapi32 -lwinmm
 }
 
 # The kept C engine (every src/*.c except the old Win32 shell lunar.c and the
