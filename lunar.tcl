@@ -129,6 +129,7 @@ set ::lunar::tz_chosen 0
 set ::lunar::tray_tip_last ""
 set ::lunar::armed [lrepeat 12 0]   ;# the 12 five-minute marks (:00..:55)
 set ::lunar::prev_min -1            ;# last displayed integer minute (chime edge)
+set ::lunar::prewarm_min -1         ;# armed mark we've already pre-warmed for
 
 proc lunar::settings_load {} {
     set path [file join [lunar::datadir] settings.dat]
@@ -193,6 +194,26 @@ proc lunar::armed_save {} {
         puts -nonewline $fh $s ; close $fh
         file rename -force $tmp $path
     }]} { catch {file delete -force $tmp} }
+}
+
+# Just-in-time audio pre-warm: ~3 s before an armed 5-minute mark, wake the
+# render endpoint so the chime renders into an awake device. Windows parks an
+# idle endpoint in D3; the D3->D0 wake would otherwise clip the tone's onset
+# (and the amp's power-on pop lands on this silent prime, not on the tone).
+# Fires once per approaching mark, and only when a chime will actually fire
+# (chimes enabled + bound chime-worthy) -- so the endpoint stays idle the rest
+# of the time, unlike a continuous keep-alive stream.
+proc lunar::prewarm_check {curMin curSec boundMs} {
+    if {$::lunar::prewarm_min == $curMin} { set ::lunar::prewarm_min -1 }  ;# mark reached; re-arm
+    if {$curSec < 57 || $boundMs >= 30000} return
+    if {![dict get $::lunar::cfg chimes]} return
+    set nextMin [expr {($curMin + 1) % 60}]
+    if {$nextMin % 5 != 0} return
+    if {![lindex $::lunar::armed [expr {$nextMin / 5}]]} return
+    if {$::lunar::prewarm_min == $nextMin} return                          ;# already primed
+    if {![llength [info commands ::lunar::prewarm]]} return
+    set ::lunar::prewarm_min $nextMin
+    catch { ::lunar::prewarm }
 }
 
 # Chime edge detector (parity with the Win32 shell): fire once when the
@@ -760,11 +781,13 @@ proc lunar::render {st} {
     }
     lunar::tray_tip_update $tip
 
-    # chimes on armed marks
+    # chimes on armed marks, with a just-in-time audio pre-warm ahead of them
     if {$hasTime && [info exists lt]} {
+        lunar::prewarm_check [dict get $lt minute] [dict get $lt second] [dict get $st boundMs]
         lunar::chime_check [dict get $lt minute] [dict get $st boundMs]
     } else {
         set ::lunar::prev_min -1
+        set ::lunar::prewarm_min -1
     }
 }
 
@@ -809,6 +832,7 @@ proc lunar::selftest {reportPath} {
         append txt "startup=[::lunar::run_at_startup]\n"
     }
     append txt "beep=[expr {[llength [info commands ::lunar::beep]] ? {yes} : {no}}]\n"
+    append txt "prewarm=[expr {[llength [info commands ::lunar::prewarm]] ? {yes} : {no}}]\n"
     append txt "armed=[join $::lunar::armed {}]\n"
     # verify the chime edge-detector fires on an armed crossing, silently
     catch {
@@ -821,6 +845,20 @@ proc lunar::selftest {reportPath} {
         set ::lunar::prev_min 5 ; lunar::chime_check 6 1000       ;# 5->6, :06 not a mark
         set ::lunar::prev_min 4 ; lunar::chime_check 5 60000      ;# bound too big -> no fire
         append txt "chimefire=$::lunar::_chimes\n"                ;# want 1
+    }
+    # verify the just-in-time pre-warm fires once, ~3 s before an armed mark
+    catch {
+        set ::lunar::armed [lreplace $::lunar::armed 1 1 1]   ;# arm :05
+        dict set ::lunar::cfg chimes 1
+        set ::lunar::_prewarms 0
+        catch { rename ::lunar::prewarm ::lunar::_realprewarm }
+        proc ::lunar::prewarm {} { incr ::lunar::_prewarms }
+        set ::lunar::prewarm_min -1
+        lunar::prewarm_check 4 57 1000    ;# 3 s before armed :05 -> prime
+        lunar::prewarm_check 4 58 1000    ;# same mark, already primed -> no
+        lunar::prewarm_check 4 50 1000    ;# too early in the minute -> no
+        lunar::prewarm_check 3 57 1000    ;# next minute :04 not a mark -> no
+        append txt "prewarmfire=$::lunar::_prewarms\n"           ;# want 1
     }
     # build added a real tray icon; remove it so headless checks leave nothing
     catch { if {[llength [info commands ::lunar::tray_remove]]} { ::lunar::tray_remove [winfo id .] } }
@@ -869,11 +907,15 @@ proc lunar::main {} {
     if {[info exists ::env(LUNAR_OPEN_SETTINGS)] && $::env(LUNAR_OPEN_SETTINGS) ne ""} { after 400 lunar::settings_dlg }
     if {[info exists ::env(LUNAR_OPEN_ABOUT)]    && $::env(LUNAR_OPEN_ABOUT)    ne ""} { after 400 lunar::about_dlg }
     if {[info exists ::env(LUNAR_OPEN_LOG)]      && $::env(LUNAR_OPEN_LOG)      ne ""} { after 400 lunar::log_dlg }
-    # LUNAR_BEEP=<n>: fire the chime n times ~700ms apart on launch, for
-    # audio testing (cold-device reliability, overlap-drop). Default 1.
+    # LUNAR_BEEP=<n>: on launch, run the real prewarm->chime sequence n times
+    # (prewarm ~300ms before each chime, ~1s apart), for audio testing
+    # (cold-device reliability, overlap-drop). Default 1.
     if {[info exists ::env(LUNAR_BEEP)] && $::env(LUNAR_BEEP) ne ""} {
         set n [expr {[string is integer -strict $::env(LUNAR_BEEP)] ? $::env(LUNAR_BEEP) : 1}]
-        for {set b 0} {$b < $n} {incr b} { after [expr {600 + $b * 700}] { catch { ::lunar::beep } } }
+        for {set b 0} {$b < $n} {incr b} {
+            after [expr {300 + $b * 1000}] { catch { ::lunar::prewarm } }
+            after [expr {600 + $b * 1000}] { catch { ::lunar::beep } }
+        }
     }
 }
 

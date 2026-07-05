@@ -175,6 +175,53 @@ static int Beep_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
     return TCL_OK;
 }
 
+/* ---- just-in-time pre-warm --------------------------------------------
+ * ::lunar::prewarm plays ~300 ms of silence to bring a D3-parked render
+ * endpoint back to D0 *ahead* of a due chime. lunar.tcl calls it ~3 s
+ * before an armed mark, so the mark-chime then renders into an already-
+ * awake, settled endpoint -- no wake clip, and the amp's power-on transient
+ * happens here (during silence) rather than on the tone. Between marks it
+ * does nothing, so unlike a continuous keep-alive stream it never holds the
+ * endpoint (or downstream HDMI/BT/USB gear) awake or costs steady-state
+ * power. SND_ASYNC keeps it off the UI's critical path; it is skipped while
+ * a chime is in flight (the endpoint is warm then, and an async play would
+ * otherwise cut the chime short -- PlaySound is process-global-single). */
+static unsigned char g_silence[44 + (BEEP_PREWARM_FRAMES * 2)];
+static int           g_silence_ready = 0;   /* UI-thread-only, like PlayBeepImpl */
+
+static void PrewarmImpl(void) {
+    if (g_beepBusy) return;
+    if (!g_silence_ready) {
+        unsigned char *p = g_silence;
+        uint32_t data = BEEP_PREWARM_FRAMES * 2;
+        memcpy(p, "RIFF", 4);               p += 4;
+        WriteLE32(p, 36 + data);            p += 4;
+        memcpy(p, "WAVE", 4);               p += 4;
+        memcpy(p, "fmt ", 4);               p += 4;
+        WriteLE32(p, 16);                   p += 4;
+        WriteLE16(p, 1);                    p += 2;
+        WriteLE16(p, 1);                    p += 2;
+        WriteLE32(p, BEEP_SAMPLE_RATE);     p += 4;
+        WriteLE32(p, BEEP_SAMPLE_RATE * 2); p += 4;
+        WriteLE16(p, 2);                    p += 2;
+        WriteLE16(p, 16);                   p += 2;
+        memcpy(p, "data", 4);               p += 4;
+        WriteLE32(p, data);                 p += 4;
+        /* the BEEP_PREWARM_FRAMES sample frames stay zero (static storage) */
+        g_silence_ready = 1;
+    }
+    PlaySoundW((LPCWSTR)g_silence, NULL, SND_MEMORY | SND_ASYNC | SND_NODEFAULT);
+}
+
+/* lunar::prewarm -- wake the audio endpoint ahead of a due chime. */
+static int Prewarm_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
+                       int objc, Tcl_Obj *const objv[]) {
+    if (objc != 1) { Tcl_WrongNumArgs(ip, 1, objv, ""); return TCL_ERROR; }
+    PrewarmImpl();
+    Tcl_SetObjResult(ip, Tcl_NewObj());
+    return TCL_OK;
+}
+
 /* lunar::engine_start -- one-time engine bootstrap. */
 static int EngineStart_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
                            int objc, Tcl_Obj *const objv[]) {
@@ -568,6 +615,7 @@ int Lunarx_Init(Tcl_Interp *ip) {
     Tcl_CreateObjCommand(ip, "::lunar::log_text",     LogText_Cmd,     nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::about",        About_Cmd,       nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::beep",         Beep_Cmd,        nullptr, nullptr);
+    Tcl_CreateObjCommand(ip, "::lunar::prewarm",      Prewarm_Cmd,     nullptr, nullptr);
     if (Tcl_PkgProvide(ip, "lunarx", "0.1") != TCL_OK) return TCL_ERROR;
     return TCL_OK;
 }
