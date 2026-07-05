@@ -13,5 +13,6 @@ Installers:
   - Architecture: x64
     InstallerUrl: https://github.com/anafalanx/lunar/releases/download/v{VERSION}/Lunar.exe
     InstallerSha256: "{SHA256}"
+    PortableCommandAlias: lunar
 ManifestType: installer
 ManifestVersion: 1.6.0
