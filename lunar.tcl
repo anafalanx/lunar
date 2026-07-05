@@ -57,6 +57,8 @@ font create lunarBig   -family Consolas   -size 44
 font create lunarDate  -family {Segoe UI} -size 12
 font create lunarSmall -family {Segoe UI} -size 9
 font create lunarState -family {Segoe UI Semibold} -size 11
+font create lunarMono  -family Consolas   -size 9
+font create lunarHdr   -family {Segoe UI Semibold} -size 8
 
 proc lunar::init_style {} {
     set s ttk::style
@@ -95,8 +97,8 @@ proc lunar::fmt_delta {ms} {
 # ---- the dashboard ----------------------------------------------------------
 proc lunar::build {} {
     wm title . "Lunar $::lunar::version"
-    wm geometry . 540x420
-    wm minsize . 440 340
+    wm geometry . 540x640
+    wm minsize . 460 520
     lunar::init_style
     . configure -background $::lunar::PAGE
     catch { wm iconphoto . -default [image create photo -file [file join [file dirname [info script]] resources icon.png]] }
@@ -107,10 +109,28 @@ proc lunar::build {} {
     label .face.date  -bg $P -fg $::lunar::MUTED -font lunarDate  -text ""
     label .face.state -bg $P -fg $::lunar::MUTED -font lunarState -text "starting…"
     label .face.bound -bg $P -fg $::lunar::MUTED -font lunarSmall -text ""
-    pack .face.time  -pady {40 0}
+    pack .face.time  -pady {26 0}
     pack .face.date  -pady {6 0}
-    pack .face.state -pady {22 0}
+    pack .face.state -pady {18 0}
     pack .face.bound -pady {3 0}
+
+    # sources section: hairline + muted header + one fixed row per slot,
+    # updated in place each tick (no rebuilding, so no flicker).
+    frame .src -bg $P
+    frame .src.hair -height 1 -bg $::lunar::HAIR
+    label .src.hdr  -bg $P -fg $::lunar::MUTED -font lunarHdr -anchor w -text "SOURCES"
+    pack .src.hair -fill x -pady {0 8}
+    pack .src.hdr  -fill x -padx 24 -pady {0 2}
+    for {set i 0} {$i < 6} {incr i} {
+        set r [frame .src.r$i -bg $P]
+        label $r.dot  -bg $P -fg $::lunar::MUTED -font lunarMono  -text "●" -width 2
+        label $r.name -bg $P -fg $::lunar::INK   -font lunarSmall -anchor w -text "—"
+        label $r.off  -bg $P -fg $::lunar::MUTED -font lunarMono  -anchor e -width 9 -text ""
+        label $r.rtt  -bg $P -fg $::lunar::MUTED -font lunarMono  -anchor e -width 8 -text ""
+        grid $r.dot $r.name $r.off $r.rtt -sticky ew -pady 1
+        grid columnconfigure $r 1 -weight 1
+        pack $r -fill x -padx 24
+    }
 
     # status bar: hairline + muted labels (els idiom)
     frame .sb -bg $::lunar::CHROME
@@ -121,9 +141,15 @@ proc lunar::build {} {
     pack .sb.sys    -side left  -padx {12 8} -pady 4
     pack .sb.update -side right -padx {8 12} -pady 4
 
-    grid .face -row 0 -column 0 -sticky nsew
-    grid .sb   -row 1 -column 0 -sticky ew
-    grid rowconfigure    . 0 -weight 1
+    # face + sources take their natural height; a page-coloured spacer absorbs
+    # the slack so the status bar stays pinned to the bottom and nothing in the
+    # face gets squeezed out.
+    frame .gap -bg $P
+    grid .face -row 0 -column 0 -sticky ew
+    grid .src  -row 1 -column 0 -sticky ew -pady {0 12}
+    grid .gap  -row 2 -column 0 -sticky nsew
+    grid .sb   -row 3 -column 0 -sticky ew
+    grid rowconfigure    . 2 -weight 1
     grid columnconfigure . 0 -weight 1
 
     bind .sb.update <Button-1> { catch { exec {*}[auto_execok start] "" \
@@ -194,6 +220,30 @@ proc lunar::render {st} {
         } else {
             .sb.update configure -text ""
         }
+    }
+
+    if {[llength [info commands ::lunar::sources]]} {
+        lunar::render_sources [::lunar::sources]
+    }
+}
+
+proc lunar::render_sources {srcs} {
+    for {set i 0} {$i < 6} {incr i} {
+        set r .src.r$i
+        if {![winfo exists $r]} continue
+        set s [lindex $srcs $i]
+        if {$s eq "" || ![dict get $s ok]} {
+            set label [expr {$s eq "" ? "—" : [dict get $s label]}]
+            if {$label eq ""} { set label "—" }
+            $r.dot  configure -fg $::lunar::HAIR
+            $r.name configure -text $label -fg $::lunar::MUTED
+            $r.off  configure -text "" ; $r.rtt configure -text ""
+            continue
+        }
+        $r.dot  configure -fg $::lunar::OK
+        $r.name configure -text [dict get $s label] -fg $::lunar::INK
+        $r.off  configure -text [format "%+d ms" [dict get $s offsetMs]]
+        $r.rtt  configure -text "[dict get $s rttMs] ms"
     }
 }
 
