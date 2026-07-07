@@ -7,8 +7,8 @@
 #
 #   tclsh90s.exe tools/package.tcl [out.exe] [--wrapper W]
 #
-# Ported verbatim from els/tools/package.tcl (Lunar uses the same zmal shared
-# Tcl/Tk 9 payload at <zmal>/r/tcltk/9.0.3).
+# Ported verbatim from els/tools/package.tcl (Lunar uses the same z shared
+# Tcl/Tk 9 payload at <z>/r/tcltk/9.0.3).
 
 proc script_root {} {
     set s [info script]
@@ -17,21 +17,21 @@ proc script_root {} {
 }
 proc zmal_paths {root args} {
     set out {}
-    if {[info exists ::env(ZMAL_ROOT)] && $::env(ZMAL_ROOT) ne ""} {
-        lappend out [file join $::env(ZMAL_ROOT) {*}$args]
+    if {[info exists ::env(Z_ROOT)] && $::env(Z_ROOT) ne ""} {
+        lappend out [file join $::env(Z_ROOT) {*}$args]
     }
     lappend out [file join [file dirname $root] {*}$args]
     return $out
 }
 proc discover_tcltk {root} {
     set cands {}
-    if {[info exists ::env(ZMAL_TCLTK)] && $::env(ZMAL_TCLTK) ne ""} { lappend cands $::env(ZMAL_TCLTK) }
+    if {[info exists ::env(Z_TCLTK)] && $::env(Z_TCLTK) ne ""} { lappend cands $::env(Z_TCLTK) }
     lappend cands {*}[zmal_paths $root r tcltk 9.0.3]
     foreach p $cands {
         set p [file normalize $p]
         if {[file exists [file join $p tcl9 bin tclsh90.exe]]} { return $p }
     }
-    error "zmal Tcl/Tk payload not found (r/tcltk/9.0.3) - restore zmal's runtime payloads"
+    error "z Tcl/Tk payload not found (r/tcltk/9.0.3) - restore z's runtime payloads"
 }
 set ROOT [script_root]
 set TC   [discover_tcltk $ROOT]

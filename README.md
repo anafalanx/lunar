@@ -24,8 +24,8 @@ The shipped product is the Tcl/Tk shell. Building it needs:
 
 - A **static Tcl/Tk 9** build (headers + static `.a`s). Lunar links it
   in so the exe has no external Tcl/Tk dependency. `tools/tasks.tcl`
-  discovers it under the `zmal` layout (`r/tcltk/9.0.3`) or from the
-  `ZMAL_TCLTK` environment variable.
+  discovers it under the z workspace layout (`r/tcltk/9.0.3`) or from the
+  `Z_TCLTK` environment variable.
 
 From the project root, run the build task with the static `tclsh`:
 

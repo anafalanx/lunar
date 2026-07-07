@@ -1,8 +1,8 @@
 #!/usr/bin/env tclsh
 # tools/tasks.tcl - Lunar's task runner, ported from els/tools/tasks.tcl.
-# Builds the native Tcl/Tk shell exe against zmal's shared Tcl/Tk 9 + UCRT64
+# Builds the native Tcl/Tk shell exe against z's shared Tcl/Tk 9 + UCRT64
 # gcc payloads. Invoked as `z <task>` (via z.json) or directly:
-#   <zmal>/r/tcltk/9.0.3/tcl9/bin/tclsh90.exe tools/tasks.tcl <task>
+#   <z>/r/tcltk/9.0.3/tcl9/bin/tclsh90.exe tools/tasks.tcl <task>
 #
 # STAGE: link spike. task_build currently compiles only src/lunar_main.c and
 # links static Tcl/Tk (no engine yet); the engine objects + src/lunarx.c and
@@ -15,8 +15,8 @@ proc script_root {} {
 }
 proc zmal_paths {root args} {
     set out {}
-    if {[info exists ::env(ZMAL_ROOT)] && $::env(ZMAL_ROOT) ne ""} {
-        lappend out [file join $::env(ZMAL_ROOT) {*}$args]
+    if {[info exists ::env(Z_ROOT)] && $::env(Z_ROOT) ne ""} {
+        lappend out [file join $::env(Z_ROOT) {*}$args]
     }
     lappend out [file join [file dirname $root] {*}$args]
     return $out
@@ -35,15 +35,15 @@ proc discover_payload {root envs rel marker missingPath} {
 }
 
 set ROOT [script_root]
-set TC    [discover_payload $ROOT ZMAL_TCLTK {r tcltk 9.0.3} {tcl9 bin tclsh90.exe} \
+set TC    [discover_payload $ROOT Z_TCLTK {r tcltk 9.0.3} {tcl9 bin tclsh90.exe} \
               [file join [file dirname $ROOT] r tcltk 9.0.3]]
-set MSYS2 [discover_payload $ROOT ZMAL_MSYS2 {r msys2} {ucrt64 bin gcc.exe} \
+set MSYS2 [discover_payload $ROOT Z_MSYS2 {r msys2} {ucrt64 bin gcc.exe} \
               [file join [file dirname $ROOT] r msys2]]
-set TWAPI [discover_payload $ROOT ZMAL_TWAPI {r twapi 5.2.0} {pkgIndex.tcl} \
+set TWAPI [discover_payload $ROOT Z_TWAPI {r twapi 5.2.0} {pkgIndex.tcl} \
               [file join [file dirname $ROOT] r twapi 5.2.0]]
-set ::env(ZMAL_TCLTK) [file nativename $TC]
-set ::env(ZMAL_MSYS2) [file nativename $MSYS2]
-set ::env(ZMAL_TWAPI) [file nativename $TWAPI]
+set ::env(Z_TCLTK) [file nativename $TC]
+set ::env(Z_MSYS2) [file nativename $MSYS2]
+set ::env(Z_TWAPI) [file nativename $TWAPI]
 
 foreach {var rel marker} {
     TCL_LIBRARY {tcllib tcl_library} init.tcl
@@ -68,7 +68,7 @@ if {[llength $pkgpaths]} {
     set auto_path [concat $pkgpaths $auto_path]
 }
 
-# zmal runtime wins on PATH: Tcl/Tk 9 BEFORE MSYS2 (which ships its own 8.6).
+# z runtime wins on PATH: Tcl/Tk 9 BEFORE MSYS2 (which ships its own 8.6).
 set vbins {}
 foreach b [list [file join $TC tcl9 bin] [file join $MSYS2 ucrt64 bin] [file join $MSYS2 usr bin]] {
     if {[file isdirectory $b]} { lappend vbins [file nativename $b] }
@@ -121,7 +121,7 @@ proc need {args} {
             windres { set p [windres] }
         }
         if {$p eq "" || ![file exists $p]} {
-            error "required tool '$tool' is missing - restore zmal's runtime payloads (r/tcltk, r/msys2)"
+            error "required tool '$tool' is missing - restore z's runtime payloads (r/tcltk, r/msys2)"
         }
     }
 }
@@ -293,7 +293,8 @@ proc task_check {args} {
 proc find_signtool {} {
     set sdk [lsort [glob -nocomplain {C:/Program Files (x86)/Windows Kits/10/bin/*/x64/signtool.exe}]]
     if {[llength $sdk]} { return [lindex $sdk end] }
-    set j {C:/zmal/r/winsdk/10.0.26100.0/signtool.exe}
+    set zroot [expr {[info exists ::env(Z_ROOT)] && $::env(Z_ROOT) ne "" ? $::env(Z_ROOT) : "C:/z"}]
+    set j [file join $zroot r winsdk 10.0.26100.0 signtool.exe]
     if {[file exists $j]} { return $j }
     set p [auto_execok signtool]
     if {[llength $p]} { return [lindex $p 0] }

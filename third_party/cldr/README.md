@@ -38,14 +38,14 @@ is repo source, kept for reproducible builds.
 
        curl -sS -o third_party/cldr/windowsZones.xml \
          https://raw.githubusercontent.com/unicode-org/cldr/main/common/supplemental/windowsZones.xml
-       C:/zmal/r/gh/bin/gh.exe api \
+       C:/z/r/gh/bin/gh.exe api \
          "repos/unicode-org/cldr/commits?path=common/supplemental/windowsZones.xml&per_page=1" \
          --jq '.[0].sha'
 
 2. Regenerate the table (run from the repo root, after any tzdata bump so
    the embedded-zone filter is current):
 
-       C:\zmal\t\drang\drang.exe scripts\gen_win_tzmap.dr
+       C:\z\t\drang\drang.exe scripts\gen_win_tzmap.dr
 
 3. Rebuild, run the tests (they assert every mapped IANA name resolves in
    the embedded index), and commit the XML + regenerated

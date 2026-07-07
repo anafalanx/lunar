@@ -12,7 +12,7 @@
 #
 # Set LUNAR_SHOT_TITLE to capture a specific toplevel/dialog by title.
 # Requires build/cap.dll (`z build-ext`). twapi is provided on auto_path by
-# tools/tasks.tcl (or via the ZMAL_TWAPI env var when run directly).
+# tools/tasks.tcl (or via the Z_TWAPI env var when run directly).
 
 package require Tk
 wm withdraw .
@@ -24,9 +24,9 @@ proc script_root {} {
 }
 set ::SHOT_ROOT [script_root]
 # twapi is normally on auto_path already (tasks.tcl exports TCLLIBPATH). When
-# shot.tcl is run standalone, honor ZMAL_TWAPI.
-if {[info exists ::env(ZMAL_TWAPI)] && $::env(ZMAL_TWAPI) ne ""} {
-    lappend auto_path $::env(ZMAL_TWAPI)
+# shot.tcl is run standalone, honor Z_TWAPI.
+if {[info exists ::env(Z_TWAPI)] && $::env(Z_TWAPI) ne ""} {
+    lappend auto_path $::env(Z_TWAPI)
 }
 
 # ---- DIB (BITMAPINFOHEADER) -> Tk photo ---------------------------------
