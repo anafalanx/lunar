@@ -14,11 +14,11 @@
 #   wide      holdover  ±2.5 s   (fan visibly open)
 #   stopped   holdover  ±6.5 s   (> default 5 s ceiling: no time shown)
 #   acquiring inop      no time  (bare dial; word only in the status bar)
-# Dialog stages (set LUNAR_SHOT_TITLE "Lunar Settings" to capture them):
-#   settings          -- the Settings dialog on its Clock tab
-#   eventlog          -- the Log tab over a seeded representative store
-#   eventlog-filtered -- Log tab with search "pin" + level Warn+
-#   eventlog-sorted   -- Log tab sorted by Category
+# Dialog stages (set LUNAR_SHOT_TITLE to the window title to capture):
+#   settings          -- "Lunar Settings", Clock tab
+#   eventlog          -- "Lunar — Event Log" over a seeded representative store
+#   eventlog-filtered -- the log with search "pin" + level Warn+
+#   eventlog-sorted   -- the log sorted by Category
 #
 # It sources lunar.tcl (which builds the real UI via lunar::main), then replaces
 # the engine commands with fixed sample data so every capture is identical.
@@ -73,11 +73,11 @@ after 150 {
     update idletasks ; update
 }
 
-# Stage the Event Log tab on a representative store: seeded directly
+# Stage the Event Log window on a representative store: seeded directly
 # into ::lunar::events (bypassing lunar::ev so the scratch events.log
 # stays empty and the staged rows are the only content). Capture with
-# LUNAR_SHOT_TITLE set to "Lunar Settings" so shot.tcl targets the
-# Settings dialog, not the face.
+# LUNAR_SHOT_TITLE set to "Lunar — Event Log" so shot.tcl targets the
+# log window, not the face.
 proc uishot_stage_eventlog {} {
     set B 1751731872000  ;# same staged instant the face uses
     # The face's localtime stub returns one fixed instant, which would
@@ -126,7 +126,7 @@ proc uishot_stage_eventlog {} {
             [list [expr {$B + $off}] $trusted $sev $cat $msg]
         incr i
     }
-    lunar::log_dlg   ;# opens the Settings dialog at the Log tab
+    lunar::log_dlg
     set r $::lunar::log_root
     switch -- $::UISHOT_STATE {
         eventlog-filtered {

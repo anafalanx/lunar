@@ -100,8 +100,9 @@ zipfs image, and the C engine (libgcc + mbedTLS) is archived in.
   (a w32time correction, a manual set, a VM time-sync) is logged with its
   magnitude. This is the one comparison the whole trust stack uniquely
   enables.
-- **A real event log.** Settings → Log is a sortable, filterable table
-  over everything the engine and UI record — time (in the display zone,
+- **A real event log.** Its own resizable window (Settings →
+  Application → Open event log): a sortable, filterable table over
+  everything the engine and UI record — time (in the display zone,
   `~` marking stamps taken before the clock anchored), severity,
   category, message — persisted across sessions in a rolling store
   (`events.log`, rotated at 4 MiB) so yesterday's anomaly is still

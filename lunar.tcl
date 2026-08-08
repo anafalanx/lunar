@@ -32,6 +32,9 @@ namespace eval lunar {
     variable log_q_ph 0      ;# search entry is showing its placeholder
     variable log_loop_after {} ;# refresh-loop token (cancelled on dialog close)
     variable log_mapped 0    ;# first-<Map> latch: snap to newest row once visible
+    variable log_fit_after {} ;# resize-refit debounce token
+    variable log_fixedW 0    ;# summed width of the fixed (non-message) columns
+    variable log_maxlen 0    ;# longest message currently shown (chars)
     variable log_chw 8       ;# mono char advance (message-width fitting)
     variable log_msg_fit 300 ;# message column width that exactly fills the viewport
     variable square_extra_w 0
@@ -1032,15 +1035,61 @@ proc lunar::events_fmt_time {wallMs trusted} {
     return $txt
 }
 
-# The Event Log lives as a tab in the Settings dialog; this keeps the old
-# entry points (LUNAR_OPEN_LOG, shortcuts) working.
-proc lunar::log_dlg {} { lunar::settings_dlg log }
+# The Event Log is its own resizable window (Settings -> Application ->
+# "Open event log", or LUNAR_OPEN_LOG): a log wants space, and the
+# Settings dialog is deliberately compact.
+proc lunar::log_dlg {} {
+    if {[winfo exists .log]} { raise .log ; focus .log ; lunar::log_refresh ; return }
+    set P $::lunar::PAGE
+    toplevel .log -bg $P
+    wm title .log "Lunar — Event Log"
+    wm transient .log .
+    set ::lunar::log_sort {time 0}
+    # generous default -- roomy message column, ~26 rows -- and resizable;
+    # all sizing from font metrics so any DPI scale gets the same shape
+    set chw   [font measure lunarMono "0"]
+    set rowh  [expr {[font metrics lunarMono -linespace] + 6}]
+    set timeW [expr {[font measure lunarMono "2026-07-05 17:51:12.345~"] + 18}]
+    set catW  [expr {[font measure lunarMono "pinstore"] + 18}]
+    set lvlW  [expr {2 * $chw + 10}]
+    set W [expr {$lvlW + $timeW + $catW + 72 * $chw + 3 * $rowh}]
+    set H [expr {30 * $rowh}]
+    wm geometry .log ${W}x${H}
+    wm minsize .log [expr {$lvlW + $timeW + $catW + 24 * $chw}] [expr {14 * $rowh}]
 
-# Build the filter row + table + copy bar into $parent (the log tab's
-# inner frame). targetW/targetH are the pixel budget the panel must fit
-# (the notebook sizes itself to its largest tab, so the log panel is cut
-# to the size the other tabs already established -- adding it must not
-# inflate the Settings dialog).
+    frame .log.inner -bg $P
+    pack .log.inner -fill both -expand 1 -padx 14 -pady 12
+    lunar::log_panel .log.inner [expr {$W - 28}] [expr {$H - 24}]
+
+    # footer: legend left, actions right (the panel owns filters + table)
+    frame .log.inner.bar -bg $P ; pack .log.inner.bar -fill x -pady {10 0}
+    label .log.inner.bar.legend -bg $P -fg $::lunar::MUTED -font lunarSmall \
+        -anchor w -text "E error · W warning · ~ approximate time"
+    ttk::button .log.inner.bar.close -style Dialog.TButton -text "Close" \
+        -command {destroy .log}
+    ttk::button .log.inner.bar.copy -style Dialog.TButton -text "Copy" \
+        -command lunar::log_copy
+    pack .log.inner.bar.legend -side left
+    pack .log.inner.bar.close -side right
+    pack .log.inner.bar.copy -side right -padx {0 8}
+
+    bind .log <Escape> {destroy .log}
+    bind .log <Destroy> { if {%W eq ".log"} { lunar::log_cleanup } }
+    catch { after cancel $::lunar::log_loop_after }
+    set ::lunar::log_loop_after [after 1000 lunar::log_refresh_loop]
+}
+
+proc lunar::log_cleanup {} {
+    set ::lunar::log_root ""
+    catch { after cancel $::lunar::log_loop_after }
+    set ::lunar::log_loop_after {}
+    catch { after cancel $::lunar::log_fit_after }
+    set ::lunar::log_fit_after {}
+}
+
+# Build the filter row + table into $parent. targetW/targetH are the
+# initial pixel budget; the window is resizable, so the message-column
+# fit is re-derived from the treeview's REAL width on every <Configure>.
 proc lunar::log_panel {parent targetW targetH} {
     set P $::lunar::PAGE
     set ::lunar::log_root $parent
@@ -1058,7 +1107,8 @@ proc lunar::log_panel {parent targetW targetH} {
     # compares content width against this, and a floor above the real
     # viewport would hide the scrollbar while text is still clipped
     set ::lunar::log_chw $chw
-    set ::lunar::log_msg_fit [expr {$targetW - $lvlW - $timeW - $catW - 3 * $rowh}]
+    set ::lunar::log_fixedW [expr {$lvlW + $timeW + $catW}]
+    set ::lunar::log_msg_fit [expr {$targetW - $::lunar::log_fixedW - 3 * $rowh}]
     if {$::lunar::log_msg_fit < 60} { set ::lunar::log_msg_fit 60 }
     set rows  [expr {($targetH - 5 * $rowh) / $rowh}]
     if {$rows < 8} { set rows 8 }
@@ -1111,20 +1161,47 @@ proc lunar::log_panel {parent targetW targetH} {
     grid rowconfigure    $parent.f 0 -weight 1
     grid columnconfigure $parent.f 0 -weight 1
 
-    frame $parent.bar -bg $P ; pack $parent.bar -fill x -pady {10 0}
-    ttk::button $parent.bar.copy -style Dialog.TButton -text "Copy" \
-        -command lunar::log_copy
-    label $parent.bar.legend -bg $P -fg $::lunar::MUTED -font lunarSmall \
-        -anchor e -text "E error · W warning · ~ approximate time"
-    pack $parent.bar.copy -side left
-    pack $parent.bar.legend -side right
-    # the refresh's deferred [see] no-ops while the dialog is still
-    # withdrawn (settings_dlg pumps idle before deiconify), so snap to
-    # the newest row once, when the tree first becomes visible
+    # snap to the newest row once the tree first becomes visible (the
+    # refresh's deferred [see] no-ops against unmapped geometry), and
+    # re-derive the message fit whenever the window is resized
     set ::lunar::log_mapped 0
     bind $parent.f.tv <Map> {+ if {!$::lunar::log_mapped} {
         set ::lunar::log_mapped 1 ; after idle lunar::log_see_end } }
+    bind $parent.f.tv <Configure> {
+        after cancel $::lunar::log_fit_after
+        set ::lunar::log_fit_after [after 80 lunar::log_refit]
+    }
     lunar::log_refresh
+}
+
+# Recompute the viewport-filling message width from the treeview's real
+# width (the dialog is resizable), then re-apply the fit decision.
+proc lunar::log_refit {} {
+    set r $::lunar::log_root
+    if {$r eq "" || ![winfo exists $r.f.tv]} return
+    set w [winfo width $r.f.tv]
+    if {$w < 80} return
+    set fit [expr {$w - $::lunar::log_fixedW - 4}]
+    if {$fit < 60} { set fit 60 }
+    if {$fit == $::lunar::log_msg_fit} return
+    set ::lunar::log_msg_fit $fit
+    lunar::log_fit_msg
+}
+
+# Width + h-scrollbar decision from the widest row currently shown:
+# viewport-filling when everything fits (no scrollbar), content-wide
+# when a row overflows (scrollbar reaches the tail).
+proc lunar::log_fit_msg {} {
+    set r $::lunar::log_root
+    if {$r eq "" || ![winfo exists $r.f.tv]} return
+    set needW [expr {$::lunar::log_maxlen * $::lunar::log_chw + 12}]
+    if {$needW > $::lunar::log_msg_fit} {
+        $r.f.tv column msg -width $needW
+        grid $r.f.hs
+    } else {
+        $r.f.tv column msg -width $::lunar::log_msg_fit
+        grid remove $r.f.hs
+    }
 }
 
 proc lunar::log_see_end {} {
@@ -1249,17 +1326,8 @@ proc lunar::log_refresh {} {
         $r.f.tv insert {} end -tags [list $sev] -values \
             [list $glyph [lunar::events_fmt_time $wallMs $trusted] $cat $msg]
     }
-    # fit the Message column: fill the viewport when everything fits; grow
-    # to the longest shown row (h-scrollbar re-appears) only on overflow,
-    # so no state carries a dead or permanently-partial scrollbar
-    set needW [expr {$maxlen * $::lunar::log_chw + 12}]
-    if {$needW > $::lunar::log_msg_fit} {
-        $r.f.tv column msg -width $needW
-        grid $r.f.hs
-    } else {
-        $r.f.tv column msg -width $::lunar::log_msg_fit
-        grid remove $r.f.hs
-    }
+    set ::lunar::log_maxlen $maxlen
+    lunar::log_fit_msg
     if {$atbottom && $col eq "time" && !$desc} {
         set kids [$r.f.tv children {}]
         if {[llength $kids]} {
@@ -1283,20 +1351,14 @@ proc lunar::log_refresh {} {
     set ::lunar::events_dirty 0
 }
 
-# Runs while the Settings dialog exists; rebuilds only when the log tab
-# is actually showing (tab changes refresh instantly via the notebook
-# binding, so nothing is stale when it comes into view). The single
-# token keeps rapid close/reopen cycles from stacking parallel chains.
+# Runs while the Event Log window exists; rebuilds only when something
+# new arrived. The single token keeps rapid close/reopen cycles from
+# stacking parallel chains.
 proc lunar::log_refresh_loop {} {
     set r $::lunar::log_root
     if {$r eq "" || ![winfo exists $r]} return
-    if {$::lunar::events_dirty && [lunar::log_tab_showing]} { lunar::log_refresh }
+    if {$::lunar::events_dirty} { lunar::log_refresh }
     set ::lunar::log_loop_after [after 1000 lunar::log_refresh_loop]
-}
-
-proc lunar::log_tab_showing {} {
-    expr {![catch { .set.shell.tabs select } cur] &&
-          $cur eq ".set.shell.tabs.log"}
 }
 
 # Copies the view exactly as filtered and sorted; the severity word is
@@ -1355,14 +1417,12 @@ proc lunar::settings_dlg {{tab ""}} {
     pack .set.shell -fill both -expand 1
 
     ttk::notebook .set.shell.tabs -style Settings.TNotebook
-    foreach {name title} {clock Clock chimes Chimes app Application log Log} {
+    foreach {name title} {clock Clock chimes Chimes app Application} {
         frame .set.shell.tabs.$name -bg $P
         frame .set.shell.tabs.$name.inner -bg $P
         pack .set.shell.tabs.$name.inner -fill both -expand 1 -padx 24 -pady 18
         .set.shell.tabs add .set.shell.tabs.$name -text $title
     }
-    # the table breathes better against slimmer margins than the form tabs
-    pack configure .set.shell.tabs.log.inner -padx 14 -pady 12
     pack .set.shell.tabs -fill both -expand 1 -pady {10 0}
 
     # Clock -------------------------------------------------------------------
@@ -1469,6 +1529,11 @@ proc lunar::settings_dlg {{tab ""}} {
         -activebackground $P -selectcolor $P \
         -text "Start Lunar when I sign in" -variable ::lunar::set_startup
     frame $c.rule1 -bg $::lunar::HAIR -height 1
+    label $c.uhdr -bg $P -fg $I -font lunarUIb -anchor w -text "Diagnostics"
+    frame $c.actions -bg $P
+    ttk::button $c.actions.log -style Dialog.TButton -text "Open event log" \
+        -command lunar::log_dlg
+    pack $c.actions.log -side left
     label $c.actionnote -bg $P -fg $M -font lunarSmall -anchor w -text ""
     frame $c.rule2 -bg $::lunar::HAIR -height 1
 
@@ -1485,36 +1550,13 @@ proc lunar::settings_dlg {{tab ""}} {
     pack $c.confirm -fill x -pady {3 0}
     pack $c.startup -fill x -pady {3 0}
     pack $c.rule1 -fill x -pady {16 14}
-    pack $c.actionnote -fill x
+    pack $c.uhdr -fill x -pady {0 8}
+    pack $c.actions -fill x
+    pack $c.actionnote -fill x -pady {6 0}
     pack $c.rule2 -fill x -pady {16 14}
     pack $c.abouttitle -fill x
     pack $c.aboutbody -fill x -pady {3 12}
     pack $c.quit -anchor w
-
-    # Log (event log table) -----------------------------------------------------
-    # Built after the form tabs so it can be fitted to the size THEY set.
-    # The notebook grows to its largest tab, so the log tab is pinned to
-    # the biggest form tab's size with geometry propagation off: nothing
-    # inside the table (wide rows, filter chrome) can ever resize the
-    # Settings dialog.
-    set ::lunar::log_sort {time 0}
-    update idletasks
-    set tabW 0 ; set tabH 0
-    foreach t {clock chimes app} {
-        set w [winfo reqwidth  .set.shell.tabs.$t]
-        set h [winfo reqheight .set.shell.tabs.$t]
-        if {$w > $tabW} { set tabW $w }
-        if {$h > $tabH} { set tabH $h }
-    }
-    .set.shell.tabs.log configure -width $tabW -height $tabH
-    pack propagate .set.shell.tabs.log 0
-    lunar::log_panel .set.shell.tabs.log.inner \
-        [expr {$tabW - 28}] [expr {$tabH - 24}]
-    bind .set.shell.tabs <<NotebookTabChanged>> {
-        if {[lunar::log_tab_showing]} { lunar::log_refresh }
-    }
-    catch { after cancel $::lunar::log_loop_after }
-    set ::lunar::log_loop_after [after 1000 lunar::log_refresh_loop]
 
     # Shared footer -----------------------------------------------------------
     frame .set.shell.footrule -bg $::lunar::HAIR -height 1
@@ -1546,7 +1588,6 @@ proc lunar::settings_dlg {{tab ""}} {
     switch $tab {
         chimes { focus .set.shell.tabs.chimes.inner.enabled }
         app    { focus .set.shell.tabs.app.inner.ontop }
-        log    { focus .set.shell.tabs.log.inner.f.tv }
         default { focus .set.shell.tabs.clock.inner.filter }
     }
     lunar::settings_preview_loop
@@ -1558,9 +1599,6 @@ proc lunar::settings_cleanup {} {
         set ::lunar::settings_preview_after ""
     }
     catch { trace remove variable ::lunar::set_filter write ::lunar::settings_filter_changed }
-    set ::lunar::log_root ""   ;# stops the log refresh loop with the dialog
-    catch { after cancel $::lunar::log_loop_after }
-    set ::lunar::log_loop_after {}
 }
 
 proc lunar::settings_close {} {
@@ -2112,7 +2150,7 @@ proc lunar::selftest {reportPath} {
         lunar::ev info app "selftest rotation trigger" 1751731875000 1
         set rotated [file exists "[lunar::events_path].1"]
         set ::lunar::events_file_max $saveMax
-        lunar::log_dlg ; update idletasks   ;# opens Settings at the Log tab
+        lunar::log_dlg ; update idletasks
         set lr $::lunar::log_root
         set rows0 [llength [$lr.f.tv children {}]]
         lunar::log_q_set "chime"
@@ -2121,7 +2159,7 @@ proc lunar::selftest {reportPath} {
         lunar::log_q_set ""
         lunar::log_sortby time   ;# time already active -> flips descending
         set firstmsg [lindex [$lr.f.tv item [lindex [$lr.f.tv children {}] 0] -values] 3]
-        lunar::settings_close
+        destroy .log
         set good [expr {$stored == 3 && $ondisk == 3 && $rotated &&
                         $rows0 == 4 && $rows1 == 1 &&
                         $firstmsg eq "selftest rotation trigger"}]
