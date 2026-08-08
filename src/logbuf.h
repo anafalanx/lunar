@@ -49,6 +49,26 @@ extern "C" {
 // adds them when serialising.
 void Log_Append(const char *fmt, ...);
 
+// Raw entry as handed to structured readers (the Tcl-side event
+// store). `seq` is a process-lifetime monotonic id (first entry = 1)
+// that survives ring eviction, so an incremental reader can ask
+// "everything after the last seq I saw" and never miss or duplicate
+// an entry that is still in the ring.
+typedef struct {
+    uint64_t seq;
+    uint64_t tickMs;    // GetTickCount64() at append (monotonic)
+    int64_t  utcMs;     // disciplined UTC ms, or 0 if untrusted
+    int      trusted;
+    char     msg[LOGBUF_MSG_MAX];
+} LogRawEntry;
+
+// Copy every ring entry with seq > sinceSeq into `out` (oldest
+// first), up to `cap` entries. Returns the number copied. Entries
+// evicted before the call are gone -- the caller sees a gap in seq
+// numbers, which is honest (the ring is the burst buffer; disk is
+// the retention authority). Pass sinceSeq=0 for everything held.
+size_t Log_CollectSince(uint64_t sinceSeq, LogRawEntry *out, size_t cap);
+
 // Copy the whole log (oldest first) into `out`, up to `out_cap-1`
 // bytes, NUL-terminating. Lines are separated by "\r\n" so the
 // result is ready for pasting into a Win32 EDIT control. Returns

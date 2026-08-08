@@ -1650,6 +1650,87 @@ static void test_logbuf_truncation(void) {
     CHECK_EQ_INT(small[sizeof small - 1], 0);
 }
 
+static void test_logbuf_collect_since(void) {
+    Log_Reset();
+    Log_Append("first");
+    Log_Append("second");
+    Log_Append("third");
+
+    static LogRawEntry all[8];
+    size_t n = Log_CollectSince(0, all, 8);
+    CHECK_EQ_INT((int)n, 3);
+    CHECK(strcmp(all[0].msg, "first") == 0);
+    CHECK(strcmp(all[2].msg, "third") == 0);
+    // seq strictly increases in append order and survives Log_Reset
+    // (process-lifetime monotonic).
+    CHECK(all[1].seq == all[0].seq + 1);
+    CHECK(all[2].seq == all[1].seq + 1);
+
+    // Incremental read: only entries after sinceSeq come back.
+    static LogRawEntry tail[8];
+    size_t m = Log_CollectSince(all[0].seq, tail, 8);
+    CHECK_EQ_INT((int)m, 2);
+    CHECK(strcmp(tail[0].msg, "second") == 0);
+    CHECK(strcmp(tail[1].msg, "third") == 0);
+
+    // Nothing new: empty result, not a repeat.
+    CHECK_EQ_INT((int)Log_CollectSince(all[2].seq, tail, 8), 0);
+
+    // cap limits the copy but keeps oldest-first order.
+    static LogRawEntry two[2];
+    CHECK_EQ_INT((int)Log_CollectSince(0, two, 2), 2);
+    CHECK(strcmp(two[0].msg, "first") == 0);
+
+    // A new append after Reset continues the seq sequence.
+    uint64_t lastSeq = all[2].seq;
+    Log_Reset();
+    Log_Append("fourth");
+    CHECK_EQ_INT((int)Log_CollectSince(0, tail, 8), 1);
+    CHECK(strcmp(tail[0].msg, "fourth") == 0);
+    CHECK(tail[0].seq == lastSeq + 1);
+}
+
+static void test_logbuf_collect_wrapped(void) {
+    // Overflow the ring so the overwrite-oldest branch runs and the head
+    // moves: collection must stay in append order with contiguous seq,
+    // and the seq gap at the front (the Tcl drain's loss detector) must
+    // equal exactly the number of overwritten entries.
+    Log_Reset();
+    enum { EXTRA = 5 };
+    for (int i = 0; i < LOGBUF_CAP + EXTRA; i++) {
+        Log_Append("wrap-%d", i);
+    }
+
+    static LogRawEntry got[LOGBUF_CAP];
+    size_t n = Log_CollectSince(0, got, LOGBUF_CAP);
+    CHECK_EQ_INT((int)n, LOGBUF_CAP);
+
+    // Oldest survivor is the (EXTRA+1)-th append; the newest is the last.
+    char expectFirst[32], expectLast[32];
+    snprintf(expectFirst, sizeof expectFirst, "wrap-%d", EXTRA);
+    snprintf(expectLast, sizeof expectLast, "wrap-%d", LOGBUF_CAP + EXTRA - 1);
+    CHECK(strcmp(got[0].msg, expectFirst) == 0);
+    CHECK(strcmp(got[n - 1].msg, expectLast) == 0);
+
+    // seq strictly contiguous across the whole wrapped collection, and
+    // the front gap equals the EXTRA entries the overwrite consumed.
+    int contiguous = 1;
+    for (size_t i = 1; i < n; i++) {
+        if (got[i].seq != got[i - 1].seq + 1) { contiguous = 0; break; }
+    }
+    CHECK(contiguous);
+    CHECK(got[0].seq == got[n - 1].seq - (uint64_t)(LOGBUF_CAP - 1));
+
+    // sinceSeq inside the wrapped region still returns only the suffix.
+    static LogRawEntry sfx[LOGBUF_CAP];
+    uint64_t mid = got[n - 3].seq;
+    size_t m = Log_CollectSince(mid, sfx, LOGBUF_CAP);
+    CHECK_EQ_INT((int)m, 2);
+    CHECK(sfx[0].seq == mid + 1);
+
+    Log_Reset();   // leave a clean ring for later suites
+}
+
 // ---------------------------------------------------------------------------
 // NTS provider pool -- metadata only, PickProvider returns an entry
 // ---------------------------------------------------------------------------
@@ -2776,6 +2857,8 @@ int main(void) {
     test_nts_pool_pins();
     test_logbuf_basic();
     test_logbuf_truncation();
+    test_logbuf_collect_since();
+    test_logbuf_collect_wrapped();
 
     test_tz_bounds();
     test_tz_southern_hemisphere();

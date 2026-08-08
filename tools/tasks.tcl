@@ -371,7 +371,7 @@ proc task_shot {args} {
 proc task_uishot {args} {
     need gcc tclsh
     if {[llength $args] < 1 || [llength $args] > 2} {
-        error "usage: z uishot <out.png> ?trusted|degraded|wide|stopped?"
+        error "usage: z uishot <out.png> ?trusted|degraded|wide|stopped|acquiring|settings|eventlog|eventlog-filtered|eventlog-sorted?\n(dialog stages need LUNAR_SHOT_TITLE=\"Lunar Settings\")"
     }
     if {![file exists [P build cap.dll]]} { puts "building capture extension..." ; task_build-ext }
     stream [tclsh] [P tools shot.tcl] [wish] [P tools uishot.tcl] {*}$args

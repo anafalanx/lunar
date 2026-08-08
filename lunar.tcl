@@ -19,6 +19,21 @@ namespace eval lunar {
     variable stopped_prev 0  ;# last rendered stop flag (recover-fast edge)
     variable hastime_prev 1  ;# last rendered hasTime (recover-fast edge)
     variable log_active 0    ;# reentry latch so logging can't recurse into bgerror
+    variable events {}       ;# unified event store: {wallMs trusted sev cat msg} each
+    variable events_seq 0    ;# last engine ring seq ingested (lunar::log_events cursor)
+    variable events_mem_max  10000   ;# in-memory history ceiling (events kept)
+    variable events_file_max 4194304 ;# rotate events.log past this (4 MiB; +.1 => ~21h of sustained-unhealthy engine)
+    variable events_lastcat app ;# engine continuation lines inherit the previous category
+    variable events_dirty 0  ;# a new event arrived since the dialog last rebuilt
+    variable log_sort {time 0}  ;# dialog sort: column + descending flag
+    variable log_filter_after {} ;# debounce token for live search
+    variable log_root ""     ;# widget path of the Event Log panel (settings tab)
+    variable log_view {}     ;# rows currently shown, in display order (Copy source)
+    variable log_q_ph 0      ;# search entry is showing its placeholder
+    variable log_loop_after {} ;# refresh-loop token (cancelled on dialog close)
+    variable log_mapped 0    ;# first-<Map> latch: snap to newest row once visible
+    variable log_chw 8       ;# mono char advance (message-width fitting)
+    variable log_msg_fit 300 ;# message column width that exactly fills the viewport
     variable square_extra_w 0
     variable square_extra_h 0
     variable square_work_x 0
@@ -33,24 +48,246 @@ namespace eval lunar {
     variable settings_preview_after ""
 }
 
-# ---- diagnostics: log + non-modal bgerror (els's approach) ------------------
-# A GUI-subsystem exe has no console, so an uncaught async error otherwise pops
-# Tk's modal "raining dialogs". Route them to %APPDATA%\Lunar\lunar-ui.log and a
-# quiet status note instead.
+# ---- diagnostics: unified event store + non-modal bgerror -------------------
+# One store carries both log domains: UI-side events (appended directly via
+# lunar::event) and the C engine's in-memory ring (drained incrementally via
+# ::lunar::log_events). Every event is {wallMs trusted sev cat msg}. The
+# store persists to %APPDATA%\Lunar\events.log -- one Tcl list per line, so
+# arbitrary message text round-trips exactly -- rotating to events.log.1 at
+# events_file_max (4 MiB; the audit.log precedent: bounded disk, no
+# daemon). The in-memory tail (last events_mem_max) is what the Event Log
+# tab shows, reloaded across sessions, so history survives restarts. An
+# OS-shutdown session keeps everything up to the last 1 s drain here; the
+# engine's own final entries land in last-session.log (WM_ENDSESSION has
+# no budget for a Tcl drain).
 proc lunar::datadir {} {
     if {[info exists ::env(LUNAR_DATA_DIR)] && $::env(LUNAR_DATA_DIR) ne ""} { return $::env(LUNAR_DATA_DIR) }
     if {[info exists ::env(APPDATA)] && $::env(APPDATA) ne ""} { return [file join $::env(APPDATA) Lunar] }
     return [pwd]
 }
-proc lunar::log {msg} {
+proc lunar::events_path {} { return [file join [lunar::datadir] events.log] }
+
+# Severity from message text. The engine's 85 call sites carry no explicit
+# level -- severity is lexical by convention there, so one classifier owns
+# the convention. UI-side events pass an explicit sev and skip this.
+proc lunar::events_classify {msg} {
+    if {[regexp -nocase {\*\*\*|unhandled exception|crash|INOP|pin mismatch|NOT accepted} $msg]} {
+        return error
+    }
+    if {[regexp -nocase {fail|error|rejected|refused|err=|timeout|expired|invalid|mismatch|deferr|NOTE|giving up|stale} $msg]} {
+        return warn
+    }
+    return info
+}
+
+# One-line invariant: the store is line-oriented and the table shows one
+# row per event. Fold newlines visibly, strip remaining control chars --
+# a raw \n inside a braced list element would span two physical lines and
+# desync the framing; remote-derived text (cert subjects, release tags)
+# is not guaranteed printable.
+proc lunar::events_clean {msg} {
+    regsub -all {[\r\n]+} $msg { · } msg
+    regsub -all "\[\x01-\x1F\x7F\]+" $msg { } msg
+    return $msg
+}
+
+# Append one event to the store (memory + disk) and mark the dialog stale.
+# NAMED ev, NOT event: a lunar::event proc would shadow Tk's [event] for
+# every proc in this namespace (the ::lunar::clock/[clock] incident).
+# wallMs "" means "stamp it now": the disciplined clock when it has time
+# (trusted stamp), the system clock otherwise (untrusted, rendered with ~).
+proc lunar::ev {sev cat msg {wallMs ""} {trusted 0}} {
     if {$::lunar::log_active} return
     set ::lunar::log_active 1
     catch {
-        set dir [lunar::datadir] ; file mkdir $dir
-        set fh [open [file join $dir lunar-ui.log] a] ; fconfigure $fh -encoding utf-8
-        puts $fh "[clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}] $msg" ; close $fh
+        if {$wallMs eq ""} {
+            set wallMs [clock milliseconds] ; set trusted 0
+            catch {
+                set st [::lunar::status]
+                if {[dict get $st hasTime]} {
+                    set wallMs [dict get $st utcMs] ; set trusted 1
+                }
+            }
+        }
+        set rec [list $wallMs $trusted $sev $cat [lunar::events_clean $msg]]
+        lappend ::lunar::events $rec
+        if {[llength $::lunar::events] > $::lunar::events_mem_max} {
+            set ::lunar::events [lrange $::lunar::events \
+                end-[expr {$::lunar::events_mem_max - 1}] end]
+        }
+        # every UI-side event persists synchronously (bgerror traces must
+        # reach disk before a follow-on crash, like lunar-ui.log did)
+        lunar::events_persist [list $rec]
+        set ::lunar::events_dirty 1
     }
     set ::lunar::log_active 0
+    # an error event often precedes worse: pull the engine ring forward
+    # too, outside the latch (drain is seq-idempotent, never nests -- it
+    # schedules nothing and enters no event loop)
+    if {$sev eq "error"} { catch { lunar::events_drain } }
+}
+
+# Batch-append records to events.log. Rotation first (audit.log's order),
+# by an actual stat, never a tracked counter -- multi-byte UTF-8 and a
+# possible second instance both drift a counter. A failed rename (the
+# other instance or an AV scanner holding the file) is skipped and simply
+# retried on a later append; a brief overshoot past the cap is fine, the
+# C precedent ignores MoveFileW failure identically. Two instances
+# sharing a data dir may still interleave lines or double-rotate -- the
+# tolerant loader contains that; the missing single-instance guard is a
+# pre-existing app-level gap (settings.dat has the same exposure).
+# Failures drop silently (audit.log's contract: logging must never take
+# the clock down with it).
+proc lunar::events_persist {recs} {
+    catch {
+        set path [lunar::events_path]
+        catch {
+            if {[file size $path] > $::lunar::events_file_max} {
+                file delete -force "$path.1"
+                file rename $path "$path.1"
+            }
+        }
+        file mkdir [lunar::datadir]
+        set out ""
+        foreach rec $recs { append out $rec \n }
+        # a hard kill can leave the file without its trailing newline; a
+        # batch appended onto that torn line would merge two records into
+        # one corrupt line, so re-open the seam before appending
+        catch {
+            if {[file size $path] > 0} {
+                set fh0 [open $path r] ; fconfigure $fh0 -translation binary
+                seek $fh0 -1 end
+                set last [read $fh0 1] ; close $fh0
+                if {$last ne "\n"} { set out "\n$out" }
+            }
+        }
+        set fh [open $path a]
+        # -translation lf + explicit utf-8: the platform defaults (crlf,
+        # ANSI codepage) would mangle the engine's UTF-8 and bloat lines;
+        # one big buffered write per batch shrinks the torn-line window
+        fconfigure $fh -encoding utf-8 -translation lf -buffersize 65536
+        puts -nonewline $fh $out
+        close $fh
+    }
+}
+
+proc lunar::events_read_file {path} {
+    if {[catch { open $path r } fh]} { return {} }
+    # -eofchar {}: the Windows default treats a stray 0x1A byte as EOF,
+    # which would silently truncate the rest of the history at load
+    fconfigure $fh -encoding utf-8 -translation lf -eofchar {}
+    set raw [read $fh] ; close $fh
+    set out {}
+    foreach line [split $raw \n] {
+        set line [string trimright $line \r]
+        if {$line eq ""} continue
+        # malformed lines (torn tail after a hard kill, dual-instance
+        # interleave, hand edits) skip individually; \n-split re-syncs
+        # at the next record. Every consumed field is validated -- one
+        # hostile trusted/sev value would otherwise throw inside the
+        # dialog's render path.
+        if {[catch { llength $line } n] || $n < 5} continue
+        lassign [lrange $line 0 4] wallMs trusted sev cat msg
+        if {![string is wideinteger -strict $wallMs]} continue
+        if {![string is boolean -strict $trusted]} continue
+        if {$sev ni {info warn error}} continue
+        lappend out [list $wallMs [expr {$trusted ? 1 : 0}] $sev $cat $msg]
+    }
+    return $out
+}
+
+# Load persisted history: current file first, the rotated generation only
+# when the current one doesn't fill the in-memory cap. Boot-time events
+# (lunar::log fires before this runs) were persisted synchronously, so
+# they are already IN the file -- the store is simply replaced by the
+# loaded history; only records whose persist failed (unwritable data
+# dir) are re-appended, never duplicated.
+proc lunar::events_load {} {
+    set cur [lunar::events_read_file [lunar::events_path]]
+    set hist {}
+    if {[llength $cur] < $::lunar::events_mem_max} {
+        set hist [lunar::events_read_file "[lunar::events_path].1"]
+    }
+    set all [concat $hist $cur]
+    foreach rec $::lunar::events {
+        if {$rec ni $cur} { lappend all $rec }
+    }
+    if {[llength $all] > $::lunar::events_mem_max} {
+        set all [lrange $all end-[expr {$::lunar::events_mem_max - 1}] end]
+    }
+    set ::lunar::events $all
+    set ::lunar::events_dirty 1
+}
+
+# Drain the engine ring incrementally: everything after the last seq seen.
+# Engine stamps: disciplined utcMs when trusted; otherwise approximate the
+# wall time as (system now - entry age) -- absolute enough to read across
+# sessions, honestly marked untrusted. `module:` prefixes become the
+# category; two-space continuation lines inherit the previous category.
+proc lunar::events_drain {} {
+    if {![llength [info commands ::lunar::log_events]]} return
+    if {[catch { ::lunar::log_events $::lunar::events_seq } batch]} return
+    if {![llength $batch]} return
+    set nowMs [clock milliseconds]
+    set recs {}
+    # seq gap = ring entries lost between drains (burst overwrite or 24h
+    # eviction outran us). Rare and pathological, but never silent.
+    set first [dict get [lindex $batch 0] seq]
+    if {$::lunar::events_seq > 0 && $first > $::lunar::events_seq + 1} {
+        set lost [expr {$first - $::lunar::events_seq - 1}]
+        lappend recs [list $nowMs 0 warn app \
+            "engine ring gap: $lost events evicted before they could be stored"]
+    }
+    foreach e $batch {
+        set seq [dict get $e seq]
+        if {$seq > $::lunar::events_seq} { set ::lunar::events_seq $seq }
+        set msg [dict get $e msg]
+        set trusted [dict get $e trusted]
+        if {$trusted} {
+            set wallMs [dict get $e utcMs]
+        } else {
+            set wallMs [expr {$nowMs - [dict get $e ageMs]}]
+        }
+        if {[regexp {^([a-z]+): (.*)$} $msg -> cat rest]} {
+            set ::lunar::events_lastcat $cat
+            set msg $rest
+        } elseif {[string match "  *" $msg]} {
+            set cat $::lunar::events_lastcat
+        } else {
+            set cat app
+        }
+        set msg [lunar::events_clean $msg]
+        lappend recs [list $wallMs $trusted [lunar::events_classify $msg] $cat $msg]
+    }
+    foreach rec $recs { lappend ::lunar::events $rec }
+    if {[llength $::lunar::events] > $::lunar::events_mem_max} {
+        set ::lunar::events [lrange $::lunar::events \
+            end-[expr {$::lunar::events_mem_max - 1}] end]
+    }
+    lunar::events_persist $recs
+    set ::lunar::events_dirty 1
+}
+
+# Schedules strictly at its own tail and never enters the event loop, so
+# drains cannot nest -- not even through lunar::quit's nested-modal loop.
+proc lunar::events_drain_loop {} {
+    catch { lunar::events_drain }
+    after 1000 lunar::events_drain_loop
+}
+
+# Compat shim: existing UI call sites log free text; categorize [tag]
+# prefixes and classify the rest, so every path feeds the one store.
+proc lunar::log {msg} {
+    set sev "" ; set cat ui
+    # tags may be multi-word ("[settings sync]") or underscored
+    # ("[engine_start]"); spaces become dashes so the category stays one
+    # scannable token
+    if {[regexp {^\[([a-z_ ]+)\] (.*)$} $msg -> tag rest]} {
+        set cat [string map {" " -} $tag] ; set msg $rest
+        if {$tag in {bgerror tick engine_start}} { set sev error }
+    }
+    if {$sev eq ""} { set sev [lunar::events_classify $msg] }
+    lunar::ev $sev $cat $msg
 }
 # Keep the status bar's trust field stable. Short-lived interaction feedback
 # uses the system-clock witness field and is replaced by the next render.
@@ -59,8 +296,8 @@ proc lunar::bgerror {msg args} {
     if {$::lunar::log_active} return
     set trace $msg
     if {[llength $args]} { catch { set trace [dict get [lindex $args 0] -errorinfo] } }
-    catch { lunar::log "\[bgerror\] $trace" }
-    catch { lunar::status_note "internal error (logged to lunar-ui.log)" }
+    catch { lunar::ev error app $trace }
+    catch { lunar::status_note "internal error (see event log)" }
 }
 
 # ---- look: els's visual identity --------------------------------------------
@@ -120,11 +357,47 @@ proc lunar::init_style {} {
     $s map Settings.TNotebook.Tab \
         -background [list selected $::lunar::PAGE active "#DEDEDE"] \
         -foreground [list selected $ink]
-    # a traditional scrollbar, arrow size in POINTS so it scales per-DPI
-    $s configure Vertical.TScrollbar -troughcolor $::lunar::PAGE \
-        -background #BCBCBC -arrowcolor #4A4A4A -bordercolor #9A9A9A \
-        -relief raised -borderwidth 1 -arrowsize 12p
-    $s map Vertical.TScrollbar -background [list active #A4A4A4 disabled $::lunar::PAGE]
+    # traditional scrollbars, arrow size in POINTS so it scales per-DPI;
+    # both orientations dress identically (the clam default horizontal bar
+    # is a ghost: page-on-page), and the grip texture goes -- it is the
+    # only 3D ornament in an otherwise flat chrome
+    foreach orient {Vertical Horizontal} {
+        $s configure $orient.TScrollbar -troughcolor $::lunar::PAGE \
+            -background #BCBCBC -arrowcolor #4A4A4A -bordercolor #9A9A9A \
+            -relief raised -borderwidth 1 -arrowsize 12p -gripcount 0
+        $s map $orient.TScrollbar \
+            -background [list active #A4A4A4 disabled $::lunar::PAGE]
+    }
+    # Event Log table: mono data rows on PAGE (continuity with the mono
+    # log it replaced; timestamps and ms digits align), quiet CHROME
+    # headings. Row height derives from the font so it scales per-DPI.
+    $s configure Log.Treeview -background $::lunar::PAGE \
+        -fieldbackground $::lunar::PAGE -foreground $ink -font lunarMono \
+        -borderwidth 1 -relief solid -bordercolor $hair \
+        -lightcolor $::lunar::PAGE -darkcolor $::lunar::PAGE \
+        -rowheight [expr {[font metrics lunarMono -linespace] + 6}]
+    $s map Log.Treeview -background [list selected "#D6E2F2"] \
+        -foreground [list selected $ink]
+    # heading left padding matches the cells' internal text indent so the
+    # captions sit flush over their column data
+    $s configure Log.Treeview.Heading -background $bg \
+        -foreground $::lunar::MUTED -font lunarHdr -relief flat -padding {4 3}
+    $s map Log.Treeview.Heading -background [list pressed $hair active "#DEDEDE"]
+    # comboboxes (the Event Log filters are the app's first): match the
+    # TEntry field treatment, including the popdown list
+    $s configure TCombobox -fieldbackground $::lunar::PAGE \
+        -background $::lunar::PAGE -foreground $ink -arrowcolor $::lunar::MUTED \
+        -bordercolor $hair -lightcolor $hair -darkcolor $hair \
+        -padding {6 3} -relief flat -borderwidth 1
+    $s map TCombobox -bordercolor [list focus "#A6ACB4"] \
+        -lightcolor [list focus "#A6ACB4"] -darkcolor [list focus "#A6ACB4"] \
+        -fieldbackground [list readonly $::lunar::PAGE] \
+        -background [list readonly $::lunar::PAGE]
+    option add *TCombobox*Listbox.background $::lunar::PAGE
+    option add *TCombobox*Listbox.foreground $ink
+    option add *TCombobox*Listbox.selectBackground "#D6E2F2"
+    option add *TCombobox*Listbox.selectForeground $ink
+    option add *TCombobox*Listbox.font lunarUI
 }
 
 # ---- state -> (label, colour) ----------------------------------------------
@@ -496,6 +769,16 @@ proc lunar::clock_hands {c lt milliseconds boundMs} {
 # Prefer the native Direct2D clock widget when packaged with Lunar.  The
 # source-only Tk iteration path has no C extension, so it deliberately falls
 # back to the canvas implementation above.
+# This runs once per 200 ms tick, so log each distinct failure once, not
+# per render (a wish/dev run falls through here every tick: the canvas
+# widget has no [show] subcommand).
+proc lunar::clock_display_err {err} {
+    if {[info exists ::lunar::clock_display_lasterr] &&
+        $::lunar::clock_display_lasterr eq $err} return
+    set ::lunar::clock_display_lasterr $err
+    lunar::log "Direct2D clock update failed: $err"
+}
+
 proc lunar::clock_display {lt milliseconds state hasTime synced boundMs stopped} {
     if {[llength [info commands .face.clock]]} {
         if {$hasTime && $lt ne ""} {
@@ -504,13 +787,13 @@ proc lunar::clock_display {lt milliseconds state hasTime synced boundMs stopped}
                     [dict get $lt second] $milliseconds 1 $state $synced \
                     $boundMs $stopped [lunar::armed_mask]
             } err]} { return }
-            lunar::log "Direct2D clock update failed: $err"
+            lunar::clock_display_err $err
         } elseif {![catch {
             .face.clock show 0 0 0 0 0 $state $synced 0 0 [lunar::armed_mask]
         } err]} {
             return
         } else {
-            lunar::log "Direct2D clock update failed: $err"
+            lunar::clock_display_err $err
         }
     }
     if {$hasTime && $lt ne "" && !$stopped} {
@@ -646,8 +929,8 @@ proc lunar::build {} {
 
     set P $::lunar::PAGE
     frame .face -bg $P
-    if {[llength [info commands ::lunar::clock]]} {
-        ::lunar::clock .face.clock -width $::lunar::CLOCK_SZ -height $::lunar::CLOCK_SZ
+    if {[llength [info commands ::lunarclock]]} {
+        ::lunarclock .face.clock -width $::lunar::CLOCK_SZ -height $::lunar::CLOCK_SZ
     } else {
         canvas .face.clock -width $::lunar::CLOCK_SZ -height $::lunar::CLOCK_SZ \
             -bg $P -highlightthickness 0
@@ -720,49 +1003,313 @@ proc lunar::copy_time {} {
     return 1
 }
 
-proc lunar::log_dlg {} {
-    if {[winfo exists .log]} { raise .log ; focus .log ; lunar::log_refresh ; return }
+# ---- Event Log dialog --------------------------------------------------------
+# A sortable, filterable table over the unified event store. Columns are
+# Time | Category | Message; severity is carried by row colour (error =
+# ACCENT, warn = WARN) and stays filterable -- a fourth column would
+# repeat what the colour already says. History is whatever the rolling
+# store holds (across sessions); the view caps at the newest 2000
+# matching rows so rebuilds stay instant.
+
+set ::lunar::LOG_VIEW_MAX 2000
+
+proc lunar::events_fmt_time {wallMs trusted} {
+    set frac [expr {$wallMs % 1000}]
+    set secs [expr {$wallMs / 1000}]
+    if {$frac < 0} { incr frac 1000 ; incr secs -1 }
+    set txt ""
+    if {[llength [info commands ::lunar::localtime]] && $::lunar::tz ne ""} {
+        if {![catch { ::lunar::localtime $wallMs $::lunar::tz } lt]} {
+            set txt [format "%04d-%02d-%02d %02d:%02d:%02d.%03d" \
+                [dict get $lt year] [dict get $lt month] [dict get $lt day] \
+                [dict get $lt hour] [dict get $lt minute] [dict get $lt second] $frac]
+        }
+    }
+    if {$txt eq ""} {
+        set txt "[clock format $secs -format {%Y-%m-%d %H:%M:%S}].[format %03d $frac]"
+    }
+    if {!$trusted} { append txt "~" }
+    return $txt
+}
+
+# The Event Log lives as a tab in the Settings dialog; this keeps the old
+# entry points (LUNAR_OPEN_LOG, shortcuts) working.
+proc lunar::log_dlg {} { lunar::settings_dlg log }
+
+# Build the filter row + table + copy bar into $parent (the log tab's
+# inner frame). targetW/targetH are the pixel budget the panel must fit
+# (the notebook sizes itself to its largest tab, so the log panel is cut
+# to the size the other tabs already established -- adding it must not
+# inflate the Settings dialog).
+proc lunar::log_panel {parent targetW targetH} {
     set P $::lunar::PAGE
-    toplevel .log -bg $P
-    wm title .log "Lunar — Event Log" ; wm geometry .log 760x480 ; wm transient .log .
-    frame .log.f -bg $P ; pack .log.f -fill both -expand 1 -padx 10 -pady 10
-    text .log.f.t -bg $P -fg $::lunar::INK -font lunarMono -wrap none \
-        -borderwidth 1 -relief solid -highlightthickness 0 -padx 8 -pady 6 \
-        -yscrollcommand {.log.f.vs set} -xscrollcommand {.log.f.hs set}
-    ttk::scrollbar .log.f.vs -orient vertical   -command {.log.f.t yview}
-    ttk::scrollbar .log.f.hs -orient horizontal -command {.log.f.t xview}
-    grid .log.f.t  -row 0 -column 0 -sticky nsew
-    grid .log.f.vs -row 0 -column 1 -sticky ns
-    grid .log.f.hs -row 1 -column 0 -sticky ew
-    grid rowconfigure    .log.f 0 -weight 1
-    grid columnconfigure .log.f 0 -weight 1
-    frame .log.b -bg $P ; pack .log.b -fill x -padx 10 -pady {0 10}
-    ttk::button .log.b.copy  -style Dialog.TButton -text "Copy all" -command lunar::log_copy
-    ttk::button .log.b.close -style Dialog.TButton -text "Close"    -command {destroy .log}
-    pack .log.b.close -side right
-    pack .log.b.copy  -side right -padx {0 8}
-    bind .log <Escape> {destroy .log}
+    set ::lunar::log_root $parent
+    # All sizing derives from the mono font so the table survives any DPI
+    # scale (raw pixel widths clip the Time column at 150%).
+    set chw   [font measure lunarMono "0"]
+    set rowh  [expr {[font metrics lunarMono -linespace] + 6}]
+    set lvlW  [expr {2 * $chw + 10}]
+    set timeW [expr {[font measure lunarMono "2026-07-05 17:51:12.345~"] + 18}]
+    set catW  [expr {[font measure lunarMono "pinstore"] + 18}]
+    # the Message column is re-fitted per refresh: viewport-filling when
+    # everything fits, content-wide (with the h-scrollbar re-appearing)
+    # only when a shown row actually overflows
+    # the true remainder, NEVER floored upward: the h-scrollbar decision
+    # compares content width against this, and a floor above the real
+    # viewport would hide the scrollbar while text is still clipped
+    set ::lunar::log_chw $chw
+    set ::lunar::log_msg_fit [expr {$targetW - $lvlW - $timeW - $catW - 3 * $rowh}]
+    if {$::lunar::log_msg_fit < 60} { set ::lunar::log_msg_fit 60 }
+    set rows  [expr {($targetH - 5 * $rowh) / $rowh}]
+    if {$rows < 8} { set rows 8 }
+    set ::lunar::log_q_ph 0   ;# the flag describes an entry that no longer exists
+
+    frame $parent.top -bg $P ; pack $parent.top -fill x -pady {0 10}
+    ttk::entry $parent.top.q -width 14
+    lunar::log_q_placeholder
+    ttk::combobox $parent.top.lvl -state readonly -width 9 \
+        -values [list "All levels" Warn+ Errors]
+    ttk::combobox $parent.top.cat -state readonly -width 13 \
+        -values [list "All categories"]
+    $parent.top.lvl set "All levels" ; $parent.top.cat set "All categories"
+    label $parent.top.count -bg $P -fg $::lunar::MUTED -font lunarSmall \
+        -anchor e -padx 0
+    pack $parent.top.q     -side left
+    pack $parent.top.lvl   -side left -padx {8 0}
+    pack $parent.top.cat   -side left -padx {8 0}
+    pack $parent.top.count -side right -fill x -expand 1
+    bind $parent.top.q <FocusIn>  lunar::log_q_focus
+    bind $parent.top.q <FocusOut> lunar::log_q_placeholder
+    bind $parent.top.q <KeyRelease> {
+        after cancel $::lunar::log_filter_after
+        set ::lunar::log_filter_after [after 150 lunar::log_refresh]
+    }
+    bind $parent.top.lvl <<ComboboxSelected>> lunar::log_refresh
+    bind $parent.top.cat <<ComboboxSelected>> lunar::log_refresh
+
+    frame $parent.f -bg $P ; pack $parent.f -fill both -expand 1
+    ttk::treeview $parent.f.tv -style Log.Treeview -show headings \
+        -columns {lvl time cat msg} -selectmode extended -height $rows \
+        -yscrollcommand [list $parent.f.vs set] \
+        -xscrollcommand [list $parent.f.hs set]
+    $parent.f.tv column lvl  -width $lvlW  -minwidth $lvlW  -stretch 0 -anchor w
+    $parent.f.tv column time -width $timeW -minwidth $timeW -stretch 0 -anchor w
+    $parent.f.tv column cat  -width $catW  -minwidth $catW  -stretch 0 -anchor w
+    $parent.f.tv column msg  -width $::lunar::log_msg_fit \
+        -minwidth [expr {24 * $chw}] -stretch 0 -anchor w
+    foreach {c t} {lvl "" time Time cat Category msg Message} {
+        $parent.f.tv heading $c -text $t -anchor w \
+            -command [list lunar::log_sortby $c]
+    }
+    $parent.f.tv tag configure error -foreground $::lunar::ACCENT
+    $parent.f.tv tag configure warn  -foreground $::lunar::WARN
+    ttk::scrollbar $parent.f.vs -orient vertical   -command [list $parent.f.tv yview]
+    ttk::scrollbar $parent.f.hs -orient horizontal -command [list $parent.f.tv xview]
+    grid $parent.f.tv -row 0 -column 0 -sticky nsew
+    grid $parent.f.vs -row 0 -column 1 -sticky ns
+    grid $parent.f.hs -row 1 -column 0 -sticky ew
+    grid rowconfigure    $parent.f 0 -weight 1
+    grid columnconfigure $parent.f 0 -weight 1
+
+    frame $parent.bar -bg $P ; pack $parent.bar -fill x -pady {10 0}
+    ttk::button $parent.bar.copy -style Dialog.TButton -text "Copy" \
+        -command lunar::log_copy
+    label $parent.bar.legend -bg $P -fg $::lunar::MUTED -font lunarSmall \
+        -anchor e -text "E error · W warning · ~ approximate time"
+    pack $parent.bar.copy -side left
+    pack $parent.bar.legend -side right
+    # the refresh's deferred [see] no-ops while the dialog is still
+    # withdrawn (settings_dlg pumps idle before deiconify), so snap to
+    # the newest row once, when the tree first becomes visible
+    set ::lunar::log_mapped 0
+    bind $parent.f.tv <Map> {+ if {!$::lunar::log_mapped} {
+        set ::lunar::log_mapped 1 ; after idle lunar::log_see_end } }
     lunar::log_refresh
-    lunar::log_refresh_loop
 }
+
+proc lunar::log_see_end {} {
+    set r $::lunar::log_root
+    if {$r eq "" || ![winfo exists $r.f.tv]} return
+    lassign $::lunar::log_sort col desc
+    if {$col ne "time" || $desc} return
+    set kids [$r.f.tv children {}]
+    if {[llength $kids]} { catch { $r.f.tv see [lindex $kids end] } }
+}
+
+# Slate placeholder in the search entry: cleared on focus, restored when
+# it loses focus empty. log_q reads "" while the placeholder shows.
+proc lunar::log_q_focus {} {
+    set q $::lunar::log_root.top.q
+    if {$::lunar::log_q_ph} {
+        set ::lunar::log_q_ph 0
+        $q delete 0 end
+        $q configure -foreground $::lunar::INK
+    }
+}
+proc lunar::log_q_placeholder {} {
+    set q $::lunar::log_root.top.q
+    if {![winfo exists $q]} return
+    if {!$::lunar::log_q_ph && [$q get] eq ""} {
+        set ::lunar::log_q_ph 1
+        $q configure -foreground $::lunar::MUTED
+        $q insert 0 "filter messages"
+    }
+}
+proc lunar::log_q {} {
+    set q $::lunar::log_root.top.q
+    if {$::lunar::log_q_ph || ![winfo exists $q]} { return "" }
+    return [$q get]
+}
+proc lunar::log_q_set {text} {
+    set q $::lunar::log_root.top.q
+    set ::lunar::log_q_ph 0
+    $q configure -foreground $::lunar::INK
+    $q delete 0 end
+    $q insert 0 $text
+}
+
+# Column-header sort: click toggles direction on the active column.
+proc lunar::log_sortby {col} {
+    lassign $::lunar::log_sort cur desc
+    set ::lunar::log_sort [list $col [expr {$col eq $cur ? !$desc : 0}]]
+    lunar::log_refresh
+}
+
+# The current filtered+sorted view: a list of {wallMs trusted sev cat msg}
+# in display order, capped at the newest LOG_VIEW_MAX matches. Kept in
+# ::lunar::log_view so Copy exports exactly what the table shows.
 proc lunar::log_refresh {} {
-    if {![winfo exists .log.f.t] || ![llength [info commands ::lunar::log_text]]} return
-    set atbottom [expr {[lindex [.log.f.t yview] 1] > 0.999}]
-    .log.f.t configure -state normal
-    .log.f.t delete 1.0 end
-    .log.f.t insert end [::lunar::log_text]
-    .log.f.t configure -state disabled
-    if {$atbottom} { .log.f.t see end }
+    set r $::lunar::log_root
+    if {$r eq "" || ![winfo exists $r.f.tv]} return
+    set q   [string tolower [lunar::log_q]]
+    set lvl [$r.top.lvl get]
+    set fcat [$r.top.cat get]
+    set minrank [expr {$lvl eq "Errors" ? 2 : ($lvl eq "Warn+" ? 1 : 0)}]
+    set ranks [dict create info 0 warn 1 error 2]
+
+    set match {}
+    set cats [dict create]
+    foreach rec $::lunar::events {
+        lassign $rec wallMs trusted sev cat msg
+        dict set cats $cat 1
+        if {[dict getdef $ranks $sev 0] < $minrank} continue
+        if {$fcat ne "All categories" && $cat ne $fcat} continue
+        if {$q ne "" && [string first $q [string tolower "$cat $msg"]] < 0} continue
+        lappend match $rec
+    }
+    set total [llength $match]
+    set clipped 0
+    if {$total > $::lunar::LOG_VIEW_MAX} {
+        set match [lrange $match end-[expr {$::lunar::LOG_VIEW_MAX - 1}] end]
+        set clipped 1
+    }
+
+    # sort (stable, so equal keys keep honest insertion order)
+    lassign $::lunar::log_sort col desc
+    set keyed {}
+    foreach rec $match {
+        lassign $rec wallMs trusted sev cat msg
+        switch $col {
+            lvl     { set key [dict getdef $ranks $sev 0] }
+            cat     { set key $cat }
+            msg     { set key $msg }
+            default { set key $wallMs }
+        }
+        lappend keyed [list $key $rec]
+    }
+    set opts [expr {$col in {time lvl} ? "-integer" : "-dictionary"}]
+    if {$desc} { lappend opts -decreasing }
+    set keyed [lsort {*}$opts -index 0 $keyed]
+
+    # heading arrows on the active column only
+    foreach {c t} {lvl "" time Time cat Category msg Message} {
+        set mark [expr {$c eq $col ? ($desc ? "▼" : "▲") : ""}]
+        set cap [string trim "$t $mark"]
+        $r.f.tv heading $c -text $cap
+    }
+
+    # lazily refresh the category filter's choices
+    set vals [linsert [lsort [dict keys $cats]] 0 "All categories"]
+    $r.top.cat configure -values $vals
+    if {$fcat ni $vals} { $r.top.cat set "All categories" }
+
+    # rebuild rows; keep the old dialog's implicit stick-to-bottom under
+    # chronological ascending order. The severity glyph column survives
+    # Copy/paste and colour-blindness; row colour stays the fast channel.
+    set atbottom [expr {[lindex [$r.f.tv yview] 1] > 0.999}]
+    $r.f.tv delete [$r.f.tv children {}]
+    set ::lunar::log_view {}
+    set maxlen 0
+    foreach pair $keyed {
+        set rec [lindex $pair 1]
+        lassign $rec wallMs trusted sev cat msg
+        lappend ::lunar::log_view $rec
+        if {[string length $msg] > $maxlen} { set maxlen [string length $msg] }
+        set glyph [expr {$sev eq "error" ? "E" : ($sev eq "warn" ? "W" : "")}]
+        $r.f.tv insert {} end -tags [list $sev] -values \
+            [list $glyph [lunar::events_fmt_time $wallMs $trusted] $cat $msg]
+    }
+    # fit the Message column: fill the viewport when everything fits; grow
+    # to the longest shown row (h-scrollbar re-appears) only on overflow,
+    # so no state carries a dead or permanently-partial scrollbar
+    set needW [expr {$maxlen * $::lunar::log_chw + 12}]
+    if {$needW > $::lunar::log_msg_fit} {
+        $r.f.tv column msg -width $needW
+        grid $r.f.hs
+    } else {
+        $r.f.tv column msg -width $::lunar::log_msg_fit
+        grid remove $r.f.hs
+    }
+    if {$atbottom && $col eq "time" && !$desc} {
+        set kids [$r.f.tv children {}]
+        if {[llength $kids]} {
+            # after idle: gridding/removing the h-scrollbar above changes
+            # the tree's height AFTER this proc returns; a synchronous
+            # [see] would scroll against stale geometry and leave the
+            # newest row hidden behind the new scrollbar, permanently
+            # unlatching stick-to-bottom
+            after idle [list catch [list $r.f.tv see [lindex $kids end]]]
+        }
+    }
+    set n [llength $::lunar::log_view]
+    set total_store [llength $::lunar::events]
+    if {$clipped} {
+        $r.top.count configure -text "newest $n of $total matching"
+    } elseif {$n == 0 && $total_store > 0} {
+        $r.top.count configure -text "no matches · $total_store hidden by filter"
+    } else {
+        $r.top.count configure -text "$n of $total_store"
+    }
+    set ::lunar::events_dirty 0
 }
+
+# Runs while the Settings dialog exists; rebuilds only when the log tab
+# is actually showing (tab changes refresh instantly via the notebook
+# binding, so nothing is stale when it comes into view). The single
+# token keeps rapid close/reopen cycles from stacking parallel chains.
 proc lunar::log_refresh_loop {} {
-    if {![winfo exists .log]} return
-    lunar::log_refresh
-    after 1000 lunar::log_refresh_loop
+    set r $::lunar::log_root
+    if {$r eq "" || ![winfo exists $r]} return
+    if {$::lunar::events_dirty && [lunar::log_tab_showing]} { lunar::log_refresh }
+    set ::lunar::log_loop_after [after 1000 lunar::log_refresh_loop]
 }
+
+proc lunar::log_tab_showing {} {
+    expr {![catch { .set.shell.tabs select } cur] &&
+          $cur eq ".set.shell.tabs.log"}
+}
+
+# Copies the view exactly as filtered and sorted; the severity word is
+# spelled out so it survives into plain text (colour doesn't paste).
 proc lunar::log_copy {} {
-    if {![llength [info commands ::lunar::log_text]]} return
-    clipboard clear ; clipboard append [::lunar::log_text]
-    lunar::status_note "log copied to clipboard"
+    set out ""
+    foreach rec $::lunar::log_view {
+        lassign $rec wallMs trusted sev cat msg
+        append out [format "%s  %-5s  %-9s  %s\n" \
+            [lunar::events_fmt_time $wallMs $trusted] $sev $cat $msg]
+    }
+    clipboard clear ; clipboard append $out
+    lunar::status_note "event log copied ([llength $::lunar::log_view] rows)"
 }
 
 # ---- Settings dialog ---------------------------------------------------------
@@ -808,12 +1355,14 @@ proc lunar::settings_dlg {{tab ""}} {
     pack .set.shell -fill both -expand 1
 
     ttk::notebook .set.shell.tabs -style Settings.TNotebook
-    foreach {name title} {clock Clock chimes Chimes app Application} {
+    foreach {name title} {clock Clock chimes Chimes app Application log Log} {
         frame .set.shell.tabs.$name -bg $P
         frame .set.shell.tabs.$name.inner -bg $P
         pack .set.shell.tabs.$name.inner -fill both -expand 1 -padx 24 -pady 18
         .set.shell.tabs add .set.shell.tabs.$name -text $title
     }
+    # the table breathes better against slimmer margins than the form tabs
+    pack configure .set.shell.tabs.log.inner -padx 14 -pady 12
     pack .set.shell.tabs -fill both -expand 1 -pady {10 0}
 
     # Clock -------------------------------------------------------------------
@@ -920,11 +1469,6 @@ proc lunar::settings_dlg {{tab ""}} {
         -activebackground $P -selectcolor $P \
         -text "Start Lunar when I sign in" -variable ::lunar::set_startup
     frame $c.rule1 -bg $::lunar::HAIR -height 1
-    label $c.uhdr -bg $P -fg $I -font lunarUIb -anchor w -text "Diagnostics"
-    frame $c.actions -bg $P
-    ttk::button $c.actions.log -style Dialog.TButton -text "Open event log" \
-        -command lunar::settings_open_log
-    pack $c.actions.log -side left
     label $c.actionnote -bg $P -fg $M -font lunarSmall -anchor w -text ""
     frame $c.rule2 -bg $::lunar::HAIR -height 1
 
@@ -941,13 +1485,36 @@ proc lunar::settings_dlg {{tab ""}} {
     pack $c.confirm -fill x -pady {3 0}
     pack $c.startup -fill x -pady {3 0}
     pack $c.rule1 -fill x -pady {16 14}
-    pack $c.uhdr -fill x -pady {0 8}
-    pack $c.actions -fill x
-    pack $c.actionnote -fill x -pady {6 0}
+    pack $c.actionnote -fill x
     pack $c.rule2 -fill x -pady {16 14}
     pack $c.abouttitle -fill x
     pack $c.aboutbody -fill x -pady {3 12}
     pack $c.quit -anchor w
+
+    # Log (event log table) -----------------------------------------------------
+    # Built after the form tabs so it can be fitted to the size THEY set.
+    # The notebook grows to its largest tab, so the log tab is pinned to
+    # the biggest form tab's size with geometry propagation off: nothing
+    # inside the table (wide rows, filter chrome) can ever resize the
+    # Settings dialog.
+    set ::lunar::log_sort {time 0}
+    update idletasks
+    set tabW 0 ; set tabH 0
+    foreach t {clock chimes app} {
+        set w [winfo reqwidth  .set.shell.tabs.$t]
+        set h [winfo reqheight .set.shell.tabs.$t]
+        if {$w > $tabW} { set tabW $w }
+        if {$h > $tabH} { set tabH $h }
+    }
+    .set.shell.tabs.log configure -width $tabW -height $tabH
+    pack propagate .set.shell.tabs.log 0
+    lunar::log_panel .set.shell.tabs.log.inner \
+        [expr {$tabW - 28}] [expr {$tabH - 24}]
+    bind .set.shell.tabs <<NotebookTabChanged>> {
+        if {[lunar::log_tab_showing]} { lunar::log_refresh }
+    }
+    catch { after cancel $::lunar::log_loop_after }
+    set ::lunar::log_loop_after [after 1000 lunar::log_refresh_loop]
 
     # Shared footer -----------------------------------------------------------
     frame .set.shell.footrule -bg $::lunar::HAIR -height 1
@@ -979,6 +1546,7 @@ proc lunar::settings_dlg {{tab ""}} {
     switch $tab {
         chimes { focus .set.shell.tabs.chimes.inner.enabled }
         app    { focus .set.shell.tabs.app.inner.ontop }
+        log    { focus .set.shell.tabs.log.inner.f.tv }
         default { focus .set.shell.tabs.clock.inner.filter }
     }
     lunar::settings_preview_loop
@@ -990,6 +1558,9 @@ proc lunar::settings_cleanup {} {
         set ::lunar::settings_preview_after ""
     }
     catch { trace remove variable ::lunar::set_filter write ::lunar::settings_filter_changed }
+    set ::lunar::log_root ""   ;# stops the log refresh loop with the dialog
+    catch { after cancel $::lunar::log_loop_after }
+    set ::lunar::log_loop_after {}
 }
 
 proc lunar::settings_close {} {
@@ -1097,11 +1668,6 @@ proc lunar::settings_test_chime {} {
     }
 }
 
-proc lunar::settings_open_log {} {
-    lunar::log_dlg
-    lunar::settings_note app "Event log opened."
-}
-
 proc lunar::settings_ok {} {
     # Validate the one external setting first. A registry failure leaves every
     # staged preference untouched and keeps the relevant page visible.
@@ -1121,6 +1687,9 @@ proc lunar::settings_ok {} {
     set z [lunar::settings_sel]
     if {$z ne ""} { set ::lunar::tz $z }
     set ::lunar::tz_chosen 1
+    # Event Log timestamps render in the display zone; a zone change
+    # re-renders an open dialog on its next refresh tick.
+    set ::lunar::events_dirty 1
     dict set ::lunar::cfg tz [expr {$::lunar::tz eq "UTC" ? "" : $::lunar::tz}]
     dict set ::lunar::cfg fmt24  [expr {$::lunar::set_fmt24 ? 1 : 0}]
     dict set ::lunar::cfg confirm [expr {$::lunar::set_confirm ? 1 : 0}]
@@ -1237,6 +1806,10 @@ proc lunar::quit {} {
         if {$answer ne "yes"} return
     }
     catch { if {[llength [info commands ::lunar::shutdown]]} { ::lunar::shutdown } }
+    # AFTER shutdown: Ntp_Shutdown/Clock_Shutdown append their own final
+    # ring entries ("aggregator stopped", "persisted rate"); the ring
+    # stays readable after Shutdown_Cmd, so this last drain captures them.
+    catch { lunar::events_drain }
     destroy .
 }
 
@@ -1513,6 +2086,53 @@ proc lunar::selftest {reportPath} {
         if {$alive && $::lunar::_asked == 1} { set cg ok } else { set cg "BAD $alive $::lunar::_asked" }
         append txt "confirmgate=$cg\n"
     }
+    # verify the event log: store ingest, rolling rotation, dialog table,
+    # live filter, and sort flip -- all under a scratch data dir so the
+    # user's real events.log is never touched
+    catch {
+        set eg "BAD unset"
+        set saveEnv [expr {[info exists ::env(LUNAR_DATA_DIR)] ? $::env(LUNAR_DATA_DIR) : ""}]
+        set saveEvents $::lunar::events
+        set saveMax $::lunar::events_file_max
+        set tmp [file join [lunar::datadir] "selftest-ev-[pid]"]
+        catch {
+            set tmp [file join $::env(TEMP) "lunar-selftest-ev-[pid]"]
+        }
+        file mkdir $tmp
+        set ::env(LUNAR_DATA_DIR) $tmp
+        set ::lunar::events {}
+        # explicit stamps: four calls can otherwise land in one millisecond,
+        # making the sort-flip assertion racy
+        lunar::ev info chime "selftest chime line" 1751731872000 1
+        lunar::ev warn ntp "selftest warn line"    1751731873000 1
+        lunar::ev error app "selftest error line"  1751731874000 1
+        set stored [llength $::lunar::events]
+        set ondisk [llength [lunar::events_read_file [lunar::events_path]]]
+        set ::lunar::events_file_max 1        ;# next persist must rotate
+        lunar::ev info app "selftest rotation trigger" 1751731875000 1
+        set rotated [file exists "[lunar::events_path].1"]
+        set ::lunar::events_file_max $saveMax
+        lunar::log_dlg ; update idletasks   ;# opens Settings at the Log tab
+        set lr $::lunar::log_root
+        set rows0 [llength [$lr.f.tv children {}]]
+        lunar::log_q_set "chime"
+        lunar::log_refresh
+        set rows1 [llength [$lr.f.tv children {}]]
+        lunar::log_q_set ""
+        lunar::log_sortby time   ;# time already active -> flips descending
+        set firstmsg [lindex [$lr.f.tv item [lindex [$lr.f.tv children {}] 0] -values] 3]
+        lunar::settings_close
+        set good [expr {$stored == 3 && $ondisk == 3 && $rotated &&
+                        $rows0 == 4 && $rows1 == 1 &&
+                        $firstmsg eq "selftest rotation trigger"}]
+        if {$good} { set eg ok } else {
+            set eg "BAD st=$stored disk=$ondisk rot=$rotated r0=$rows0 r1=$rows1 first=$firstmsg"
+        }
+        if {$saveEnv ne ""} { set ::env(LUNAR_DATA_DIR) $saveEnv } else { unset -nocomplain ::env(LUNAR_DATA_DIR) }
+        set ::lunar::events $saveEvents
+        catch { file delete -force $tmp }
+        append txt "eventlog=$eg\n"
+    }
     append txt "status=[expr {$ok ? {ok} : {FAIL}}]\n"
     if {!$ok} { append txt "error=$msg\n" }
     if {$reportPath ne ""} {
@@ -1556,6 +2176,12 @@ proc lunar::main {} {
         # rather than waiting a full base interval.
         set ::lunar::repoll_after [after $::lunar::poll_min lunar::repoll]
     }
+    # Event store: session marker now; history merge-load off the paint
+    # path (after idle still beats the first 1 s drain tick, and boot-time
+    # events ingested before it are merged, not clobbered).
+    lunar::ev info app "session start (Lunar $::lunar::version)"
+    after idle lunar::events_load
+    after 1000 lunar::events_drain_loop
     after 100 lunar::tick
     # dev hooks: open a dialog on launch, for screenshots/testing
     if {[info exists ::env(LUNAR_OPEN_SETTINGS)] && $::env(LUNAR_OPEN_SETTINGS) ne ""} {

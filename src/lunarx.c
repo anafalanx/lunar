@@ -278,6 +278,46 @@ static int LogText_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
     return TCL_OK;
 }
 
+/* lunar::log_events ?sinceSeq? -- structured incremental read of the
+ * in-memory event ring for the Tcl-side persistent event store: a list of
+ * dicts {seq ageMs utcMs trusted msg}, oldest first, holding every ring
+ * entry with seq > sinceSeq. ageMs is the entry's age on the monotonic
+ * clock at read time, so the caller can approximate an absolute stamp for
+ * untrusted entries (system now - ageMs) without trusting the ring's
+ * wall-clock state. */
+static int LogEvents_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
+                         int objc, Tcl_Obj *const objv[]) {
+    Tcl_WideInt since = 0;
+    if (objc > 2) { Tcl_WrongNumArgs(ip, 1, objv, "?sinceSeq?"); return TCL_ERROR; }
+    if (objc == 2 && Tcl_GetWideIntFromObj(ip, objv[1], &since) != TCL_OK) {
+        return TCL_ERROR;
+    }
+    if (since < 0) since = 0;
+
+    LogRawEntry *buf =
+        (LogRawEntry *)Tcl_Alloc(sizeof(LogRawEntry) * LOGBUF_CAP);
+    size_t n = Log_CollectSince((uint64_t)since, buf, LOGBUF_CAP);
+    uint64_t nowTick = GetTickCount64();
+
+    Tcl_Obj *list = Tcl_NewListObj(0, nullptr);
+    for (size_t i = 0; i < n; i++) {
+        const LogRawEntry *e = &buf[i];
+        uint64_t age = (nowTick >= e->tickMs) ? (nowTick - e->tickMs) : 0;
+        Tcl_Obj *d = Tcl_NewDictObj();
+        PUT(d, "seq",     Tcl_NewWideIntObj((Tcl_WideInt)e->seq));
+        PUT(d, "ageMs",   Tcl_NewWideIntObj((Tcl_WideInt)age));
+        PUT(d, "utcMs",   Tcl_NewWideIntObj((Tcl_WideInt)e->utcMs));
+        /* resolved here, matching Log_Snapshot's display rule, so the Tcl
+         * side never needs a second copy of the trust convention */
+        PUT(d, "trusted", Tcl_NewIntObj((e->trusted && e->utcMs != 0) ? 1 : 0));
+        PUT(d, "msg",     Tcl_NewStringObj(e->msg, -1));
+        Tcl_ListObjAppendElement(ip, list, d);
+    }
+    Tcl_Free((char *)buf);
+    Tcl_SetObjResult(ip, list);
+    return TCL_OK;
+}
+
 /* lunar::about -- {version X tzdata Y} for the About box. */
 static int About_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
                      int objc, Tcl_Obj *const objv[]) {
@@ -633,6 +673,7 @@ int Lunarx_Init(Tcl_Interp *ip) {
     Tcl_CreateObjCommand(ip, "::lunar::watch_resize", ResizeWatch_Cmd, nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::run_at_startup", RunAtStartup_Cmd, nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::log_text",     LogText_Cmd,     nullptr, nullptr);
+    Tcl_CreateObjCommand(ip, "::lunar::log_events",   LogEvents_Cmd,   nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::about",        About_Cmd,       nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::beep",         Beep_Cmd,        nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::prewarm",      Prewarm_Cmd,     nullptr, nullptr);

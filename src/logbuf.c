@@ -30,6 +30,7 @@
 //   - msg      : NUL-terminated payload.
 
 typedef struct {
+    uint64_t seq;       // process-lifetime monotonic id (first = 1)
     uint64_t tickMs;
     int64_t  utcMs;
     int      trusted;
@@ -39,6 +40,7 @@ typedef struct {
 static LogEntry          g_ring[LOGBUF_CAP];
 static int               g_head = 0;    // oldest valid index
 static int               g_count = 0;   // number of valid entries
+static uint64_t          g_nextSeq = 1;
 static uint64_t          g_procStartTick = 0;
 static CRITICAL_SECTION  g_cs;
 static int               g_csInit = 0;
@@ -160,6 +162,7 @@ void Log_Append(const char *fmt, ...) {
     }
 
     LogEntry *e = &g_ring[idx];
+    e->seq     = g_nextSeq++;
     e->tickMs  = nowTick;
     e->utcMs   = utcMs;
     e->trusted = trusted;
@@ -246,6 +249,29 @@ size_t Log_Snapshot(char *out, size_t out_cap) {
         out[term] = 0;
     }
     return written;
+}
+
+size_t Log_CollectSince(uint64_t sinceSeq, LogRawEntry *out, size_t cap) {
+    if (out == NULL || cap == 0) return 0;
+    EnsureInit();
+
+    size_t n = 0;
+    EnterCriticalSection(&g_cs);
+    EvictOld(GetTickCount64());
+    // Ring is in append order and seq is monotonic, so the first
+    // entry with seq > sinceSeq starts a contiguous suffix.
+    for (int i = 0; i < g_count && n < cap; i++) {
+        const LogEntry *e = &g_ring[(g_head + i) % LOGBUF_CAP];
+        if (e->seq <= sinceSeq) continue;
+        LogRawEntry *o = &out[n++];
+        o->seq     = e->seq;
+        o->tickMs  = e->tickMs;
+        o->utcMs   = e->utcMs;
+        o->trusted = e->trusted;
+        memcpy(o->msg, e->msg, sizeof o->msg);
+    }
+    LeaveCriticalSection(&g_cs);
+    return n;
 }
 
 int Log_FlushToDisk(const wchar_t *leaf_name) {

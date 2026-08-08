@@ -52,7 +52,7 @@ zipfs image, and the C engine (libgcc + mbedTLS) is archived in.
     src/         # C engine (ntp/nts/dns/clock/pin_store/siv/tz/...) plus
                  #   lunar_main.c (entry point), lunarx.c (::lunar::*),
                  #   lunarclock.c (Direct2D clock widget), cap.c (screenshots)
-    lunar.tcl    # the Tk UI chrome: analog face, status bar, Settings, tray
+    lunar.tcl    # the Tk UI chrome: analog face, status bar, Settings, event log
     tools/       # Tcl build tooling (tasks/genres/package/shot/mkico)
     assets/      # icons, fonts
     scripts/     # Build/codegen helpers: build.py (mbedTLS archive + version.h),
@@ -74,7 +74,8 @@ zipfs image, and the C engine (libgcc + mbedTLS) is archived in.
 - The UI is an **antialiased Direct2D analog clock** inside normal Tk
   chrome. Its hour markers arm persistent five-minute chimes; the status
   bar reports trust, uncertainty, system-clock delta, and display zone.
-  Tk supplies the status-bar settings control, system tray, and Event Log.
+  Tk supplies the status-bar settings control and the Settings dialog,
+  including its Event Log tab.
 - Time is disciplined by six parallel sources: four plain-SNTP
   national-metrology / research-lab servers and two NTS-authenticated
   anchors (RFC 8915, TLS 1.3, local enrolled SPKI pins). The trust gate
@@ -99,9 +100,15 @@ zipfs image, and the C engine (libgcc + mbedTLS) is archived in.
   (a w32time correction, a manual set, a VM time-sync) is logged with its
   magnitude. This is the one comparison the whole trust stack uniquely
   enables.
-- **Lives in the tray.** Minimize-to-tray, a live time/zone/state
-  tooltip, and an optional run-at-startup entry, so it is an all-day
-  instrument rather than a window you reopen every boot.
+- **A real event log.** Settings → Log is a sortable, filterable table
+  over everything the engine and UI record — time (in the display zone,
+  `~` marking stamps taken before the clock anchored), severity,
+  category, message — persisted across sessions in a rolling store
+  (`events.log`, rotated at 4 MiB) so yesterday's anomaly is still
+  there in the morning.
+- **All-day instrument.** An optional run-at-startup entry and a
+  confirm-before-closing guard (both in Settings), so it stays up
+  rather than being a window you reopen every boot.
 - Time zones come from an IANA tzdata snapshot embedded at build time;
   the OS time-zone API is never consulted.
 

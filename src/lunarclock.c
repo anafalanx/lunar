@@ -10,7 +10,6 @@
 #include <windows.h>
 #include <initguid.h>
 #include <d2d1.h>
-#include <dwrite.h>
 #include <tcl.h>
 #include <tk.h>
 #include <tkPlatDecls.h>
@@ -47,12 +46,9 @@ typedef struct ClockWidget {
     ID2D1PathGeometry *hourHand;
     ID2D1PathGeometry *minuteHand;
     float handSize;
-    IDWriteTextFormat *textFormat;
-    int textSize;
 } ClockWidget;
 
 static ID2D1Factory *g_d2d;
-static IDWriteFactory *g_dwrite;
 
 /* --- Sweep animation -------------------------------------------------------
  * The Tcl side feeds authoritative disciplined time at 5 Hz; between feeds
@@ -118,11 +114,6 @@ static HRESULT ensure_factories(void) {
     if (!g_d2d) {
         hr = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
                                &IID_ID2D1Factory, NULL, (void **)&g_d2d);
-        if (FAILED(hr)) return hr;
-    }
-    if (!g_dwrite) {
-        hr = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
-                                &IID_IDWriteFactory, (IUnknown **)&g_dwrite);
         if (FAILED(hr)) return hr;
     }
     return S_OK;
@@ -210,36 +201,6 @@ static void draw_hand(ClockWidget *clock, ID2D1PathGeometry *geometry,
     ID2D1RenderTarget_SetTransform((ID2D1RenderTarget *)clock->target, &identity);
 }
 
-static HRESULT ensure_text_format(ClockWidget *clock, int size) {
-    if (clock->textFormat && clock->textSize == size) return S_OK;
-    if (clock->textFormat) {
-        IDWriteTextFormat_Release(clock->textFormat);
-        clock->textFormat = NULL;
-    }
-    HRESULT hr = IDWriteFactory_CreateTextFormat(
-        g_dwrite, L"Segoe UI", NULL, DWRITE_FONT_WEIGHT_SEMI_BOLD,
-        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
-        (FLOAT)size, L"en-us", &clock->textFormat);
-    if (SUCCEEDED(hr)) clock->textSize = size;
-    return hr;
-}
-
-static void draw_centered_text(ClockWidget *clock, const WCHAR *text,
-                               D2D1_RECT_F rect, int size,
-                               D2D1_COLOR_F color) {
-    if (FAILED(ensure_text_format(clock, size))) return;
-    IDWriteTextFormat_SetTextAlignment(clock->textFormat,
-                                       DWRITE_TEXT_ALIGNMENT_CENTER);
-    IDWriteTextFormat_SetParagraphAlignment(clock->textFormat,
-                                            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-    set_brush(clock, color);
-    ID2D1RenderTarget_DrawText((ID2D1RenderTarget *)clock->target, text,
-                               (UINT32)wcslen(text), clock->textFormat, &rect,
-                               (ID2D1Brush *)clock->brush,
-                               D2D1_DRAW_TEXT_OPTIONS_NONE,
-                               DWRITE_MEASURING_MODE_NATURAL);
-}
-
 /* The uncertainty sector: the second hand drawn as wide as the error bound.
  * ±boundMs maps onto the seconds dial as a half-angle of boundMs/1000 × 6°,
  * centered on the best-estimate second.  Direct2D gives a true translucent
@@ -292,7 +253,8 @@ static void draw_uncertainty(ClockWidget *clock, float cx, float cy,
     ID2D1PathGeometry_Release(sector);
 }
 
-static void draw_dial(ClockWidget *clock, float cx, float cy, float size) {
+static void draw_dial(ClockWidget *clock, float cx, float cy, float size,
+                      int live) {
     ID2D1RenderTarget *target = (ID2D1RenderTarget *)clock->target;
     D2D1_COLOR_F ink = rgb(26, 26, 26);
     D2D1_COLOR_F soft = rgb(107, 113, 119);
@@ -327,7 +289,7 @@ static void draw_dial(ClockWidget *clock, float cx, float cy, float size) {
     ID2D1RenderTarget_FillEllipse(target, &inner, (ID2D1Brush *)clock->brush);
 
     /* The uncertainty fan sits under the ticks and hands. */
-    draw_uncertainty(clock, cx, cy, size, seconds);
+    if (live) draw_uncertainty(clock, cx, cy, size, seconds);
 
     set_brush(clock, soft);
     for (int mark = 0; mark < 60; ++mark) {
@@ -363,6 +325,10 @@ static void draw_dial(ClockWidget *clock, float cx, float cy, float size) {
                                    size * 0.0140f, NULL);
     }
 
+    /* No time to show: the dial stays bare -- ring, ticks, and markers
+     * only. No hands, no fan, no hub, and never a word on the face. */
+    if (!live) return;
+
     ensure_hand_cache(clock, size);
     draw_hand(clock, clock->hourHand, cx, cy, hours * 30.0f, ink);
     draw_hand(clock, clock->minuteHand, cx, cy, minutes * 6.0f, ink);
@@ -376,29 +342,6 @@ static void draw_dial(ClockWidget *clock, float cx, float cy, float size) {
                                size * 0.0045f, NULL);
     D2D1_ELLIPSE pivot = ellipse(cx, cy, size * 0.014f);
     ID2D1RenderTarget_FillEllipse(target, &pivot, (ID2D1Brush *)clock->brush);
-}
-
-static const WCHAR *state_label(ClockWidget *clock) {
-    if (clock->stopped) return L"STOPPED";
-    switch (clock->trust) {
-        case CLOCK_TRUST_OK:          return L"TRUSTED";
-        case CLOCK_TRUST_HOLDOVER:    return L"ESTIMATED";
-        case CLOCK_TRUST_REACQUIRING: return L"REACQUIRING";
-        case CLOCK_TRUST_INOP:
-        default: return clock->synced ? L"NO SIGNAL" : L"ACQUIRING";
-    }
-}
-
-static D2D1_COLOR_F state_color(ClockWidget *clock) {
-    if (clock->stopped) return rgb(220, 50, 47);
-    switch (clock->trust) {
-        case CLOCK_TRUST_OK:       return rgb(46, 125, 50);
-        case CLOCK_TRUST_INOP:     return clock->synced ? rgb(220, 50, 47)
-                                                        : rgb(107, 113, 119);
-        case CLOCK_TRUST_HOLDOVER:
-        case CLOCK_TRUST_REACQUIRING:
-        default:                   return rgb(184, 134, 11);
-    }
 }
 
 static HRESULT create_target(ClockWidget *clock, HWND hwnd, int width, int height) {
@@ -480,17 +423,12 @@ static void clock_redraw(void *clientData) {
 
     float dw = (float)width, dh = (float)height;
     float size = dw < dh ? dw : dh;
-    if (clock->hasTime && !clock->stopped && size > 40.0f) {
-        /* Exactly two display states: the time -- with the uncertainty
-         * carried entirely by the second hand's fan -- or no time at all
-         * (the word screen below, which STOPPED joins). */
-        draw_dial(clock, dw * 0.5f, dh * 0.5f, size);
-    } else {
-        D2D1_RECT_F full = { 0.0f, 0.0f, dw, dh };
-        int fontSize = (int)(size * 0.13f);
-        if (fontSize < 18) fontSize = 18;
-        draw_centered_text(clock, state_label(clock), full, fontSize,
-                           state_color(clock));
+    if (size > 40.0f) {
+        /* Exactly two display states, and NO words on the face: the time
+         * (hands + uncertainty fan), or the bare dial with no hands at
+         * all. State words live in the status bar only. */
+        int live = clock->hasTime && !clock->stopped;
+        draw_dial(clock, dw * 0.5f, dh * 0.5f, size, live);
     }
 
     HRESULT hr = ID2D1RenderTarget_EndDraw(target, NULL, NULL);
@@ -584,7 +522,6 @@ static void clock_command_deleted(void *clientData) {
         Tk_DestroyWindow(clock->tkwin);
         clock->tkwin = NULL;
     }
-    if (clock->textFormat) IDWriteTextFormat_Release(clock->textFormat);
     discard_target(clock);
     ckfree(clock);
 }
@@ -708,7 +645,13 @@ static int clock_create_command(void *clientData, Tcl_Interp *interp,
 
 int LunarClock_Init(Tcl_Interp *interp) {
     if (Tk_InitStubs(interp, "9.0", 0) == NULL) return TCL_ERROR;
-    Tcl_CreateObjCommand(interp, "::lunar::clock", clock_create_command,
+    /* Global widget-class command, Tk style (button, canvas, ...). It must
+     * NOT live inside ::lunar: a ::lunar::clock command shadows Tcl's own
+     * [clock] for every proc defined in that namespace (namespace-first
+     * resolution), silently breaking [clock milliseconds]/[clock format]
+     * throughout the UI -- and only in the packaged exe, where this widget
+     * is registered. */
+    Tcl_CreateObjCommand(interp, "lunarclock", clock_create_command,
                          Tk_MainWindow(interp), NULL);
     return TCL_OK;
 }
