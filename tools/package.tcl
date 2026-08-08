@@ -8,7 +8,7 @@
 #   tclsh90s.exe tools/package.tcl [out.exe] [--wrapper W]
 #
 # Ported verbatim from els/tools/package.tcl (Lunar uses the same z shared
-# Tcl/Tk 9 payload at <z>/r/tcltk/9.0.3).
+# Tcl/Tk 9 payload at <z>/.z/r/tcltk/9.0.3).
 
 proc script_root {} {
     set s [info script]
@@ -17,10 +17,12 @@ proc script_root {} {
 }
 proc zmal_paths {root args} {
     set out {}
-    if {[info exists ::env(Z_ROOT)] && $::env(Z_ROOT) ne ""} {
-        lappend out [file join $::env(Z_ROOT) {*}$args]
+    if {[info exists ::env(Z_HOME)] && $::env(Z_HOME) ne ""} {
+        lappend out [file join $::env(Z_HOME) {*}$args]
+    } elseif {[info exists ::env(Z_ROOT)] && $::env(Z_ROOT) ne ""} {
+        lappend out [file join $::env(Z_ROOT) .z {*}$args]
     }
-    lappend out [file join [file dirname $root] {*}$args]
+    lappend out [file join [file dirname $root] .z {*}$args]
     return $out
 }
 proc discover_tcltk {root} {

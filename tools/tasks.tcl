@@ -2,11 +2,10 @@
 # tools/tasks.tcl - Lunar's task runner, ported from els/tools/tasks.tcl.
 # Builds the native Tcl/Tk shell exe against z's shared Tcl/Tk 9 + UCRT64
 # gcc payloads. Invoked as `z <task>` (via z.json) or directly:
-#   <z>/r/tcltk/9.0.3/tcl9/bin/tclsh90.exe tools/tasks.tcl <task>
+#   <z>/.z/r/tcltk/9.0.3/tcl9/bin/tclsh90.exe tools/tasks.tcl <task>
 #
-# STAGE: link spike. task_build currently compiles only src/lunar_main.c and
-# links static Tcl/Tk (no engine yet); the engine objects + src/lunarx.c and
-# the resource generation get added as the port proceeds.
+# The build links the C timing engine, Tcl/Tk shell glue, Direct2D clock
+# widget, generated resources, and the statically linked Tcl/Tk runtime.
 
 proc script_root {} {
     set s [info script]
@@ -15,10 +14,12 @@ proc script_root {} {
 }
 proc zmal_paths {root args} {
     set out {}
-    if {[info exists ::env(Z_ROOT)] && $::env(Z_ROOT) ne ""} {
-        lappend out [file join $::env(Z_ROOT) {*}$args]
+    if {[info exists ::env(Z_HOME)] && $::env(Z_HOME) ne ""} {
+        lappend out [file join $::env(Z_HOME) {*}$args]
+    } elseif {[info exists ::env(Z_ROOT)] && $::env(Z_ROOT) ne ""} {
+        lappend out [file join $::env(Z_ROOT) .z {*}$args]
     }
-    lappend out [file join [file dirname $root] {*}$args]
+    lappend out [file join [file dirname $root] .z {*}$args]
     return $out
 }
 proc discover_payload {root envs rel marker missingPath} {
@@ -36,11 +37,11 @@ proc discover_payload {root envs rel marker missingPath} {
 
 set ROOT [script_root]
 set TC    [discover_payload $ROOT Z_TCLTK {r tcltk 9.0.3} {tcl9 bin tclsh90.exe} \
-              [file join [file dirname $ROOT] r tcltk 9.0.3]]
+              [file join [file dirname $ROOT] .z r tcltk 9.0.3]]
 set MSYS2 [discover_payload $ROOT Z_MSYS2 {r msys2} {ucrt64 bin gcc.exe} \
-              [file join [file dirname $ROOT] r msys2]]
+              [file join [file dirname $ROOT] .z r msys2]]
 set TWAPI [discover_payload $ROOT Z_TWAPI {r twapi 5.2.0} {pkgIndex.tcl} \
-              [file join [file dirname $ROOT] r twapi 5.2.0]]
+              [file join [file dirname $ROOT] .z r twapi 5.2.0]]
 set ::env(Z_TCLTK) [file nativename $TC]
 set ::env(Z_MSYS2) [file nativename $MSYS2]
 set ::env(Z_TWAPI) [file nativename $TWAPI]
@@ -158,7 +159,7 @@ proc task_run {args} {
 set ::SYSLIBS {
     -lnetapi32 -lkernel32 -luser32 -ladvapi32 -luserenv -lws2_32
     -lgdi32 -lcomdlg32 -limm32 -lcomctl32 -lshell32 -luuid -lole32
-    -loleaut32 -lwinspool -lcrypt32 -lbcrypt -lwtsapi32 -lwinmm
+    -loleaut32 -lwinspool -lcrypt32 -lbcrypt -lwtsapi32 -lwinmm -ld2d1 -ldwrite
 }
 
 # The C engine (every engine src/*.c). The Tk shell glue -- entry point
@@ -225,6 +226,10 @@ proc task_build {args} {
     stream [gcc] -std=c23 -O2 {*}$gf -DSTATIC_BUILD=1 -ffunction-sections -fdata-sections \
         -I$inc -I[P src] -I[P build] -c [P src lunarx.c] -o [P build lunarx.o]
 
+    puts "cc  src/lunarclock.c"
+    stream [gcc] -std=c23 -O2 {*}$gf -DSTATIC_BUILD=1 -ffunction-sections -fdata-sections \
+        -I$inc -I[P src] -I[P build] -c [P src lunarclock.c] -o [P build lunarclock.o]
+
     puts "cc  src/lunar_main.c"
     stream [gcc] -std=c23 -O2 {*}$gf -municode -DUNICODE -D_UNICODE -DSTATIC_BUILD=1 \
         -DLUNAR_STATIC_LUNARX -ffunction-sections -fdata-sections \
@@ -233,7 +238,7 @@ proc task_build {args} {
     puts "ld  -> build/lunar-bare.exe"
     set bare [P build lunar-bare.exe]
     stream [gcc] -municode -mwindows -static-libgcc -Wl,--gc-sections \
-        [P build lunar_main.o] [P build lunarx.o] {*}$objs [P build lunar.res] \
+        [P build lunar_main.o] [P build lunarx.o] [P build lunarclock.o] {*}$objs [P build lunar.res] \
         [file join $libd libtcl9tk90.a] [file join $libd libtcl90.a] \
         [file join $libd libtclstub.a] $mbedtls {*}$::SYSLIBS -o $bare
     if {!$dbg} { catch {stream [strip-exe] $bare} }
@@ -293,8 +298,8 @@ proc task_check {args} {
 proc find_signtool {} {
     set sdk [lsort [glob -nocomplain {C:/Program Files (x86)/Windows Kits/10/bin/*/x64/signtool.exe}]]
     if {[llength $sdk]} { return [lindex $sdk end] }
-    set zroot [expr {[info exists ::env(Z_ROOT)] && $::env(Z_ROOT) ne "" ? $::env(Z_ROOT) : "C:/z"}]
-    set j [file join $zroot r winsdk 10.0.26100.0 signtool.exe]
+    set zhome [expr {[info exists ::env(Z_HOME)] && $::env(Z_HOME) ne "" ? $::env(Z_HOME) : [file join [file dirname $::ROOT] .z]}]
+    set j [file join $zhome r winsdk 10.0.26100.0 signtool.exe]
     if {[file exists $j]} { return $j }
     set p [auto_execok signtool]
     if {[llength $p]} { return [lindex $p 0] }
@@ -362,15 +367,14 @@ proc task_shot {args} {
     }
 }
 
-# uishot -- capture a deterministic (stubbed-engine) UI state for review.
-# States: collapsed (default) | expanded. See tools/uishot.tcl.
+# uishot -- capture the deterministic (stubbed-engine) analog UI for review.
 proc task_uishot {args} {
     need gcc tclsh
-    if {![llength $args]} { error "usage: z uishot <out.png> \[collapsed|expanded]" }
+    if {[llength $args] < 1 || [llength $args] > 2} {
+        error "usage: z uishot <out.png> ?trusted|degraded|wide|stopped?"
+    }
     if {![file exists [P build cap.dll]]} { puts "building capture extension..." ; task_build-ext }
-    set out   [lindex $args 0]
-    set state [expr {[llength $args] > 1 ? [lindex $args 1] : "collapsed"}]
-    stream [tclsh] [P tools shot.tcl] [wish] [P tools uishot.tcl] $out $state
+    stream [tclsh] [P tools shot.tcl] [wish] [P tools uishot.tcl] {*}$args
 }
 
 # ---- dispatch -----------------------------------------------------------

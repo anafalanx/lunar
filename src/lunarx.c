@@ -29,6 +29,8 @@
 #include "logbuf.h"
 #include "version.h"
 
+extern int LunarClock_Init(Tcl_Interp *interp);
+
 static const char *trust_name(TrustState s) {
     switch (s) {
         case TRUST_OK:          return "ok";
@@ -51,8 +53,9 @@ static const char *auth_name(NtpAuthMode m) {
 #define PUT(d, k, v) Tcl_DictObjPut(ip, (d), Tcl_NewStringObj((k), -1), (v))
 
 /* ---- chime -------------------------------------------------------------
- * An 880 Hz / 250 ms sine chime, volume-compensated against the system
- * master slider, played from an in-memory WAV.
+ * An 880 Hz / 250 ms sine chime with a 200 ms linear attack and a hard end,
+ * volume-compensated against the system master slider and played from an
+ * in-memory WAV.
  *
  * Reliability (why this is more than a PlaySound one-liner): Windows parks
  * an idle render endpoint in device power state D3. The first sound after
@@ -76,13 +79,17 @@ extern float Sysvol_Get(void);   /* sysvol.c (compiled into the engine) */
 #define BEEP_SAMPLE_RATE 44100
 #define BEEP_PREWARM_MS  300                              /* covers the worst-case D3->D0 wake */
 #define BEEP_TONE_MS     250
+#define BEEP_ATTACK_MS   200
 #define BEEP_PREWARM_FRAMES (BEEP_SAMPLE_RATE * BEEP_PREWARM_MS / 1000)
 #define BEEP_TONE_FRAMES    (BEEP_SAMPLE_RATE * BEEP_TONE_MS / 1000)
+#define BEEP_ATTACK_FRAMES  (BEEP_SAMPLE_RATE * BEEP_ATTACK_MS / 1000)
 #define BEEP_TOTAL_FRAMES   (BEEP_PREWARM_FRAMES + BEEP_TONE_FRAMES)
 #define BEEP_FREQ_HZ     880.0f                           /* A5 */
 #define BEEP_TARGET_SPEAKER_AMPLITUDE 0.276f
 #define BEEP_DATA_BYTES  (BEEP_TOTAL_FRAMES * 2)
 #define BEEP_BUF_BYTES   (44 + BEEP_DATA_BYTES)
+static_assert(BEEP_ATTACK_FRAMES > 0 && BEEP_ATTACK_FRAMES < BEEP_TONE_FRAMES,
+              "chime attack must fit inside the tone");
 
 static void WriteLE16(unsigned char *p, uint16_t v) { p[0]=v&0xFF; p[1]=(v>>8)&0xFF; }
 static void WriteLE32(unsigned char *p, uint32_t v) {
@@ -106,12 +113,12 @@ static void BuildWav(unsigned char *buf, float freqHz, float amplitude) {
     /* Leading silence warms a D3-parked endpoint before the tone renders. */
     for (int i = 0; i < BEEP_PREWARM_FRAMES; i++) { WriteLE16(p, 0); p += 2; }
     const float TAU = 6.28318530717958647692f;
-    const float attackFrames  = BEEP_SAMPLE_RATE * 0.010f;
-    const float releaseFrames = BEEP_SAMPLE_RATE * 0.030f;
     for (int i = 0; i < BEEP_TONE_FRAMES; i++) {
-        float env = 1.0f;
-        if (i < attackFrames)                          env = (float)i / attackFrames;
-        else if (i > BEEP_TONE_FRAMES - releaseFrames) env = (BEEP_TONE_FRAMES - i) / releaseFrames;
+        /* Rise linearly for 200 ms, then remain at full amplitude. Deliberately
+         * do not apply a release envelope: the tone stops at its fixed end. */
+        float env = i < BEEP_ATTACK_FRAMES
+                  ? (float)i / (float)BEEP_ATTACK_FRAMES
+                  : 1.0f;
         float s = sinf(TAU * freqHz * (float)i / BEEP_SAMPLE_RATE) * env * amplitude;
         int v = (int)(s * 32767.0f);
         if (v >  32767) v =  32767;
@@ -458,8 +465,11 @@ static void tray_queue(const char *kind) {
     lstrcpynA(te->kind, kind, (int)sizeof te->kind);
     Tcl_QueueEvent((Tcl_Event *)te, TCL_QUEUE_TAIL);
 }
+
 static LRESULT CALLBACK TraySubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                      UINT_PTR uid, [[maybe_unused]] DWORD_PTR ref) {
+    if (msg == WM_ENTERSIZEMOVE) tray_queue("resize-start");
+    if (msg == WM_EXITSIZEMOVE) tray_queue("resize-end");
     if (msg == LUNAR_TRAY_MSG) {
         switch (LOWORD(lp)) {
             case WM_LBUTTONUP:
@@ -513,6 +523,79 @@ static int TrayAdd_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
     Tcl_SetObjResult(ip, Tcl_NewObj());
     return TCL_OK;
 }
+
+/* lunar::frame_metrics hwnd -- the frame insets needed to convert Tk's client
+ * geometry to the visible Windows-frame geometry.  Tk owns the resize itself;
+ * this command is deliberately read-only. */
+static int FrameMetrics_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
+                            int objc, Tcl_Obj *const objv[]) {
+    if (objc != 2) { Tcl_WrongNumArgs(ip, 1, objv, "hwnd"); return TCL_ERROR; }
+    Tcl_WideInt h;
+    if (Tcl_GetWideIntFromObj(ip, objv[1], &h) != TCL_OK) return TCL_ERROR;
+    HWND hwnd = (HWND)(intptr_t)h;
+    if (!IsWindow(hwnd)) {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("not a window", -1));
+        return TCL_ERROR;
+    }
+    HWND frame = GetAncestor(hwnd, GA_ROOT);
+    if (!frame) {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("top-level window not found", -1));
+        return TCL_ERROR;
+    }
+    RECT outer, client;
+    POINT origin = { 0, 0 };
+    if (!GetWindowRect(frame, &outer) || !GetClientRect(frame, &client) ||
+        !ClientToScreen(frame, &origin)) return TCL_ERROR;
+    int clientWidth = client.right - client.left;
+    int clientHeight = client.bottom - client.top;
+    Tcl_Obj *result = Tcl_NewDictObj();
+    Tcl_DictObjPut(ip, result, Tcl_NewStringObj("extraWidth", -1),
+                   Tcl_NewIntObj((outer.right - outer.left) - clientWidth));
+    Tcl_DictObjPut(ip, result, Tcl_NewStringObj("extraHeight", -1),
+                   Tcl_NewIntObj((outer.bottom - outer.top) - clientHeight));
+    Tcl_DictObjPut(ip, result, Tcl_NewStringObj("left", -1),
+                   Tcl_NewIntObj(origin.x - outer.left));
+    Tcl_DictObjPut(ip, result, Tcl_NewStringObj("top", -1),
+                   Tcl_NewIntObj(origin.y - outer.top));
+    HMONITOR monitor = MonitorFromWindow(frame, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitorInfo = { .cbSize = sizeof monitorInfo };
+    if (monitor && GetMonitorInfoW(monitor, &monitorInfo)) {
+        RECT work = monitorInfo.rcWork;
+        Tcl_DictObjPut(ip, result, Tcl_NewStringObj("workX", -1),
+                       Tcl_NewIntObj(work.left));
+        Tcl_DictObjPut(ip, result, Tcl_NewStringObj("workY", -1),
+                       Tcl_NewIntObj(work.top));
+        Tcl_DictObjPut(ip, result, Tcl_NewStringObj("workWidth", -1),
+                       Tcl_NewIntObj(work.right - work.left));
+        Tcl_DictObjPut(ip, result, Tcl_NewStringObj("workHeight", -1),
+                       Tcl_NewIntObj(work.bottom - work.top));
+    }
+    Tcl_SetObjResult(ip, result);
+    return TCL_OK;
+}
+
+/* lunar::watch_resize hwnd -- report the native resize-gesture boundary to
+ * Tk without altering a Windows sizing message or its geometry. */
+static int ResizeWatch_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
+                           int objc, Tcl_Obj *const objv[]) {
+    if (objc != 2) { Tcl_WrongNumArgs(ip, 1, objv, "hwnd"); return TCL_ERROR; }
+    Tcl_WideInt h;
+    if (Tcl_GetWideIntFromObj(ip, objv[1], &h) != TCL_OK) return TCL_ERROR;
+    HWND hwnd = (HWND)(intptr_t)h;
+    if (!IsWindow(hwnd)) {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("not a window", -1));
+        return TCL_ERROR;
+    }
+    HWND frame = GetAncestor(hwnd, GA_ROOT);
+    if (!frame || !SetWindowSubclass(frame, TraySubclass, LUNAR_TRAY_UID, 0)) {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("could not watch resize", -1));
+        return TCL_ERROR;
+    }
+    g_uiInterp = ip;
+    Tcl_SetObjResult(ip, Tcl_NewObj());
+    return TCL_OK;
+}
+
 /* lunar::tray_tip hwnd tooltip -- update the tooltip. */
 static int TrayTip_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
                        int objc, Tcl_Obj *const objv[]) {
@@ -544,7 +627,8 @@ static int TrayRemove_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
 }
 
 /* lunar::run_at_startup ?0|1? -- query (no arg) or set the HKCU Run entry.
- * Returns 1/0 on query, "" on set. The Run key is the source of truth. */
+ * Returns 1/0 on query, "" on a successful set, or a Tcl error if the write
+ * fails. The Run key is the source of truth. */
 static int RunAtStartup_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
                             int objc, Tcl_Obj *const objv[]) {
     static const wchar_t *kSub = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -565,20 +649,28 @@ static int RunAtStartup_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
     if (RegCreateKeyExW(HKEY_CURRENT_USER, kSub, 0, NULL, 0, KEY_SET_VALUE,
                         NULL, &k, NULL) != ERROR_SUCCESS) {
         Tcl_SetObjResult(ip, Tcl_NewStringObj("cannot open Run key", -1));
-        return TCL_OK;
+        return TCL_ERROR;
     }
+    LSTATUS rc = ERROR_SUCCESS;
     if (enable) {
         wchar_t exe[MAX_PATH]; DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH);
         if (n > 0 && n < MAX_PATH) {
             wchar_t q[MAX_PATH + 2];
             int qn = wsprintfW(q, L"\"%s\"", exe);
-            RegSetValueExW(k, kVal, 0, REG_SZ, (const BYTE *)q,
-                           (DWORD)((qn + 1) * (int)sizeof(wchar_t)));
+            rc = RegSetValueExW(k, kVal, 0, REG_SZ, (const BYTE *)q,
+                                (DWORD)((qn + 1) * (int)sizeof(wchar_t)));
+        } else {
+            rc = ERROR_INSUFFICIENT_BUFFER;
         }
     } else {
-        RegDeleteValueW(k, kVal);
+        rc = RegDeleteValueW(k, kVal);
+        if (rc == ERROR_FILE_NOT_FOUND) rc = ERROR_SUCCESS;
     }
     RegCloseKey(k);
+    if (rc != ERROR_SUCCESS) {
+        Tcl_SetObjResult(ip, Tcl_NewStringObj("cannot update Run key", -1));
+        return TCL_ERROR;
+    }
     Tcl_SetObjResult(ip, Tcl_NewObj());
     return TCL_OK;
 }
@@ -599,6 +691,7 @@ static int Update_Cmd([[maybe_unused]] void *cd, Tcl_Interp *ip,
 int Lunarx_Init(Tcl_Interp *ip) {
     if (Tcl_InitStubs(ip, "9.0", 0) == nullptr) return TCL_ERROR;
     Tcl_CreateNamespace(ip, "::lunar", nullptr, nullptr);
+    if (LunarClock_Init(ip) != TCL_OK) return TCL_ERROR;
     Tcl_CreateObjCommand(ip, "::lunar::engine_start", EngineStart_Cmd, nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::syncnow",      SyncNow_Cmd,     nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::shutdown",     Shutdown_Cmd,    nullptr, nullptr);
@@ -612,6 +705,8 @@ int Lunarx_Init(Tcl_Interp *ip) {
     Tcl_CreateObjCommand(ip, "::lunar::tray_add",     TrayAdd_Cmd,     nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::tray_tip",     TrayTip_Cmd,     nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::tray_remove",  TrayRemove_Cmd,  nullptr, nullptr);
+    Tcl_CreateObjCommand(ip, "::lunar::frame_metrics", FrameMetrics_Cmd, nullptr, nullptr);
+    Tcl_CreateObjCommand(ip, "::lunar::watch_resize", ResizeWatch_Cmd, nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::run_at_startup", RunAtStartup_Cmd, nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::log_text",     LogText_Cmd,     nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::about",        About_Cmd,       nullptr, nullptr);
