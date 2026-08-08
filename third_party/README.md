@@ -88,7 +88,7 @@ key writing, weak curves, weak hashes, and deprecated APIs.
 ## cldr/
 
 The CLDR `windowsZones.xml` mapping (Windows time-zone key → IANA name).
-Used at **build time only** by `scripts/gen_win_tzmap.dr` to generate
+Used at **build time only** by `scripts/gen_win_tzmap.go` to generate
 `src/tz_winmap_gen.c`, so a fresh install can open on the user's likely
 zone instead of UTC. The XML itself is **not** linked into `Lunar.exe`.
 Pinned commit, provenance, and the refresh procedure are in

@@ -1,8 +1,8 @@
 # Lunar
 
-A trusted time reference for Windows, presented as a minimalist digital
-dashboard. A hardened C (C23) engine under a statically-linked Tcl/Tk
-shell — one self-contained, signed `.exe`.
+A trusted time reference for Windows, presented as a minimalist analog clock.
+A hardened C (C23) engine sits beneath a statically-linked Tcl/Tk shell —
+one self-contained, signed `.exe`.
 
 Lunar keeps its own cryptographically-attested timescale — disciplined
 by authenticated NTS consensus, never by the OS clock — and uses it to
@@ -10,9 +10,8 @@ tell you the true time, how certain it is, and **when your PC's own
 clock is wrong and by how much**. It is fail-honest: it never silently
 lies, and it never goes dark just because the network did.
 
-Current version: **0.50** — a two-part `MAJOR.MINOR` string, single-sourced
-from the top-level [`VERSION`](VERSION) file (the build injects it into the
-exe's version resource and `build/version.h`).
+The version is single-sourced from the top-level [`VERSION`](VERSION) file;
+the build injects it into the exe's version resource and `build/version.h`.
 
 ## Build
 
@@ -51,13 +50,13 @@ zipfs image, and the C engine (libgcc + mbedTLS) is archived in.
 ## Project layout
 
     src/         # C engine (ntp/nts/dns/clock/pin_store/siv/tz/...) plus
-                 #   the Tk shell glue: lunarx.c (::lunar::* commands),
-                 #   lunar_main.c (entry point), cap.c (screenshot helper)
-    lunar.tcl    # the Tk UI (digital dashboard, Settings, tray, menus)
+                 #   lunar_main.c (entry point), lunarx.c (::lunar::*),
+                 #   lunarclock.c (Direct2D clock widget), cap.c (screenshots)
+    lunar.tcl    # the Tk UI chrome: analog face, status bar, Settings, tray
     tools/       # Tcl build tooling (tasks/genres/package/shot/mkico)
     assets/      # icons, fonts
-    scripts/     # Python helpers: build.py (mbedTLS archive + version.h),
-                 #   gen_tz_embed.py, probe_nts.py
+    scripts/     # Build/codegen helpers: build.py (mbedTLS archive + version.h),
+                 #   gen_tz_embed.py, gen_win_tzmap.go, probe_nts.py
     third_party/ # vendored mbedTLS + IANA tzdata zoneinfo subset
                  #   + CLDR windowsZones (build-time only; see the
                  #   per-directory READMEs under third_party/)
@@ -72,10 +71,10 @@ zipfs image, and the C engine (libgcc + mbedTLS) is archived in.
   the UI as `::lunar::*` commands (`engine_start`, `status`, `sources`,
   `localtime`, `syncnow`, ...) registered from `lunarx.c`. All time logic
   lives in C; Tcl/Tk only draws.
-- The UI is a **digital time dashboard**: a large disciplined-time
-  readout, the trust state, the honest error bound, a live sources pane,
-  and the system-clock delta — with a menubar, Settings dialog, system
-  tray, and Event Log viewer.
+- The UI is an **antialiased Direct2D analog clock** inside normal Tk
+  chrome. Its hour markers arm persistent five-minute chimes; the status
+  bar reports trust, uncertainty, system-clock delta, and display zone.
+  Tk supplies the status-bar settings control, system tray, and Event Log.
 - Time is disciplined by six parallel sources: four plain-SNTP
   national-metrology / research-lab servers and two NTS-authenticated
   anchors (RFC 8915, TLS 1.3, local enrolled SPKI pins). The trust gate
@@ -95,7 +94,7 @@ zipfs image, and the C engine (libgcc + mbedTLS) is archived in.
   run, or a local fault.
 - **System-clock witness.** Lunar never *displays* the Windows clock,
   but with a disciplined reference in hand it *measures* it: the status
-  bar shows "PC clock: +N.NN s vs Lunar", and every step in the OS clock
+  bar shows "SYS +N.NN s", and every step in the OS clock
   (a w32time correction, a manual set, a VM time-sync) is logged with its
   magnitude. This is the one comparison the whole trust stack uniquely
   enables.

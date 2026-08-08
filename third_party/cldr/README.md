@@ -24,7 +24,7 @@ zone instead of UTC. Reading the zone *name* is not trusting the OS
 
 ## What ships in the binary
 
-**Not this XML.** `scripts/gen_win_tzmap.dr` compiles it into
+**Not this XML.** `scripts/gen_win_tzmap.go` compiles it into
 `src/tz_winmap_gen.c` — a sorted C table of `{ Windows key → IANA name }`
 pairs (~10 KB in `.rdata`), filtered to the zones actually embedded in
 `src/tz_embed.c` and canonicalized through the vendored tzdata backward
@@ -38,14 +38,14 @@ is repo source, kept for reproducible builds.
 
        curl -sS -o third_party/cldr/windowsZones.xml \
          https://raw.githubusercontent.com/unicode-org/cldr/main/common/supplemental/windowsZones.xml
-       C:/z/r/gh/bin/gh.exe api \
+       C:/dev/.z/r/gh/bin/gh.exe api \
          "repos/unicode-org/cldr/commits?path=common/supplemental/windowsZones.xml&per_page=1" \
          --jq '.[0].sha'
 
 2. Regenerate the table (run from the repo root, after any tzdata bump so
    the embedded-zone filter is current):
 
-       C:\z\t\drang\drang.exe scripts\gen_win_tzmap.dr
+       z go run scripts/gen_win_tzmap.go
 
 3. Rebuild, run the tests (they assert every mapped IANA name resolves in
    the embedded index), and commit the XML + regenerated
