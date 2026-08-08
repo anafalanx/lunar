@@ -213,27 +213,19 @@ static void draw_centered_text(ClockWidget *clock, const WCHAR *text,
                                DWRITE_MEASURING_MODE_NATURAL);
 }
 
-/* The second hand's provenance hue: signature red only while the time is
- * fully authenticated (TRUST_OK); amber while it rides unauthenticated
- * corroboration or holdover.  Width says how uncertain; hue says why. */
-static D2D1_COLOR_F provenance_color(ClockWidget *clock) {
-    return clock->trust == CLOCK_TRUST_OK ? rgb(220, 50, 47)
-                                          : rgb(184, 134, 11);
-}
-
 /* The uncertainty sector: the second hand drawn as wide as the error bound.
  * ±boundMs maps onto the seconds dial as a half-angle of boundMs/1000 × 6°,
  * centered on the best-estimate second.  Direct2D gives a true translucent
  * fill, so the dial stays legible through the fan.  At ±30 s the sector
- * covers the whole dial; draw a disc rather than a degenerate arc. */
+ * covers the whole dial; draw a disc rather than a degenerate arc.
+ * The display has exactly two states -- time shown (this dial, uncertainty
+ * carried entirely by the fan's width) or no time -- so the fan is always
+ * the signature red; there is no third look. */
 static void draw_uncertainty(ClockWidget *clock, float cx, float cy,
                              float size, float seconds) {
     if (clock->boundMs <= 0) return;
     float half = (float)clock->boundMs / 1000.0f * 6.0f;
-    D2D1_COLOR_F hue = provenance_color(clock);
-    D2D1_COLOR_F tint = rgba((int)(hue.r * 255.0f + 0.5f),
-                             (int)(hue.g * 255.0f + 0.5f),
-                             (int)(hue.b * 255.0f + 0.5f), 0.20f);
+    D2D1_COLOR_F tint = rgba(220, 50, 47, 0.20f);
     float radius = size * 0.44f;   /* same reach as the second hand's tip */
     ID2D1RenderTarget *target = (ID2D1RenderTarget *)clock->target;
 
@@ -273,10 +265,9 @@ static void draw_uncertainty(ClockWidget *clock, float cx, float cy,
     ID2D1PathGeometry_Release(sector);
 }
 
-static void draw_dial(ClockWidget *clock, float cx, float cy, float size,
-                      int stopped) {
+static void draw_dial(ClockWidget *clock, float cx, float cy, float size) {
     ID2D1RenderTarget *target = (ID2D1RenderTarget *)clock->target;
-    D2D1_COLOR_F ink = stopped ? rgb(107, 113, 119) : rgb(26, 26, 26);
+    D2D1_COLOR_F ink = rgb(26, 26, 26);
     D2D1_COLOR_F soft = rgb(107, 113, 119);
     D2D1_COLOR_F ring = rgb(212, 212, 212);
     D2D1_COLOR_F face = rgb(242, 242, 242);
@@ -292,9 +283,8 @@ static void draw_dial(ClockWidget *clock, float cx, float cy, float size,
     D2D1_ELLIPSE inner = ellipse(cx, cy, radius);
     ID2D1RenderTarget_FillEllipse(target, &inner, (ID2D1Brush *)clock->brush);
 
-    /* The uncertainty fan sits under the ticks and hands.  While stopped the
-     * seconds claim is withdrawn entirely: no fan, no second hand. */
-    if (!stopped) draw_uncertainty(clock, cx, cy, size, seconds);
+    /* The uncertainty fan sits under the ticks and hands. */
+    draw_uncertainty(clock, cx, cy, size, seconds);
 
     set_brush(clock, soft);
     for (int mark = 0; mark < 60; ++mark) {
@@ -307,7 +297,7 @@ static void draw_dial(ClockWidget *clock, float cx, float cy, float size,
     for (int mark = 1; mark < 12; ++mark) {
         /* Five-minute markers double as the persistent chime controls. */
         D2D1_COLOR_F marker = (clock->armedMask & (1u << mark))
-                            ? (stopped ? soft : rgb(220, 50, 47)) : ink;
+                            ? rgb(220, 50, 47) : ink;
         set_brush(clock, marker);
         D2D1_POINT_2F from = polar(cx, cy, radius - size * 0.050f, mark * 30.0f);
         D2D1_POINT_2F to = polar(cx, cy, radius, mark * 30.0f);
@@ -317,7 +307,7 @@ static void draw_dial(ClockWidget *clock, float cx, float cy, float size,
 
     {
         D2D1_COLOR_F marker = (clock->armedMask & 1u)
-                            ? (stopped ? soft : rgb(220, 50, 47)) : ink;
+                            ? rgb(220, 50, 47) : ink;
         float offset = size * 0.020f;
         D2D1_POINT_2F from = polar(cx, cy, radius - size * 0.050f, 0.0f);
         D2D1_POINT_2F to = polar(cx, cy, radius, 0.0f);
@@ -336,27 +326,19 @@ static void draw_dial(ClockWidget *clock, float cx, float cy, float size,
     draw_hand(clock, clock->hourHand, cx, cy, hours * 30.0f, ink);
     draw_hand(clock, clock->minuteHand, cx, cy, minutes * 6.0f, ink);
 
-    if (!stopped) {
-        /* Best-estimate centerline through the uncertainty fan. */
-        D2D1_COLOR_F accent = provenance_color(clock);
-        D2D1_POINT_2F tip = polar(cx, cy, size * 0.44f, seconds * 6.0f);
-        D2D1_POINT_2F tail = polar(cx, cy, -size * 0.08f, seconds * 6.0f);
-        set_brush(clock, accent);
-        ID2D1RenderTarget_DrawLine(target, tail, tip, (ID2D1Brush *)clock->brush,
-                                   size * 0.0045f, NULL);
-        D2D1_ELLIPSE pivot = ellipse(cx, cy, size * 0.014f);
-        ID2D1RenderTarget_FillEllipse(target, &pivot, (ID2D1Brush *)clock->brush);
-    } else {
-        /* Stopped: the hour/minute hands keep tracking the projection in
-         * grey, but no seconds are claimed -- hub only, a shade darker than
-         * the hands so the center still reads as a finished cap. */
-        set_brush(clock, rgb(80, 86, 92));
-        D2D1_ELLIPSE pivot = ellipse(cx, cy, size * 0.014f);
-        ID2D1RenderTarget_FillEllipse(target, &pivot, (ID2D1Brush *)clock->brush);
-    }
+    /* Best-estimate centerline through the uncertainty fan. */
+    D2D1_COLOR_F accent = rgb(220, 50, 47);
+    D2D1_POINT_2F tip = polar(cx, cy, size * 0.44f, seconds * 6.0f);
+    D2D1_POINT_2F tail = polar(cx, cy, -size * 0.08f, seconds * 6.0f);
+    set_brush(clock, accent);
+    ID2D1RenderTarget_DrawLine(target, tail, tip, (ID2D1Brush *)clock->brush,
+                               size * 0.0045f, NULL);
+    D2D1_ELLIPSE pivot = ellipse(cx, cy, size * 0.014f);
+    ID2D1RenderTarget_FillEllipse(target, &pivot, (ID2D1Brush *)clock->brush);
 }
 
 static const WCHAR *state_label(ClockWidget *clock) {
+    if (clock->stopped) return L"STOPPED";
     switch (clock->trust) {
         case CLOCK_TRUST_OK:          return L"TRUSTED";
         case CLOCK_TRUST_DEGRADED:    return L"DEGRADED";
@@ -368,6 +350,7 @@ static const WCHAR *state_label(ClockWidget *clock) {
 }
 
 static D2D1_COLOR_F state_color(ClockWidget *clock) {
+    if (clock->stopped) return rgb(220, 50, 47);
     switch (clock->trust) {
         case CLOCK_TRUST_OK:       return rgb(46, 125, 50);
         case CLOCK_TRUST_INOP:     return clock->synced ? rgb(220, 50, 47)
@@ -455,11 +438,11 @@ static void clock_redraw(void *clientData) {
 
     float dw = (float)width, dh = (float)height;
     float size = dw < dh ? dw : dh;
-    if (clock->hasTime && size > 40.0f) {
-        /* The uncertainty fan (width) and its hue (provenance) carry the
-         * trust story while running; grey is reserved for the stopped
-         * clock, whose hands keep tracking but claim no seconds. */
-        draw_dial(clock, dw * 0.5f, dh * 0.5f, size, clock->stopped);
+    if (clock->hasTime && !clock->stopped && size > 40.0f) {
+        /* Exactly two display states: the time -- with the uncertainty
+         * carried entirely by the second hand's fan -- or no time at all
+         * (the word screen below, which STOPPED joins). */
+        draw_dial(clock, dw * 0.5f, dh * 0.5f, size);
     } else {
         D2D1_RECT_F full = { 0.0f, 0.0f, dw, dh };
         int fontSize = (int)(size * 0.13f);

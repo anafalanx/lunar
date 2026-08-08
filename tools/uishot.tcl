@@ -6,11 +6,12 @@
 #   tools/shot.tcl <wish> tools/uishot.tcl <out.png> ?state?
 #
 # ?state?: trusted (default) | degraded | wide | stopped -- stages the
-# uncertainty-fan second hand at a representative bound:
-#   trusted   ok        ±207 ms  (red hairline fan)
-#   degraded  degraded  ±300 ms  (amber: unauthenticated corroboration)
-#   wide      holdover  ±2.5 s   (amber fan, visibly open)
-#   stopped   holdover  ±6.5 s   (> default 5 s ceiling: seconds withdrawn)
+# uncertainty-fan second hand at a representative bound. The display has
+# exactly two states (time-with-fan, always signature red; or no time):
+#   trusted   ok        ±207 ms  (near-hairline fan)
+#   degraded  degraded  ±300 ms  (slightly wider fan, same look)
+#   wide      holdover  ±2.5 s   (fan visibly open)
+#   stopped   holdover  ±6.5 s   (> default 5 s ceiling: no time shown)
 #
 # It sources lunar.tcl (which builds the real UI via lunar::main), then replaces
 # the engine commands with fixed sample data so every capture is identical.

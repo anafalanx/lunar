@@ -446,16 +446,14 @@ proc lunar::clock_face_static {c} {
     $c lower face
 }
 
-# Draw the hands from a localtime dict, mirroring the native widget's policy:
-# the second hand is an UNCERTAINTY FAN -- a pie sector as wide as the error
-# bound (±boundMs -> half-angle boundMs/1000 × 6°) with a hairline
-# best-estimate centerline. Hue carries provenance: signature red only while
-# fully authenticated (ok); amber while degraded/holdover. When `stopped`
-# (bound above the user's ceiling) the seconds claim is withdrawn entirely --
-# no fan, no centerline -- and the hour/minute hands keep tracking in grey.
-# Tk canvas has no alpha, so the fan is a solid tint lowered BENEATH the face
-# ticks; the ticks stay legible across it.
-proc lunar::clock_hands {c lt milliseconds state boundMs stopped} {
+# Draw the hands from a localtime dict, mirroring the native widget's policy.
+# The display has exactly TWO states: the time -- with the uncertainty carried
+# entirely by the second hand, an UNCERTAINTY FAN (a pie sector as wide as the
+# error bound, ±boundMs -> half-angle boundMs/1000 × 6°, around a hairline
+# best-estimate centerline, always the signature red) -- or no time at all
+# (the caller clears the hands). Tk canvas has no alpha, so the fan is a solid
+# tint lowered BENEATH the face ticks; the ticks stay legible across it.
+proc lunar::clock_hands {c lt milliseconds boundMs} {
     set w [winfo width $c] ; set h [winfo height $c]
     if {$w <= 1 || $h <= 1} { set w $::lunar::CLOCK_SZ ; set h $::lunar::CLOCK_SZ }
     set sz [expr {min($w, $h)}]
@@ -463,40 +461,28 @@ proc lunar::clock_hands {c lt milliseconds state boundMs stopped} {
     $c delete hand
     set h [dict get $lt hour] ; set m [dict get $lt minute]
     set s [expr {[dict get $lt second] + $milliseconds / 1000.0}]
-    set hcol [expr {$stopped ? $::lunar::MUTED : $::lunar::INK}]
-    if {!$stopped} {
+    if {$boundMs > 0} {
         set r [expr {$sz*.44}]
-        if {$state eq "ok"} {
-            set hue $::lunar::ACCENT ; set tint "#EECCCB"
-        } else {
-            set hue $::lunar::WARN   ; set tint "#E6DCC4"
-        }
         set half [expr {double($boundMs) / 1000.0 * 6.0}]
-        if {$boundMs > 0} {
-            if {$half >= 180.0} {
-                set id [$c create oval [expr {$cx-$r}] [expr {$cy-$r}] \
-                            [expr {$cx+$r}] [expr {$cy+$r}] \
-                            -fill $tint -outline "" -tags hand]
-            } else {
-                set secAng [expr {$s/60.0*360}]
-                set id [$c create arc [expr {$cx-$r}] [expr {$cy-$r}] \
-                            [expr {$cx+$r}] [expr {$cy+$r}] \
-                            -start [expr {90.0 - $secAng - $half}] \
-                            -extent [expr {2.0*$half}] \
-                            -style pieslice -fill $tint -outline "" -tags hand]
-            }
-            $c lower $id     ;# beneath the face ring/ticks
+        if {$half >= 180.0} {
+            set id [$c create oval [expr {$cx-$r}] [expr {$cy-$r}] \
+                        [expr {$cx+$r}] [expr {$cy+$r}] \
+                        -fill "#EECCCB" -outline "" -tags hand]
+        } else {
+            set secAng [expr {$s/60.0*360}]
+            set id [$c create arc [expr {$cx-$r}] [expr {$cy-$r}] \
+                        [expr {$cx+$r}] [expr {$cy+$r}] \
+                        -start [expr {90.0 - $secAng - $half}] \
+                        -extent [expr {2.0*$half}] \
+                        -style pieslice -fill "#EECCCB" -outline "" -tags hand]
         }
+        $c lower $id     ;# beneath the face ring/ticks
     }
-    lunar::_hand $c $cx $cy [expr {$sz*.28}] [expr {(($h%12)+$m/60.0)/12.0*360}] $hcol 9
-    lunar::_hand $c $cx $cy [expr {$sz*.40}] [expr {($m+$s/60.0)/60.0*360}]      $hcol 5
-    if {!$stopped} {
-        lunar::_hand $c $cx $cy [expr {$sz*.44}] [expr {$s/60.0*360}] $hue 2
-    }
-    # Hub cap: a shade darker than the hands when stopped, so the pivot still
-    # reads as a finished cap (parity with the native renderer).
+    lunar::_hand $c $cx $cy [expr {$sz*.28}] [expr {(($h%12)+$m/60.0)/12.0*360}] $::lunar::INK 9
+    lunar::_hand $c $cx $cy [expr {$sz*.40}] [expr {($m+$s/60.0)/60.0*360}]      $::lunar::INK 5
+    lunar::_hand $c $cx $cy [expr {$sz*.44}] [expr {$s/60.0*360}] $::lunar::ACCENT 2
     $c create oval [expr {$cx-6}] [expr {$cy-6}] [expr {$cx+6}] [expr {$cy+6}] \
-        -fill [expr {$stopped ? "#50565C" : $hcol}] -outline "" -tags hand
+        -fill $::lunar::INK -outline "" -tags hand
 }
 
 # Prefer the native Direct2D clock widget when packaged with Lunar.  The
@@ -519,9 +505,10 @@ proc lunar::clock_display {lt milliseconds state hasTime synced boundMs stopped}
             lunar::log "Direct2D clock update failed: $err"
         }
     }
-    if {$hasTime && $lt ne ""} {
-        lunar::clock_hands .face.clock $lt $milliseconds $state $boundMs $stopped
+    if {$hasTime && $lt ne "" && !$stopped} {
+        lunar::clock_hands .face.clock $lt $milliseconds $boundMs
     } else {
+        # The other of the two display states: no time shown at all.
         catch { .face.clock delete hand }
     }
 }
@@ -1312,7 +1299,7 @@ proc lunar::render {st} {
     if {$hasTime} {
         # break the disciplined UTC down in the DISPLAY zone via the embedded
         # tzdata (never Tcl's [clock], which trusts the OS zone database), then
-        # draw the hands -- inked while trusted, greyed on holdover.
+        # draw the hands; the second hand's fan width carries the uncertainty.
         set utcMs [dict get $st utcMs]
         set milliseconds [expr {$utcMs % 1000}]
         if {$milliseconds < 0} { set milliseconds [expr {$milliseconds + 1000}] }
@@ -1335,9 +1322,10 @@ proc lunar::render {st} {
     lunar::clock_display $lt $milliseconds $state [expr {$hasTime && $lt ne ""}] $synced \
         $boundMs $stopped
 
-    # The face carries the trust story now -- fan width = bound, hue =
-    # provenance -- so the bar words a state ONLY when the face cannot:
-    # STOPPED, or the no-time states (ACQUIRING/NO SIGNAL/REACQUIRING).
+    # The face has exactly two states -- time (uncertainty carried entirely
+    # by the second hand's fan width) or no time -- so the bar words a state
+    # ONLY when the face shows no time: STOPPED, or ACQUIRING/NO SIGNAL/
+    # REACQUIRING.
     # Cells hide entirely (with their separator dots) when redundant, so the
     # zone witness is never starved into a clipped, fake-looking code: the
     # full bar's natural width exceeded the window (measured 633 vs 510 px),
@@ -1354,11 +1342,15 @@ proc lunar::render {st} {
     .sb.bound configure -text [expr {$running ? ($bound eq "" ? "±—" : $bound) : ""}] \
         -fg $::lunar::MUTED
     set showSys [expr {$running && !$stopped && [dict get $st sysDeltaValid]}]
-    # A separator dot renders only when BOTH its neighbors are visible.
-    .sb.sep2  configure -text [expr {$running && $showSys ? "·" : ""}]
+    # A separator dot renders only when BOTH its neighbors are visible:
+    # sep2 pairs bound|sys; sep3 is the zone's dot and pairs it with ANY
+    # visible cell on the left cluster (bound when running -- with SYS hidden
+    # the bound|zone pairing still needs it); in the no-time states sep1
+    # (word) already provides the single dot before the zone.
+    .sb.sep2  configure -text [expr {$showSys ? "·" : ""}]
     .sb.sys  configure -text [expr {$showSys ? \
         "SYS [lunar::fmt_delta [dict get $st sysDeltaMs]]" : ""}] -fg $::lunar::MUTED
-    .sb.sep3 configure -text [expr {$showSys ? "·" : ""}]
+    .sb.sep3 configure -text [expr {$running ? "·" : ""}]
     if {$running} {
         .sb.zone configure -text "[dict get $lt abbr] [lunar::fmt_utcoff [dict get $lt offSec]]"
     } else {
