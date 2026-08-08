@@ -10,7 +10,7 @@ namespace eval lunar {
     variable version "0.55"
     variable poll_ms   60000 ;# BASE cadence: re-sync about this often when OK
     variable poll_min   8000 ;# FAST floor while acquiring / re-anchoring
-    variable poll_max 300000 ;# RELAXED ceiling once well disciplined (5 min)
+    variable poll_max 600000 ;# RELAXED ceiling once well disciplined (10 min)
     variable poll_good     0 ;# consecutive converged cycles (drives the relax ramp)
     variable poll_bad      0 ;# consecutive unhealthy cycles (drives the fast backoff)
     variable poll_cur  60000 ;# current interval actually scheduled (for the log/About)
@@ -1813,7 +1813,7 @@ proc lunar::next_poll_ms {syncErr} {
     incr ::lunar::poll_good
     if {$::lunar::poll_good < 3} { return $base }                      ;# confirm before relaxing
     set iv [expr {$base * (1 << min($::lunar::poll_good - 3, 8))}]     ;# 60,120,240,480...
-    return [expr {$iv > $max ? $max : $iv}]                           ;# capped at 5 min
+    return [expr {$iv > $max ? $max : $iv}]                           ;# capped at 10 min
 }
 
 # ---- window state -----------------------------------------------------------
@@ -2066,7 +2066,7 @@ proc lunar::selftest {reportPath} {
         append txt "prewarmfire=$::lunar::_prewarms\n"           ;# want 1
     }
     # verify the adaptive poll cadence: FAST (8s) when unhealthy, BASE (60s)
-    # when merely OK, RELAXED ramp (120/240/300s, capped) once converged.
+    # when merely OK, RELAXED ramp (120/240/480/600s, capped) once converged.
     catch {
         catch { rename ::lunar::status ::lunar::_realstatus }
         proc ::lunar::status {} { return $::lunar::_ststub }
@@ -2081,10 +2081,11 @@ proc lunar::selftest {reportPath} {
         for {set i 1} {$i <= 3} {incr i} { set r3 [lunar::next_poll_ms 0] } ;# confirm x3 -> 60000
         set r4 [lunar::next_poll_ms 0]                           ;# -> 120000
         set r5 [lunar::next_poll_ms 0]                           ;# -> 240000
-        set r6 [lunar::next_poll_ms 0]                           ;# -> capped 300000
+        set r6 [lunar::next_poll_ms 0]                           ;# -> 480000
+        set r7 [lunar::next_poll_ms 0]                           ;# -> capped 600000
         set good [expr {$fst==8000 && $bse==60000 && $r3==60000 && $r4==120000 \
-                        && $r5==240000 && $r6==300000}]
-        if {$good} { set cad ok } else { set cad "BAD $fst $bse $r3 $r4 $r5 $r6" }
+                        && $r5==240000 && $r6==480000 && $r7==600000}]
+        if {$good} { set cad ok } else { set cad "BAD $fst $bse $r3 $r4 $r5 $r6 $r7" }
         append txt "pollcadence=$cad\n"
     }
     # verify the stop rule: setting clamp, 2-read debounce, immediate resume

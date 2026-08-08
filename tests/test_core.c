@@ -376,21 +376,21 @@ static void test_clock_display_states(void) {
     CHECK(d1.lastSyncUtcMs >= trustedUtc);
 
     // Staleness: with no corroborating cycle for >CYCLE_STALE_AFTER_MS
-    // (360 s, sized above the relaxed 5-min poll ceiling + cycle budget) the
-    // display derives to honest HOLDOVER -- still a running time, never dark,
-    // same projection basis (the generation is untouched).
-    Clock_TestAgeLastCycle(361000);
+    // (660 s, sized above the relaxed 10-min poll ceiling + cycle budget)
+    // the display derives to honest HOLDOVER -- still a running time, never
+    // dark, same projection basis (the generation is untouched).
+    Clock_TestAgeLastCycle(661000);
     CHECK_EQ_INT(Clock_Trust(), TRUST_HOLDOVER);
     CHECK_EQ_INT(Clock_NowUtcMs(&display), 1);
     CHECK_EQ_INT(Clock_DisplayGenerationIsCurrent(gen2), 1);
 
-    // The bound grows with anchor age: 200 ppm over the total 361 s + 1 h
-    // aged so far = ~792 ms of growth on the (default 200 ms) base.
+    // The bound grows with anchor age: 200 ppm over the total 661 s + 1 h
+    // aged so far = ~852 ms of growth on the (default 200 ms) base.
     Clock_TestAgeAnchor(3600000);
     ClockDisplay d2;
     Clock_GetDisplay(&d2);
     CHECK_EQ_INT(d2.state, TRUST_HOLDOVER);
-    CHECK(d2.boundMs >= 980 && d2.boundMs <= 1010);
+    CHECK(d2.boundMs >= 1040 && d2.boundMs <= 1070);
     CHECK(d2.lastSyncAgeMs >= 3600000);
 
     // Continuity break (suspend/resume): REACQUIRING carries only the

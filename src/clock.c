@@ -92,12 +92,15 @@ static int        g_consecutiveLocalFaults = 0;
 // CYCLE_STALE_AFTER_MS: an accepted cycle older than this no longer keeps
 // the OK claim alive and the display derives to HOLDOVER. Chosen above
 // the worst-case healthy renewal path: the poll scheduler (lunar.tcl)
-// relaxes the cadence up to a 300 s (5 min) ceiling when the clock is
+// relaxes the cadence up to a 600 s (10 min) ceiling when the clock is
 // well disciplined, and one cycle can take up to the 40 s cycle budget,
-// so a healthy slow renewal lands up to 340 s apart. 360 s clears that
+// so a healthy slow renewal lands up to 640 s apart. 660 s clears that
 // with a 20 s margin, so a slow-but-successful relaxed cycle never
 // false-alarms to HOLDOVER, while a genuinely wedged poller is still
-// caught within ~6 min (proportionate to the relaxed cadence).
+// caught within ~11 min (proportionate to the relaxed cadence). This
+// constant is DERIVED from the Tcl scheduler's poll_max -- move them
+// together or the display drops to holdover mid-relaxation and the
+// cadence oscillates between relaxed and FAST forever.
 //
 // CONTINUITY_TRIP_MIN_MS: DeriveDisplayLocked cross-checks the QPC-based
 // anchor age against the tick64-based age (tick64 keeps counting across
@@ -107,7 +110,7 @@ static int        g_consecutiveLocalFaults = 0;
 // the projection can no longer be defended, so continuity is tripped and
 // the display drops to REACQUIRING until an authenticated re-anchor.
 #define ANCHOR_ERR_DEFAULT_MS    200
-#define CYCLE_STALE_AFTER_MS  360000
+#define CYCLE_STALE_AFTER_MS  660000
 #define CONTINUITY_TRIP_MIN_MS  2000
 
 // --- Discipline-loop constants --------------------------------------------
