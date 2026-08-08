@@ -1271,10 +1271,12 @@ proc lunar::quit {} {
 }
 
 # ---- poll loop --------------------------------------------------------------
-# The old Direct2D application refreshed at five frames per second, phase
-# locked to the disciplined clock.  Keeping that cadence makes the fractional
-# seconds hand move smoothly without turning the Tk event loop into an
-# animation loop.
+# The Tcl side feeds the face authoritative disciplined time at five frames
+# per second, phase locked to the disciplined clock. The native widget sweeps
+# the second hand at ~30 fps on its own timer by extrapolating (at most a few
+# hundred ms of QPC) between feeds -- so the Tk event loop never becomes an
+# animation loop, and a stalled feed pauses the hand instead of letting the
+# display free-run.
 proc lunar::schedule_tick {utcMs} {
     set delay 200
     if {$utcMs ne ""} {

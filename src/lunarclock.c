@@ -16,6 +16,7 @@
 #include <tkPlatDecls.h>
 
 #include <math.h>
+#include <stdint.h>
 #include <string.h>
 #include <wchar.h>
 
@@ -37,6 +38,8 @@ typedef struct ClockWidget {
     int stopped;   /* bound exceeded the user's ceiling: withdraw the seconds claim */
     unsigned short armedMask;
     ClockTrust trust;
+    int64_t baseQpc;            /* QPC stamp of the last `show` feed */
+    Tcl_TimerToken sweepTimer;  /* ~30 fps sweep re-arm, NULL when idle */
     int redrawPending;
     ID2D1HwndRenderTarget *target;
     ID2D1SolidColorBrush *brush;
@@ -50,6 +53,31 @@ typedef struct ClockWidget {
 
 static ID2D1Factory *g_d2d;
 static IDWriteFactory *g_dwrite;
+
+/* --- Sweep animation -------------------------------------------------------
+ * The Tcl side feeds authoritative disciplined time at 5 Hz; between feeds
+ * the widget extrapolates the shown milliseconds from raw QPC so the second
+ * hand SWEEPS instead of stepping. The extrapolation is display-only and
+ * hard-capped: if the feed stalls, the hand pauses (an honest signal) rather
+ * than free-running local time. The timer runs only while a dial is shown. */
+#define SWEEP_FRAME_MS        33   /* ~30 fps: tip moves < 1 px per frame */
+#define SWEEP_MAX_EXTRAP_MS  400   /* two feed periods, then hold */
+
+static int64_t qpc_freq(void) {
+    static int64_t f = 0;
+    if (!f) {
+        LARGE_INTEGER li;
+        QueryPerformanceFrequency(&li);
+        f = li.QuadPart ? li.QuadPart : 1;
+    }
+    return f;
+}
+
+static int64_t qpc_now(void) {
+    LARGE_INTEGER li;
+    QueryPerformanceCounter(&li);
+    return li.QuadPart;
+}
 
 #ifndef PI
 #define PI 3.14159265358979323846f
@@ -273,7 +301,23 @@ static void draw_dial(ClockWidget *clock, float cx, float cy, float size) {
     /* Match the original Direct2D face: an inset dial, full-length ticks,
      * and a double marker at 12 o'clock. */
     float radius = size * 0.46f;
-    float seconds = (float)clock->second + (float)clock->millisecond / 1000.0f;
+
+    /* Sweep: extrapolate the shown time by the QPC elapsed since the last
+     * authoritative feed, hard-capped so a stalled feed pauses the hand.
+     * Total-seconds math lets the carry ripple into minutes and hours. */
+    int64_t extraMs = 0;
+    if (clock->baseQpc) {
+        extraMs = (qpc_now() - clock->baseQpc) * 1000 / qpc_freq();
+        if (extraMs < 0) extraMs = 0;
+        if (extraMs > SWEEP_MAX_EXTRAP_MS) extraMs = SWEEP_MAX_EXTRAP_MS;
+    }
+    double totalSec = (double)(clock->hour % 12) * 3600.0
+                    + (double)clock->minute * 60.0
+                    + (double)clock->second
+                    + ((double)clock->millisecond + (double)extraMs) / 1000.0;
+    float seconds = (float)fmod(totalSec, 60.0);
+    float minutes = (float)(fmod(totalSec, 3600.0) / 60.0);
+    float hours   = (float)(totalSec / 3600.0);
 
     set_brush(clock, ring);
     D2D1_ELLIPSE outer = ellipse(cx, cy, radius + 1.5f);
@@ -319,8 +363,6 @@ static void draw_dial(ClockWidget *clock, float cx, float cy, float size) {
                                    size * 0.0140f, NULL);
     }
 
-    float minutes = (float)clock->minute + seconds / 60.0f;
-    float hours = (float)(clock->hour % 12) + minutes / 60.0f;
     ensure_hand_cache(clock, size);
     draw_hand(clock, clock->hourHand, cx, cy, hours * 30.0f, ink);
     draw_hand(clock, clock->minuteHand, cx, cy, minutes * 6.0f, ink);
@@ -400,9 +442,12 @@ static void paint_fallback(HWND hwnd) {
     ReleaseDC(hwnd, dc);
 }
 
+static void sweep_manage(ClockWidget *clock);
+
 static void clock_redraw(void *clientData) {
     ClockWidget *clock = clientData;
     clock->redrawPending = 0;
+    sweep_manage(clock);
     if (!clock->tkwin || !Tk_IsMapped(clock->tkwin)) return;
     Tk_MakeWindowExist(clock->tkwin);
     HWND hwnd = Tk_GetHWND(Tk_WindowId(clock->tkwin));
@@ -462,6 +507,27 @@ static void request_redraw(ClockWidget *clock) {
     }
 }
 
+static void sweep_tick(void *clientData) {
+    ClockWidget *clock = clientData;
+    clock->sweepTimer = NULL;
+    request_redraw(clock);   /* clock_redraw re-arms while still eligible */
+}
+
+/* Keep the ~30 fps sweep timer alive exactly while a dial is being shown:
+ * hasTime, not stopped, and the window is mapped. The word screens and the
+ * stopped face are static, so the widget goes fully idle there. */
+static void sweep_manage(ClockWidget *clock) {
+    int want = clock->tkwin && Tk_IsMapped(clock->tkwin)
+               && clock->hasTime && !clock->stopped;
+    if (want && !clock->sweepTimer) {
+        clock->sweepTimer = Tcl_CreateTimerHandler(SWEEP_FRAME_MS,
+                                                   sweep_tick, clock);
+    } else if (!want && clock->sweepTimer) {
+        Tcl_DeleteTimerHandler(clock->sweepTimer);
+        clock->sweepTimer = NULL;
+    }
+}
+
 static void clock_event(void *clientData, XEvent *eventPtr) {
     ClockWidget *clock = clientData;
     if (eventPtr->type == Expose) {
@@ -507,6 +573,10 @@ static int parse_armed_mask(Tcl_Interp *interp, Tcl_Obj *obj, unsigned short *ma
 
 static void clock_command_deleted(void *clientData) {
     ClockWidget *clock = clientData;
+    if (clock->sweepTimer) {
+        Tcl_DeleteTimerHandler(clock->sweepTimer);
+        clock->sweepTimer = NULL;
+    }
     if (clock->redrawPending) Tcl_CancelIdleCall(clock_redraw, clock);
     if (clock->tkwin) {
         Tk_DeleteEventHandler(clock->tkwin, ExposureMask | StructureNotifyMask,
@@ -568,6 +638,10 @@ static int clock_widget_command(void *clientData, Tcl_Interp *interp,
         Tcl_SetObjResult(interp, Tcl_NewStringObj("unknown clock trust state", -1));
         return TCL_ERROR;
     }
+    /* This feed's time components are current NOW: restart the sweep
+     * extrapolation from this instant (even when the fields are equal --
+     * a fresh feed still re-bases the sweep). */
+    if (hasTime) clock->baseQpc = qpc_now();
     if (clock->hour != hour || clock->minute != minute || clock->second != second ||
         clock->millisecond != millisecond ||
         clock->hasTime != hasTime || clock->synced != synced || clock->trust != trust ||
