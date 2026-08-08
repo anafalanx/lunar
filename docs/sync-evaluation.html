@@ -473,7 +473,7 @@
     <li><strong>Tiered trust with graceful degradation</strong> (addresses S1, A1).
       <ul>
         <li><code>TRUST_OK</code> — NTS + ≥ 2 core within 200 ms (today).</li>
-        <li><code>TRUST_DEGRADED</code> — NTS unavailable, but ≥ 3 core sources concur within <strong>100 ms</strong> (tighter) and last NTS-OK is &lt; 2 h old. Clock runs disciplined; UI shows amber "UNAUTHENTICATED"; rate is read-only (no EMA update from degraded cycles).</li>
+        <li><code>TRUST_DEGRADED</code> — NTS unavailable, but ≥ 3 core sources concur within <strong>100 ms</strong> (tighter) and last NTS-OK is &lt; 2 h old. Clock runs disciplined; UI shows amber "UNAUTHENTICATED"; rate is read-only (no EMA update from degraded cycles). <em>Superseded (July 2026): the DEGRADED tier was later removed entirely — trust is the measured certainty interval alone, unauthenticated clusters only ever widen it, and past a user ceiling the clock stops and recovers immediately.</em></li>
         <li><code>TRUST_INOP</code> — nothing else.</li>
       </ul>
       Availability rises; security stance is explicit (degradation is user-visible, not silent); PLL is protected from being poisoned by unauthenticated samples.
@@ -492,7 +492,7 @@
     <li><strong>Exponential INOP back-off</strong> (A3): 5 / 10 / 20 / 40 / 60 s, reset on OK.</li>
     <li><strong>Parallel-harvest aggregator</strong> (A2): decouple per-source deadlines so core replies are processed the instant they arrive; NTS runs on its own 20 s budget.</li>
     <li><strong>IPv6 dual-stack</strong> (A6): <code>AF_UNSPEC</code> + try-all.</li>
-    <li><strong>Last-known-good amber mode</strong> (A4): render recent-but-stale time distinctly, not INOP, for outages ≤ 2 min. Guarded by the <code>TRUST_DEGRADED</code> tier above.</li>
+    <li><strong>Last-known-good amber mode</strong> (A4): render recent-but-stale time distinctly, not INOP, for outages ≤ 2 min. Was guarded by the <code>TRUST_DEGRADED</code> tier above <em>(tier since removed — the growing certainty interval now covers this role)</em>.</li>
     <li><strong>Warm-start pre-flight SNTP</strong> (A5): one unauthenticated query against the cached IP of the fastest previous source, fired in parallel with <code>Init</code>. Displayed as "SYNCING" (untrusted) until the first gated OK lands.</li>
   </ol>
 </div>

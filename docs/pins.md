@@ -137,8 +137,9 @@ sample riding on a continuous enrolled peer), and the two NTS providers to come 
 different operator families. They must agree within 200 ms, and at least three of the four
 plain SNTP core sources must agree with their midpoint.
 
-If fewer than two operator-diverse NTS samples are available, Lunar stays INOP (or, with a
-recent enough authenticated anchor, the unauthenticated DEGRADED tier; see `src/ntp.h`).
+If fewer than two operator-diverse NTS samples are available, the cycle is INOP: the
+certainty interval simply keeps growing from the last authenticated anchor, and a tight
+unauthenticated core cluster can only *widen* it, never sustain a claim (see `src/ntp.h`).
 
 ## Logging
 

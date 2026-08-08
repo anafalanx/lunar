@@ -80,21 +80,22 @@ zipfs image, and the C engine (libgcc + mbedTLS) is archived in.
   anchors (RFC 8915, TLS 1.3, local enrolled SPKI pins). The trust gate
   requires two operator-diverse NTS anchors to agree and at least 3 of 4
   core sources to concur.
-- The display policy is **fail-honest**: the clock never silently lies,
-  but it also never goes dark just because the network did. In
-  descending confidence: full trust; **UNAUTHENTICATED** (NTS down, but
-  3+ core sources corroborate the held anchor within 100 ms, allowed
-  for up to 8 h after the last authenticated cycle); **UNSYNCED
-  holdover** (no live consensus at all — the readout keeps running on the
-  disciplined oscillator with an honest, growing worst-case error bound,
-  ~12 ms/min); **REACQUIRING** (suspend/resume or session handoff broke
-  timing continuity — the last verified time is shown, greyed and frozen
-  with its age, until an authenticated cycle re-anchors). The red INOP
-  state is reserved for genuinely unrenderable states: no sync yet this
-  run, or a local fault.
+- The display policy is **fail-honest** and deliberately binary: either
+  the time is shown — with its certainty interval drawn as the second
+  hand, a fan exactly as wide as the honest error bound — or no time is
+  shown at all. The interval starts at the anchor's **measured**
+  uncertainty (authenticated pair spread, network asymmetry, and the
+  server's own root-dispersion claim — typically a few tens of ms) and
+  grows at the worst-case oscillator drift (~12 ms/min) until the next
+  authenticated cycle; unauthenticated sources can only ever *widen* it.
+  Past a user-settable ceiling (default 5 s) the clock stops showing
+  time (**STOPPED**) and recovers as fast as possible. **REACQUIRING**
+  covers broken timing continuity (suspend/resume); **ACQUIRING** /
+  **NO SIGNAL** cover a run that has not yet, or no longer, anchored.
+  There is no intermediate "degraded" tier.
 - **System-clock witness.** Lunar never *displays* the Windows clock,
   but with a disciplined reference in hand it *measures* it: the status
-  bar shows "SYS +N.NN s", and every step in the OS clock
+  bar shows "SYS+N.NN", and every step in the OS clock
   (a w32time correction, a manual set, a VM time-sync) is logged with its
   magnitude. This is the one comparison the whole trust stack uniquely
   enables.

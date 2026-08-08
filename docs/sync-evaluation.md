@@ -232,7 +232,9 @@ We rely fully on the TLS 1.3 client-hello entropy + NTS cookie for replay protec
 
    Availability rises; security stance is explicit (degradation is user-visible, not silent); PLL is protected from being poisoned by unauthenticated samples.
 
-   *As built:* the degraded tier **holds** the last authenticated anchor and freezes the rate rather than re-anchoring — unauthenticated core sources can only corroborate the held projection (and trip INOP on a > 200 ms disagreement), never steer the displayed time. A conflicting *present* NTS pair (both reply but disagree, or share an operator family) is treated as more alarming than absent NTS and hard-fails to INOP rather than degrading. See `clock.h` / `ntp.h` and `test_clock_degraded` / `test_ntp_concur_degraded`.
+   *As built (first iteration):* the degraded tier **held** the last authenticated anchor and froze the rate rather than re-anchoring — unauthenticated core sources could only corroborate the held projection, never steer the displayed time. A conflicting *present* NTS pair (both reply but disagree, or share an operator family) was treated as more alarming than absent NTS and hard-failed to INOP rather than degrading.
+
+   *Superseded (July 2026):* the DEGRADED tier was later **removed entirely**. Trust is now the measured certainty interval alone — each accepted cycle carries a measured anchor uncertainty (authenticated pair spread/2 + worst NTS RTT/2 + server root dispersion, widened to the concurring cores' median deviation) and the interval grows from there at the 200 ppm clamp. Unauthenticated core clusters act only as a **widen-only watchdog** (`Clock_OnCoreWitness`): they can inflate the published interval, never sustain, tighten, re-anchor, or clear a latch. Past a user-settable ceiling (default 5 s) the display stops showing time and the scheduler recovers immediately. The conflicting-NTS-pair hard-fail is unchanged. See `clock.h` / `ntp.h`.
 
 2. **Anchor monotonicity guard** (C5, S6). Reject any new anchor where `ntpUtcMs < previousAnchorUtcMs + elapsedQpcMs − slack` (slack ≈ 60 s). Hard reject: INOP, log `clock: anchor rejected — retrograde time (Δ=…)`.
 
@@ -249,7 +251,7 @@ We rely fully on the TLS 1.3 client-hello entropy + NTS cookie for replay protec
 7. **Exponential INOP back-off** (A3): 5 / 10 / 20 / 40 / 60 s, reset on OK.
 8. **Parallel-harvest aggregator** (A2): decouple per-source deadlines so core replies are processed the instant they arrive; NTS slot runs on its own 20 s budget.
 9. **IPv6 dual-stack** (A6): `AF_UNSPEC` + try-all.
-10. **Last-known-good amber mode** (A4): render recent-but-stale time distinctly, not INOP, for outages ≤ 2 min. Guarded by the TRUST_DEGRADED tier above.
+10. **Last-known-good amber mode** (A4): render recent-but-stale time distinctly, not INOP, for outages ≤ 2 min. Was guarded by the TRUST_DEGRADED tier above *(tier since removed — the growing certainty interval now covers this role)*.
 11. **Warm-start pre-flight SNTP** (A5): one unauthenticated query against the cached IP of the fastest previous source, fired in parallel with `Init`. Displayed as "SYNCING" (untrusted) until the first gated OK lands.
 
 ### Tier 3 — defense-in-depth
