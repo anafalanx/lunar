@@ -159,15 +159,14 @@ proc lunar::fmt_delta {ms} {
 
 # ---- settings (same file + format + semantics as the Win32 shell) -----------
 # %APPDATA%\Lunar\settings.dat, one key=value per line. Keys this shell does
-# not own (chimes/unmin/confirm/tray/startup) are preserved verbatim so the
+# not own (legacy tray, and any future keys) are preserved verbatim so the
 # two shells can be swapped without losing anything. The PRESENCE of the tz=
 # key -- even empty, meaning explicit UTC -- counts as a deliberate choice;
 # only then does first-run OS-zone suggestion stop.
-set ::lunar::cfg [dict create fmt24 1 tray 0 startup 0 chimes 1 unmin 0 stopms 5000]
+set ::lunar::cfg [dict create fmt24 1 confirm 1 startup 0 chimes 1 unmin 0 stopms 5000]
 set ::lunar::cfg_extra {}       ;# unowned lines (confirm), kept in file order
 set ::lunar::tz "UTC"           ;# the active display zone
 set ::lunar::tz_chosen 0
-set ::lunar::tray_tip_last ""
 set ::lunar::armed [lrepeat 12 0]   ;# the 12 five-minute marks (:00..:55)
 set ::lunar::prev_min -1            ;# last displayed integer minute (chime edge)
 set ::lunar::prewarm_min -1         ;# armed mark we've already pre-warmed for
@@ -207,7 +206,7 @@ proc lunar::settings_load {} {
         if {![regexp {^([a-z0-9]+)=(.*)$} $line -> k v]} continue
         switch $k {
             fmt24   { dict set ::lunar::cfg fmt24   [expr {$v ? 1 : 0}] }
-            tray    { dict set ::lunar::cfg tray    [expr {$v ? 1 : 0}] }
+            confirm { dict set ::lunar::cfg confirm [expr {$v ? 1 : 0}] }
             startup { dict set ::lunar::cfg startup [expr {$v ? 1 : 0}] }
             chimes  { dict set ::lunar::cfg chimes  [expr {$v ? 1 : 0}] }
             unmin   { dict set ::lunar::cfg unmin   [expr {$v ? 1 : 0}] }
@@ -225,7 +224,7 @@ proc lunar::settings_save {} {
     lappend lines "chimes=[dict get $::lunar::cfg chimes]"
     lappend lines "unmin=[dict get $::lunar::cfg unmin]"
     lappend lines "fmt24=[dict get $::lunar::cfg fmt24]"
-    lappend lines "tray=[dict get $::lunar::cfg tray]"
+    lappend lines "confirm=[dict get $::lunar::cfg confirm]"
     lappend lines "startup=[dict get $::lunar::cfg startup]"
     lappend lines "stopms=[dict get $::lunar::cfg stopms]"
     lappend lines "tz=[expr {$::lunar::tz eq "UTC" ? "" : $::lunar::tz}]"
@@ -698,7 +697,6 @@ proc lunar::build {} {
     pack .face -fill both -expand 1
 
     wm protocol . WM_DELETE_WINDOW lunar::quit
-    lunar::tray_setup
     # Let Tk map and decorate the top-level before measuring its frame insets.
     after 50 lunar::force_square_window
 }
@@ -787,7 +785,7 @@ proc lunar::settings_dlg {{tab ""}} {
     set ::lunar::set_filter  ""
     set ::lunar::set_tz      $::lunar::tz
     set ::lunar::set_fmt24   [dict get $::lunar::cfg fmt24]
-    set ::lunar::set_tray    [dict get $::lunar::cfg tray]
+    set ::lunar::set_confirm [dict get $::lunar::cfg confirm]
     set ::lunar::set_startup [dict get $::lunar::cfg startup]
     set ::lunar::set_chimes  [dict get $::lunar::cfg chimes]
     set ::lunar::set_unmin   [dict get $::lunar::cfg unmin]
@@ -915,9 +913,9 @@ proc lunar::settings_dlg {{tab ""}} {
     checkbutton $c.ontop -bg $P -fg $I -font lunarUI -anchor w \
         -activebackground $P -selectcolor $P \
         -text "Keep Lunar above other windows" -variable ::lunar::set_ontop
-    checkbutton $c.tray -bg $P -fg $I -font lunarUI -anchor w \
+    checkbutton $c.confirm -bg $P -fg $I -font lunarUI -anchor w \
         -activebackground $P -selectcolor $P \
-        -text "Minimize to the notification area" -variable ::lunar::set_tray
+        -text "Confirm before closing" -variable ::lunar::set_confirm
     checkbutton $c.startup -bg $P -fg $I -font lunarUI -anchor w \
         -activebackground $P -selectcolor $P \
         -text "Start Lunar when I sign in" -variable ::lunar::set_startup
@@ -940,7 +938,7 @@ proc lunar::settings_dlg {{tab ""}} {
 
     pack $c.bhdr -fill x -pady {0 7}
     pack $c.ontop -fill x
-    pack $c.tray -fill x -pady {3 0}
+    pack $c.confirm -fill x -pady {3 0}
     pack $c.startup -fill x -pady {3 0}
     pack $c.rule1 -fill x -pady {16 14}
     pack $c.uhdr -fill x -pady {0 8}
@@ -977,6 +975,7 @@ proc lunar::settings_dlg {{tab ""}} {
     wm geometry .set +$x+$y
     wm deiconify .set
     raise .set
+    if {$tab ne ""} { catch { .set.shell.tabs select .set.shell.tabs.$tab } }
     switch $tab {
         chimes { focus .set.shell.tabs.chimes.inner.enabled }
         app    { focus .set.shell.tabs.app.inner.ontop }
@@ -1124,7 +1123,7 @@ proc lunar::settings_ok {} {
     set ::lunar::tz_chosen 1
     dict set ::lunar::cfg tz [expr {$::lunar::tz eq "UTC" ? "" : $::lunar::tz}]
     dict set ::lunar::cfg fmt24  [expr {$::lunar::set_fmt24 ? 1 : 0}]
-    dict set ::lunar::cfg tray   [expr {$::lunar::set_tray ? 1 : 0}]
+    dict set ::lunar::cfg confirm [expr {$::lunar::set_confirm ? 1 : 0}]
     dict set ::lunar::cfg chimes [expr {$::lunar::set_chimes ? 1 : 0}]
     dict set ::lunar::cfg unmin  [expr {$::lunar::set_unmin ? 1 : 0}]
     if {[string is integer -strict $::lunar::set_stopsec]} {
@@ -1210,7 +1209,7 @@ proc lunar::next_poll_ms {syncErr} {
     return [expr {$iv > $max ? $max : $iv}]                           ;# capped at 5 min
 }
 
-# ---- system tray + window state --------------------------------------------
+# ---- window state -----------------------------------------------------------
 proc lunar::hwnd {} { return [winfo id .] }
 
 proc lunar::restore {} {
@@ -1219,53 +1218,24 @@ proc lunar::restore {} {
     catch { focus -force . }
 }
 
-# Called from the C tray subclass (via ::lunar::tray_event) at a safe point.
-proc lunar::tray_event {kind} {
+# Called from the C window subclass (via ::lunar::window_event) at a safe
+# point in the event loop: the native resize-gesture boundaries that drive
+# the square-window dance.
+proc lunar::window_event {kind} {
     switch $kind {
-        activate { lunar::restore }
-        menu     { lunar::tray_menu }
         resize-start { lunar::square_resize_start }
         resize-end   { lunar::square_resize_end }
     }
 }
 
-proc lunar::tray_menu {} {
-    catch {destroy .traymenu}
-    menu .traymenu -tearoff 0
-    .traymenu add command -label "Restore"    -command lunar::restore
-    .traymenu add command -label "Sync now"   -command { catch { ::lunar::syncnow } }
-    .traymenu add command -label "Settings…"  -command lunar::settings_dlg
-    .traymenu add separator
-    .traymenu add command -label "Exit Lunar" -command lunar::quit
-    # a tray popup needs the owning window foregrounded or it won't dismiss
-    catch { focus -force . }
-    tk_popup .traymenu [winfo pointerx .] [winfo pointery .]
-}
-
-# minimize-to-tray: when enabled, a minimize withdraws the window (leaving only
-# the tray icon). Guarded on iconic state so withdrawing can't re-enter.
-proc lunar::on_unmap {} {
-    if {[dict get $::lunar::cfg tray] && [wm state .] eq "iconic"} {
-        wm withdraw .
-    }
-}
-
-proc lunar::tray_setup {} {
-    if {![llength [info commands ::lunar::tray_add]]} return
-    catch { ::lunar::tray_add [lunar::hwnd] "Lunar" }
-    bind . <Unmap> { after idle lunar::on_unmap }
-}
-
-proc lunar::tray_tip_update {text} {
-    if {$text eq $::lunar::tray_tip_last} return
-    set ::lunar::tray_tip_last $text
-    if {[llength [info commands ::lunar::tray_tip]]} {
-        catch { ::lunar::tray_tip [lunar::hwnd] $text }
-    }
-}
-
+# Closing stops the disciplined clock, so it asks first (Settings toggle,
+# default on). The OS-shutdown path (WM_ENDSESSION in C) never asks.
 proc lunar::quit {} {
-    catch { if {[llength [info commands ::lunar::tray_remove]]} { ::lunar::tray_remove [lunar::hwnd] } }
+    if {[dict get $::lunar::cfg confirm]} {
+        set answer [tk_messageBox -parent . -type yesno -default yes \
+            -icon question -title "Lunar" -message "Close Lunar?"]
+        if {$answer ne "yes"} return
+    }
     catch { if {[llength [info commands ::lunar::shutdown]]} { ::lunar::shutdown } }
     destroy .
 }
@@ -1395,15 +1365,6 @@ proc lunar::render {st} {
     } else {
         .sb.zone configure -text $::lunar::tz
     }
-
-    set tip "Lunar · $txt"
-    if {$stopped} {
-        append tip " · [lunar::fmt_bound $boundMs] exceeds\
-            [expr {[dict get $::lunar::cfg stopms] / 1000.0}] s · recovering"
-    } elseif {$hasTime && $lt ne ""} {
-        append tip " · [format %02d:%02d [dict get $lt hour] [dict get $lt minute]] [dict get $lt abbr]"
-    }
-    lunar::tray_tip_update $tip
 
     # chimes on armed marks, with a just-in-time audio pre-warm ahead of them
     if {$hasTime && [info exists lt]} {
@@ -1536,8 +1497,22 @@ proc lunar::selftest {reportPath} {
         catch { rename ::lunar::status {} }
         catch { rename ::lunar::_realstatus ::lunar::status }
     }
-    # build added a real tray icon; remove it so headless checks leave nothing
-    catch { if {[llength [info commands ::lunar::tray_remove]]} { ::lunar::tray_remove [winfo id .] } }
+    # verify close confirmation: with confirm on and the dialog answering
+    # "no", quit must leave the window alive and must have asked exactly once
+    catch {
+        set oldConfirm [dict get $::lunar::cfg confirm]
+        dict set ::lunar::cfg confirm 1
+        set ::lunar::_asked 0
+        rename ::tk_messageBox ::lunar::_realmsgbox
+        proc ::tk_messageBox {args} { incr ::lunar::_asked ; return no }
+        lunar::quit
+        set alive [winfo exists .]
+        rename ::tk_messageBox {}
+        rename ::lunar::_realmsgbox ::tk_messageBox
+        dict set ::lunar::cfg confirm $oldConfirm
+        if {$alive && $::lunar::_asked == 1} { set cg ok } else { set cg "BAD $alive $::lunar::_asked" }
+        append txt "confirmgate=$cg\n"
+    }
     append txt "status=[expr {$ok ? {ok} : {FAIL}}]\n"
     if {!$ok} { append txt "error=$msg\n" }
     if {$reportPath ne ""} {
@@ -1583,7 +1558,11 @@ proc lunar::main {} {
     }
     after 100 lunar::tick
     # dev hooks: open a dialog on launch, for screenshots/testing
-    if {[info exists ::env(LUNAR_OPEN_SETTINGS)] && $::env(LUNAR_OPEN_SETTINGS) ne ""} { after 400 lunar::settings_dlg }
+    if {[info exists ::env(LUNAR_OPEN_SETTINGS)] && $::env(LUNAR_OPEN_SETTINGS) ne ""} {
+        # value "1" opens the default tab; any other value names a tab
+        set _tab [expr {$::env(LUNAR_OPEN_SETTINGS) eq "1" ? "" : $::env(LUNAR_OPEN_SETTINGS)}]
+        after 400 [list lunar::settings_dlg $_tab]
+    }
     if {[info exists ::env(LUNAR_OPEN_ABOUT)]    && $::env(LUNAR_OPEN_ABOUT)    ne ""} { after 400 {lunar::settings_dlg app} }
     if {[info exists ::env(LUNAR_OPEN_LOG)]      && $::env(LUNAR_OPEN_LOG)      ne ""} { after 400 lunar::log_dlg }
     # LUNAR_BEEP=<n>: on launch, run the real prewarm->chime sequence n times
