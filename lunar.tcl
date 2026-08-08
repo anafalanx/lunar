@@ -14,6 +14,10 @@ namespace eval lunar {
     variable poll_good     0 ;# consecutive converged cycles (drives the relax ramp)
     variable poll_bad      0 ;# consecutive unhealthy cycles (drives the fast backoff)
     variable poll_cur  60000 ;# current interval actually scheduled (for the log/About)
+    variable repoll_after {} ;# pending [after] token, so poll_now can cancel it
+    variable poll_forced_at 0 ;# [clock milliseconds] of the last forced poll
+    variable stopped_prev 0  ;# last rendered stop flag (recover-fast edge)
+    variable hastime_prev 1  ;# last rendered hasTime (recover-fast edge)
     variable log_active 0    ;# reentry latch so logging can't recurse into bgerror
     variable square_extra_w 0
     variable square_extra_h 0
@@ -127,7 +131,6 @@ proc lunar::init_style {} {
 proc lunar::state_display {state synced} {
     switch $state {
         ok          { return [list "TRUSTED"     $::lunar::OK] }
-        degraded    { return [list "DEGRADED"    $::lunar::WARN] }
         holdover    { return [list "ESTIMATED"   $::lunar::WARN] }
         reacquiring { return [list "REACQUIRING" $::lunar::WARN] }
         default {
@@ -143,9 +146,15 @@ proc lunar::fmt_bound {ms} {
     return [format "±%.1f s" [expr {$ms / 1000.0}]]
 }
 
+# System-clock deviation, compact: seconds carry no unit (they are the
+# obvious default); minutes/hours/days get m/h/d appended directly, no space.
 proc lunar::fmt_delta {ms} {
     set s [expr {$ms / 1000.0}]
-    return [format "%+.2f s" $s]
+    set a [expr {abs($s)}]
+    if {$a < 60.0}      { return [format "%+.2f" $s] }
+    if {$a < 3600.0}    { return [format "%+.1fm" [expr {$s / 60.0}]] }
+    if {$a < 86400.0}   { return [format "%+.1fh" [expr {$s / 3600.0}]] }
+    return [format "%+.1fd" [expr {$s / 86400.0}]]
 }
 
 # ---- settings (same file + format + semantics as the Win32 shell) -----------
@@ -164,10 +173,10 @@ set ::lunar::prev_min -1            ;# last displayed integer minute (chime edge
 set ::lunar::prewarm_min -1         ;# armed mark we've already pre-warmed for
 set ::lunar::stop_hits 0            ;# consecutive reads with bound above the ceiling
 
-# The stop ceiling: boundMs above which the clock withdraws its seconds claim.
-# Clamped to [1 s, 30 s]: below 1 s a healthy clock could trip on the DEGRADED
-# 300 ms cap or a transient fault inflate; above 30 s the fan exceeds what the
-# seconds dial can encode (±30 s wraps the full circle). Bad input -> default.
+# The stop ceiling: boundMs above which the clock stops showing time.
+# Clamped to [1 s, 30 s]: below 1 s a healthy clock could trip on a
+# transient fault inflate; above 30 s the fan exceeds what the seconds
+# dial can encode (±30 s wraps the full circle). Bad input -> default.
 proc lunar::clamp_stopms {v} {
     if {![string is integer -strict $v]} { return 5000 }
     if {$v < 1000}  { return 1000 }
@@ -1139,7 +1148,20 @@ proc lunar::repoll {} {
     set err [catch { ::lunar::syncnow }]
     set next [lunar::next_poll_ms $err]
     set ::lunar::poll_cur $next
-    after $next lunar::repoll
+    set ::lunar::repoll_after [after $next lunar::repoll]
+}
+
+# Recover as fast as possible: cancel the pending scheduled poll and fire
+# one now. Called on the stop edge (interval crossed the ceiling) and on
+# the time-vanishing edge (hasTime 1 -> 0), so recovery never waits out a
+# relaxed interval. Rate-limited to one forced poll per FAST floor; the
+# engine's g_running CAS already dedups an in-flight cycle.
+proc lunar::poll_now {} {
+    set now [clock milliseconds]
+    if {$now - $::lunar::poll_forced_at < $::lunar::poll_min} return
+    set ::lunar::poll_forced_at $now
+    catch { after cancel $::lunar::repoll_after }
+    set ::lunar::repoll_after [after 0 lunar::repoll]
 }
 
 # Adaptive poll cadence (this is the ENTIRE scheduler; the C engine polls only
@@ -1161,7 +1183,12 @@ proc lunar::next_poll_ms {syncErr} {
             set unhealthy 1
         } else {
             set state [dict get $st state]
-            if {$state ni {ok degraded}} { set unhealthy 1 }
+            # Unhealthy = not fully trusted, or the interval has grown past
+            # half the stop ceiling (recover BEFORE the face would blank).
+            set b [expr {[dict exists $st boundMs] ? [dict get $st boundMs] : 0}]
+            if {$state ne "ok" || $b > [dict get $::lunar::cfg stopms] / 2} {
+                set unhealthy 1
+            }
             if {$state eq "ok" && [dict get $st synced] && [dict get $st ratePpm] != 0} {
                 set cs [dict get $st spreadMs]
                 set ns [dict get $st ntsSpreadMs]
@@ -1318,9 +1345,20 @@ proc lunar::render {st} {
         [string is integer -strict $::env(LUNAR_FAKE_BOUND)]} {
         set boundMs $::env(LUNAR_FAKE_BOUND)
     }
-    set stopped [lunar::stop_eval [expr {$hasTime && $lt ne ""}] $boundMs]
-    lunar::clock_display $lt $milliseconds $state [expr {$hasTime && $lt ne ""}] $synced \
+    set running [expr {$hasTime && $lt ne ""}]
+    set stopped [lunar::stop_eval $running $boundMs]
+    lunar::clock_display $lt $milliseconds $state $running $synced \
         $boundMs $stopped
+
+    # Recover as fast as possible: on the edge where the face stops showing
+    # time -- the stop ceiling was crossed, or the time vanished outright --
+    # fire an immediate poll instead of waiting out the scheduled interval.
+    if {($stopped && !$::lunar::stopped_prev) ||
+        (!$running && $::lunar::hastime_prev)} {
+        lunar::poll_now
+    }
+    set ::lunar::stopped_prev $stopped
+    set ::lunar::hastime_prev $running
 
     # The face has exactly two states -- time (uncertainty carried entirely
     # by the second hand's fan width) or no time -- so the bar words a state
@@ -1334,7 +1372,6 @@ proc lunar::render {st} {
     if {$stopped} {
         set txt "STOPPED" ; set col $::lunar::ACCENT
     }
-    set running [expr {$hasTime && $lt ne ""}]
     set word [expr {($stopped || !$running) ? $txt : ""}]
     .sb.trust configure -text $word -fg $col
     .sb.sep1  configure -text [expr {$word eq "" ? "" : "·"}]
@@ -1349,7 +1386,7 @@ proc lunar::render {st} {
     # (word) already provides the single dot before the zone.
     .sb.sep2  configure -text [expr {$showSys ? "·" : ""}]
     .sb.sys  configure -text [expr {$showSys ? \
-        "SYS [lunar::fmt_delta [dict get $st sysDeltaMs]]" : ""}] -fg $::lunar::MUTED
+        "SYS[lunar::fmt_delta [dict get $st sysDeltaMs]]" : ""}] -fg $::lunar::MUTED
     .sb.sep3 configure -text [expr {$running ? "·" : ""}]
     if {$running} {
         .sb.zone configure -text "[dict get $lt abbr] [lunar::fmt_utcoff [dict get $lt offSec]]"
@@ -1460,13 +1497,13 @@ proc lunar::selftest {reportPath} {
         catch { rename ::lunar::status ::lunar::_realstatus }
         proc ::lunar::status {} { return $::lunar::_ststub }
         set ::lunar::poll_good 0 ; set ::lunar::poll_bad 0
-        set ::lunar::_ststub {state holdover synced 0 ratePpm 0 spreadMs 0 ntsSpreadMs 0}
+        set ::lunar::_ststub {state holdover synced 0 ratePpm 0 spreadMs 0 ntsSpreadMs 0 boundMs 6000}
         set fst [lunar::next_poll_ms 0]                          ;# unhealthy -> 8000
         set ::lunar::poll_good 0 ; set ::lunar::poll_bad 0
-        set ::lunar::_ststub {state ok synced 1 ratePpm 0 spreadMs 20 ntsSpreadMs 20}
+        set ::lunar::_ststub {state ok synced 1 ratePpm 0 spreadMs 20 ntsSpreadMs 20 boundMs 50}
         set bse [lunar::next_poll_ms 0]                          ;# OK, no rate -> 60000
         set ::lunar::poll_good 0 ; set ::lunar::poll_bad 0
-        set ::lunar::_ststub {state ok synced 1 ratePpm 13 spreadMs 20 ntsSpreadMs 20}
+        set ::lunar::_ststub {state ok synced 1 ratePpm 13 spreadMs 20 ntsSpreadMs 20 boundMs 50}
         for {set i 1} {$i <= 3} {incr i} { set r3 [lunar::next_poll_ms 0] } ;# confirm x3 -> 60000
         set r4 [lunar::next_poll_ms 0]                           ;# -> 120000
         set r5 [lunar::next_poll_ms 0]                           ;# -> 240000
@@ -1540,7 +1577,7 @@ proc lunar::main {} {
         # engine_start fired cycle #1 now; arm the adaptive scheduler at the
         # FAST floor so a fresh boot re-polls quickly until it has anchored,
         # rather than waiting a full base interval.
-        after $::lunar::poll_min lunar::repoll
+        set ::lunar::repoll_after [after $::lunar::poll_min lunar::repoll]
     }
     after 100 lunar::tick
     # dev hooks: open a dialog on launch, for screenshots/testing

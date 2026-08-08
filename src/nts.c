@@ -457,6 +457,18 @@ cleanup:
 #define NTS_UDP_TIMEOUT_MS 3000
 #define NTS_UDP_MAX_PKT    1500
 
+// Server-claimed error from the (AEAD-authenticated) NTP header: root
+// dispersion + root delay/2, 16.16 fixed-point seconds at bytes 4-11.
+static uint32_t nts_root_err_ms(const uint8_t *pkt) {
+    uint32_t beDelay, beDisp;
+    memcpy(&beDelay, pkt + 4, 4);
+    memcpy(&beDisp,  pkt + 8, 4);
+    uint64_t delayMs = ((uint64_t)ntohl(beDelay) * 1000ULL) >> 16;
+    uint64_t dispMs  = ((uint64_t)ntohl(beDisp)  * 1000ULL) >> 16;
+    uint64_t err = dispMs + delayMs / 2;
+    return err > 0x7fffffffULL ? 0x7fffffffU : (uint32_t)err;
+}
+
 static int parse_sntp_reply(const uint8_t *pkt, size_t pkt_len,
                             int64_t *out_t2_ms, int64_t *out_t3_ms)
 {
@@ -704,7 +716,7 @@ static int nts_udp_exchange(const char *host, uint16_t port,
                             const uint8_t c2s[32], const uint8_t s2c[32],
                             const uint8_t *cookie, size_t cookie_len,
                             int64_t *out_ntpUtcMs, int64_t *out_qpcAtT4,
-                            uint32_t *out_rttMs,
+                            uint32_t *out_rttMs, uint32_t *out_rootErrMs,
                             uint8_t (*harvest)[NTSKE_MAX_COOKIE_LEN],
                             size_t *harvest_lens, size_t *harvest_cnt) {
     *harvest_cnt = 0;
@@ -777,6 +789,7 @@ static int nts_udp_exchange(const char *host, uint16_t port,
     *out_ntpUtcMs = t3_ms + netRtt / 2;
     *out_qpcAtT4  = qpcT4;
     *out_rttMs    = (uint32_t)(rtt > 0x7fffffff ? 0x7fffffff : rtt);
+    if (out_rootErrMs) *out_rootErrMs = nts_root_err_ms(reply);
     rc = 1;
 
 net_done:
@@ -794,19 +807,22 @@ int Nts_FetchSample(const NtsProvider *p,
                     int64_t  *out_qpcAtT4,
                     uint32_t *out_rttMs)
 {
-    return Nts_FetchSampleEx(p, out_ntpUtcMs, out_qpcAtT4, out_rttMs, NULL);
+    return Nts_FetchSampleEx(p, out_ntpUtcMs, out_qpcAtT4, out_rttMs,
+                             NULL, NULL);
 }
 
 int Nts_FetchSampleEx(const NtsProvider *p,
                       int64_t  *out_ntpUtcMs,
                       int64_t  *out_qpcAtT4,
                       uint32_t *out_rttMs,
+                      uint32_t *out_rootErrMs,
                       NtsRotationPending *rot)
 {
     if (rot) memset(rot, 0, sizeof *rot);
     if (p == NULL || out_ntpUtcMs == NULL || out_qpcAtT4 == NULL
         || out_rttMs == NULL) return 0;
     *out_ntpUtcMs = 0; *out_qpcAtT4 = 0; *out_rttMs = 0;
+    if (out_rootErrMs) *out_rootErrMs = 0;
 
     uint8_t harvest[NTSKE_MAX_COOKIES][NTSKE_MAX_COOKIE_LEN];
     size_t  harvest_lens[NTSKE_MAX_COOKIES];
@@ -825,6 +841,7 @@ int Nts_FetchSampleEx(const NtsProvider *p,
             uint16_t    port = nport ? nport : 123;
             int r = nts_udp_exchange(host, port, c2s, s2c, cookie, clen,
                                      out_ntpUtcMs, out_qpcAtT4, out_rttMs,
+                                     out_rootErrMs,
                                      harvest, harvest_lens, &harvest_cnt);
             mbedtls_platform_zeroize(c2s, sizeof c2s);
             mbedtls_platform_zeroize(s2c, sizeof s2c);
@@ -872,6 +889,7 @@ int Nts_FetchSampleEx(const NtsProvider *p,
     int rc = nts_udp_exchange(host, port, ke.c2s_key, ke.s2c_key,
                               ke.cookies[0], ke.cookie_len[0],
                               out_ntpUtcMs, out_qpcAtT4, out_rttMs,
+                              out_rootErrMs,
                               harvest, harvest_lens, &harvest_cnt);
     if (rc == 1 && enrolled) {
         jar_add_cookies(p->host, (const uint8_t (*)[NTSKE_MAX_COOKIE_LEN])harvest,

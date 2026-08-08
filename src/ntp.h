@@ -9,10 +9,10 @@
 // aggregated into a single trust verdict via Ntp_Concur. Both NTS
 // anchors must succeed, come from different operator families, and
 // mutually agree; at least 3 of the 4 core sources must also concur
-// for the cycle to produce TRUST_OK. If NTS is unavailable but >= 3 core
-// sources still agree within a tighter 100 ms gate and a full OK occurred
-// within the last eight hours, the cycle produces the unauthenticated
-// TRUST_DEGRADED state instead (see clock.h).
+// for the cycle to produce TRUST_OK -- anything else is TRUST_INOP.
+// There is no intermediate tier: an accepted cycle also carries its
+// MEASURED anchor uncertainty, and the certainty interval simply grows
+// from there until the next accepted cycle (see clock.h).
 #ifndef LUNAR_NTP_H
 #define LUNAR_NTP_H
 
@@ -54,6 +54,9 @@ typedef struct {
     int64_t     ntpUtcMs;    // server-believed UTC at QPC capture moment
     int64_t     qpcAtT4;     // QPC tick at t4 (reply received)
     uint32_t    rttMs;       // round-trip time in ms
+    uint32_t    rootErrMs;   // server-claimed root dispersion + rootDelay/2
+                             // (ms), parsed from the (NTS: authenticated)
+                             // NTP header; feeds the measured anchor error
     const char *label;       // short source name, e.g. "NIST"
     NtpAuthMode authMode;    // plain SNTP, enrolled NTS pin, or pending rotation
     const char *operatorFamily;
@@ -67,7 +70,8 @@ void    Ntp_Start(void);
 // and any detached workers to finish before process shutdown.
 void    Ntp_Shutdown(void);
 
-// True iff the clockwork has been anchored within the fresh window.
+// True iff the clockwork has been anchored at least once this run (the
+// UI uses this to distinguish NO SIGNAL from never-synced ACQUIRING).
 int     Ntp_IsSynced(void);
 
 // Legacy accessors: the offset and wall-clock UTC of the most recent
@@ -90,38 +94,46 @@ int64_t Ntp_LastNtsSpreadMs(void);
 int     Ntp_GetResults(NtpSourceResult out[NTP_SOURCE_COUNT]);
 
 // Pure concurrence evaluator. Given a set of per-source results, returns
-// the trust verdict and, on TRUST_OK / TRUST_DEGRADED, the consensus
-// utcMs and its matching QPC tick. maxSpreadMs receives the largest
-// absolute deviation of a corroborating source from the consensus.
+// the trust verdict and, on TRUST_OK, the consensus utcMs, its matching
+// QPC tick, and the measured anchor uncertainty.
 //
 // The NTS slots are the authenticated trust anchor; the core sources
 // corroborate. Two paths:
 //
-//   Path 1 -- both NTS slots ok (enrolled or rotated pins): the cycle must
-//     reach a full OK or hard-fail. TRUST_OK requires different operator
-//     families AND mutual agreement within 200 ms (projected to a common
-//     QPC) AND >= 3 of 4 core sources within 200 ms of the NTS midpoint;
-//     the anchor is that midpoint. A ROTATED_PIN slot (CA-validated leaf
-//     that matched no stored pin outside the renewal window) may count
-//     ONLY when the other slot is a continuous ENROLLED_PIN -- an attacker
-//     must defeat a still-pinned independent operator to exploit a
-//     rotation. Two ROTATED_PIN slots return TRUST_INOP. A same-family,
-//     disagreeing, or under-corroborated NTS pair returns TRUST_INOP -- a
-//     conflicting authenticated layer is never downgraded to DEGRADED.
+//   TRUST_OK -- both NTS slots ok (enrolled or rotated pins), different
+//     operator families, mutual agreement within 200 ms (projected to a
+//     common QPC), AND >= 3 of 4 core sources within 200 ms of the NTS
+//     midpoint; the anchor is that midpoint. A ROTATED_PIN slot
+//     (CA-validated leaf that matched no stored pin outside the renewal
+//     window) may count ONLY when the other slot is a continuous
+//     ENROLLED_PIN -- an attacker must defeat a still-pinned independent
+//     operator to exploit a rotation. Two ROTATED_PIN slots return
+//     TRUST_INOP.
 //
-//   Path 2 -- fewer than two ok NTS slots (NTS unavailable): if >= 3 of 4
-//     core sources mutually agree within the tighter 100 ms gate, returns
-//     TRUST_DEGRADED with the core consensus in the out-params. The caller
-//     gates this on the last TRUST_OK being recent and uses the consensus
-//     only to cross-check the held anchor. Otherwise TRUST_INOP.
+//   TRUST_INOP -- anything else. There is no intermediate tier: trust is
+//     the measured certainty interval, and unauthenticated sources can
+//     only widen it (see Clock_OnCoreWitness).
 //
-// This function is pure: no globals, no I/O. The freshness window for
-// DEGRADED is applied by the caller, not here. Exposed so the test
-// harness can exercise the math directly.
+// On TRUST_OK, *outAnchorErrMs carries the MEASURED anchor uncertainty:
+//   base = pairSpread/2 + worstNtsRtt/2 + serverRootErr (floor 15 ms),
+//   widened to the concurring cores' median deviation from the midpoint
+// -- honest under one-sided asymmetry and under correlated NTS error.
+//
+// On TRUST_INOP, if >= 3 core sources still mutually agree within 100 ms,
+// their cluster is reported via *outClusterUtcMs/*outClusterQpc and
+// *outHaveCluster=1 so the caller can feed the widen-only watchdog
+// (Clock_OnCoreWitness). The cluster carries no trust of its own.
+//
+// This function is pure: no persistent state beyond the published spread
+// side-channels, no I/O. Exposed so the test harness can exercise the
+// math directly. Out-params may be NULL.
 TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
                       int64_t *outBestUtcMs,
                       int64_t *outBestQpc,
-                      int64_t *outMaxSpreadMs);
+                      int64_t *outAnchorErrMs,
+                      int64_t *outClusterUtcMs,
+                      int64_t *outClusterQpc,
+                      int     *outHaveCluster);
 
 #ifdef LUNAR_TESTING
 // Kiss-o'-death bookkeeping hooks (see ntp.c).

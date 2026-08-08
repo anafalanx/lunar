@@ -67,14 +67,11 @@
 #define NTP_NTS_SLOT_ATTEMPTS  2       // initial pick + one immediate replacement
 #define NTP_PACKET_LEN       48
 #define NTP_EPOCH_DELTA_S    2208988800ULL        // seconds between 1900 and 1970
-// How long unauthenticated core corroboration may keep the DEGRADED tier
-// alive after the last full authenticated cycle. Sized to cover a working
-// day behind an NTS-blocking network without letting spoofable SNTP
-// consensus extend its own permission indefinitely; past this the display
-// falls to honest holdover.
-#define FRESH_WINDOW_MS      (8LL * 60LL * 60LL * 1000LL) // 8 hours
 #define CONCUR_THRESHOLD_MS  200
-#define DEGRADED_CONCUR_THRESHOLD_MS 100   // tighter core-only gate (DEGRADED)
+#define CORE_CLUSTER_THRESHOLD_MS 100  // tight core cluster: widen-only witness
+#define NTP_DISP_FLOOR_MS     15  // floor on the server-claimed root error
+                                  // (covers t2/t3 quantization + a stingy
+                                  // or zeroed root-dispersion field)
 #define NTP_CYCLE_TIMEOUT_MS (NTS_SLOT_TIMEOUT_MS * NTP_NTS_SLOT_ATTEMPTS)
 #define NTP_WAIT_SLICE_MS    250
 #define NTP_SHUTDOWN_WORKER_GRACE_MS      2000
@@ -247,11 +244,26 @@ static void Ntp_WorkerFinished(void)
 // those values onto a common QPC moment before computing concurrence.
 // outKiss (optional, char[5]): filled with the ASCII kiss-o'-death code
 // when the server replies with stratum 0; left untouched otherwise.
+// Server-claimed error from the NTP header: root dispersion + root
+// delay/2, both 16.16 fixed-point seconds at fixed offsets (bytes 4-11).
+// Under NTS the header is AEAD-authenticated, so the claim is the
+// server's own, not an on-path forger's.
+static uint32_t NtpRootErrMs(const unsigned char *pkt) {
+    uint32_t beDelay, beDisp;
+    memcpy(&beDelay, pkt + 4, 4);
+    memcpy(&beDisp,  pkt + 8, 4);
+    uint64_t delayMs = ((uint64_t)ntohl(beDelay) * 1000ULL) >> 16;
+    uint64_t dispMs  = ((uint64_t)ntohl(beDisp)  * 1000ULL) >> 16;
+    uint64_t err = dispMs + delayMs / 2;
+    return err > 0x7fffffffULL ? 0x7fffffffU : (uint32_t)err;
+}
+
 static int NtpQueryHost(const char *host,
                         int64_t *outOffsetMs,
                         int64_t *outNtpUtcMs,
                         int64_t *outQpcAtT4,
                         uint32_t *outRttMs,
+                        uint32_t *outRootErrMs,
                         char *outKiss) {
     unsigned char pkt[NTP_PACKET_LEN];
     memset(pkt, 0, sizeof(pkt));
@@ -334,6 +346,7 @@ static int NtpQueryHost(const char *host,
     *outNtpUtcMs = t3_ms + netRtt / 2;
     *outQpcAtT4  = qpcT4;
     *outRttMs    = (uint32_t)(rtt > 0x7fffffff ? 0x7fffffff : rtt);
+    if (outRootErrMs) *outRootErrMs = NtpRootErrMs(pkt);
     // offsetMs carries absolute UTC at qpcAtT4 (legacy field reused).
     *outOffsetMs = *outNtpUtcMs;
     return 1;
@@ -384,14 +397,15 @@ static DWORD WINAPI WorkerProc(LPVOID param) {
         r->label = src->label;
 
         int64_t off = 0, utc = 0, qpc = 0;
-        uint32_t rtt = 0;
+        uint32_t rtt = 0, rootErr = 0;
         char kiss[5] = { 0 };
-        if (NtpQueryHost(src->host, &off, &utc, &qpc, &rtt, kiss)) {
+        if (NtpQueryHost(src->host, &off, &utc, &qpc, &rtt, &rootErr, kiss)) {
             r->ok        = 1;
             r->offsetMs  = off;
             r->ntpUtcMs  = utc;
             r->qpcAtT4   = qpc;
             r->rttMs     = rtt;
+            r->rootErrMs = rootErr;
             r->authMode  = NTP_AUTH_PLAIN_SNTP;
             goto done;
         }
@@ -527,12 +541,13 @@ static DWORD WINAPI NtsWorkerProc(LPVOID param) {
         r->label = ctx->labelBuf;
 
         int64_t utc = 0, qpc = 0;
-        uint32_t rtt = 0;
-        if (Nts_FetchSampleEx(p, &utc, &qpc, &rtt, &ctx->rot)) {
-            r->ok       = 1;
-            r->ntpUtcMs = utc;
-            r->qpcAtT4  = qpc;
-            r->rttMs    = rtt;
+        uint32_t rtt = 0, rootErr = 0;
+        if (Nts_FetchSampleEx(p, &utc, &qpc, &rtt, &rootErr, &ctx->rot)) {
+            r->ok        = 1;
+            r->ntpUtcMs  = utc;
+            r->qpcAtT4   = qpc;
+            r->rttMs     = rtt;
+            r->rootErrMs = rootErr;
             r->offsetMs = utc;   // legacy field (overwritten with display value below)
             r->authMode = ctx->rot.pending ? NTP_AUTH_ROTATED_PIN
                                            : NTP_AUTH_ENROLLED_PIN;
@@ -720,7 +735,7 @@ static void AuditNote(const char *text) {
 }
 
 static void AuditWrite(TrustState trust,
-                       int64_t maxSpreadMs,
+                       int64_t anchorErrMs,
                        const NtpSourceResult results[NTP_SOURCE_COUNT]) {
     HANDLE h = AuditOpenAppend();
     if (h == INVALID_HANDLE_VALUE) return;
@@ -731,11 +746,11 @@ static void AuditWrite(TrustState trust,
     char line[768];
     int  pos = 0;
     pos += _snprintf(line + pos, sizeof(line) - (size_t)pos,
-                     "%s%c %-4s  spread=%5lldms",
+                     "%s%c %-4s  anchorErr=%5lldms",
                      stamp,
                      trusted ? ' ' : '~',
                      (trust == TRUST_OK) ? "OK" : "INOP",
-                     (long long)maxSpreadMs);
+                     (long long)anchorErrMs);
 
     for (int i = 0; i < NTP_SOURCE_COUNT && pos < (int)sizeof(line) - 64; i++) {
         const NtpSourceResult *r = &results[i];
@@ -980,20 +995,11 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
 
     int64_t    bestUtcMs = 0;
     int64_t    bestQpc   = 0;
-    int64_t    maxSpread = 0;
-    TrustState trust = Ntp_Concur(snapshot, &bestUtcMs, &bestQpc, &maxSpread);
-
-    // DEGRADED is only usable while we still hold a recent authenticated
-    // anchor: require the last TRUST_OK to be within the fresh window.
-    // g_lastSuccessTick is updated only on full-OK cycles (below), so a
-    // run of degraded cycles cannot keep refreshing its own window.
-    if (trust == TRUST_DEGRADED) {
-        LONG64 lastOk = g_lastSuccessTick;
-        if (lastOk == 0 ||
-            ((LONG64)GetTickCount64() - lastOk) > FRESH_WINDOW_MS) {
-            trust = TRUST_INOP;
-        }
-    }
+    int64_t    anchorErr = 0;
+    int64_t    clusterUtc = 0, clusterQpc = 0;
+    int        haveCluster = 0;
+    TrustState trust = Ntp_Concur(snapshot, &bestUtcMs, &bestQpc, &anchorErr,
+                                  &clusterUtc, &clusterQpc, &haveCluster);
 
     // Corroborated pin-rotation promotion: an NTS slot that completed
     // via a CA-valid leaf matching no stored pin (NTP_AUTH_ROTATED_PIN)
@@ -1046,9 +1052,8 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
         if (qpcFreq <= 0) qpcFreq = 1;
         int64_t refQpc = 0, refUtc = 0;
         int have_ref = 0;
-        if (trust != TRUST_INOP) {
-            // OK or DEGRADED: bestUtc/bestQpc is the cycle's consensus
-            // (NTS midpoint on OK, core consensus on DEGRADED).
+        if (trust == TRUST_OK) {
+            // bestUtc/bestQpc is the cycle's authenticated NTS midpoint.
             refQpc = bestQpc;
             refUtc = bestUtcMs;
             have_ref = 1;
@@ -1109,14 +1114,19 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
 
     // Inform the clockwork. If state is INOP the anchor is not updated
     // and Clock_NowUtcMs() will refuse to return a time (callers render
-    // the big red INOP).
-    Clock_OnPollCycle(trust, bestUtcMs, bestQpc, maxSpread);
-    InterlockedExchange64(&g_lastSpreadMs, (LONG64)maxSpread);
+    // the big red INOP). On an INOP cycle whose unauthenticated cores
+    // still clustered tightly, feed the widen-only watchdog -- it can
+    // only ever inflate the published interval, never sustain a claim.
+    Clock_OnPollCycle(trust, bestUtcMs, bestQpc, anchorErr);
+    if (trust != TRUST_OK && haveCluster) {
+        Clock_OnCoreWitness(clusterUtc, clusterQpc);
+    }
+    InterlockedExchange64(&g_lastSpreadMs, (LONG64)anchorErr);
 
     // One line to the audit log per cycle. Done after Clock_OnPollCycle
     // so the timestamp reflects the clockwork's *post-cycle* state
     // (disciplined if this cycle was OK, untrusted-fallback otherwise).
-    AuditWrite(trust, maxSpread, snapshot);
+    AuditWrite(trust, anchorErr, snapshot);
 
     // Promote corroborated pin rotations collected above: persist the
     // new SPKI and leave a LOUD trace in both the in-memory event log
@@ -1161,21 +1171,19 @@ static DWORD WINAPI AggregatorProc(LPVOID param) {
             if (off <= CONCUR_THRESHOLD_MS) coreConcur++;
         }
         const char *verdictName =
-              (trust == TRUST_OK)       ? "TRUST_OK"
-            : (trust == TRUST_DEGRADED) ? "TRUST_DEGRADED"
-            :                             "TRUST_INOP";
+              (trust == TRUST_OK) ? "TRUST_OK" : "TRUST_INOP";
         const char *gateDesc =
               (trust == TRUST_OK)
                   ? "2 operator-diverse NTS + >=3/4 core within +/-200ms"
-            : (trust == TRUST_DEGRADED)
-                  ? "NTS unavailable; >=3/4 core within 100ms, holding last-OK anchor (<8h)"
+            : haveCluster
+                  ? "gate failed; core cluster reported to the widen-only watchdog"
                   : "need 2 operator-diverse NTS agreeing + >=3/4 core";
         Log_Append("ntp: cycle %s  concur=%d/%d core + %d/%d NTS  "
-                   "spread=%lldms  gate=%s",
+                   "anchorErr=%lldms  gate=%s",
                    verdictName,
                    coreConcur, NTP_CORE_COUNT,
                    ntsOk, NTP_NTS_COUNT,
-                   (long long)maxSpread,
+                   (long long)anchorErr,
                    gateDesc);
         (void)okCount;
         for (int i = 0; i < NTP_SOURCE_COUNT; i++) {
@@ -1277,9 +1285,11 @@ static int CountCoreConcurring(const NtpSourceResult results[NTP_SOURCE_COUNT],
                                int64_t refUtc,
                                int64_t refQpc,
                                int64_t qpcFreq,
-                               int64_t *outWorstAbs) {
+                               int64_t *outWorstAbs,
+                               int64_t *outMedianConcurAbs) {
     int concurring = 0;
     int64_t worst = 0;
+    int64_t concurAbs[NTP_CORE_COUNT];
     for (int i = 0; i < NTP_CORE_COUNT; i++) {
         const NtpSourceResult *r = &results[i];
         if (!r->ok) continue;
@@ -1288,20 +1298,44 @@ static int CountCoreConcurring(const NtpSourceResult results[NTP_SOURCE_COUNT],
         int64_t delta = projected - refUtc;
         int64_t absD  = delta < 0 ? -delta : delta;
         if (absD > worst) worst = absD;
-        if (absD <= CONCUR_THRESHOLD_MS) concurring++;
+        if (absD <= CONCUR_THRESHOLD_MS) concurAbs[concurring++] = absD;
     }
     if (outWorstAbs) *outWorstAbs = worst;
+    // Median deviation of the CONCURRING cores from the reference: an
+    // independent (if unauthenticated) witness of the anchor's error.
+    // Median, not mean or max, so one outlier core can neither dominate
+    // nor tighten it. Used widen-only by the anchor-error computation.
+    if (outMedianConcurAbs) {
+        int64_t med = 0;
+        if (concurring > 0) {
+            // insertion sort; at most NTP_CORE_COUNT (4) entries
+            for (int i = 1; i < concurring; i++) {
+                int64_t v = concurAbs[i];
+                int j = i - 1;
+                while (j >= 0 && concurAbs[j] > v) {
+                    concurAbs[j + 1] = concurAbs[j];
+                    j--;
+                }
+                concurAbs[j + 1] = v;
+            }
+            med = (concurring & 1)
+                ? concurAbs[concurring / 2]
+                : (concurAbs[concurring / 2 - 1] + concurAbs[concurring / 2]) / 2;
+        }
+        *outMedianConcurAbs = med;
+    }
     return concurring;
 }
 
-// Core-only consensus for the unauthenticated DEGRADED tier. Among the
-// successful core (plain-SNTP) slots, find the largest cluster that
-// mutually agrees within `thresholdMs` after QPC-projection onto a common
-// moment. If at least 3 core sources fall in one cluster, write the
-// cluster-center value (projected to that moment) to *outUtc/*outQpc, the
-// worst in-cluster deviation to *outWorst, and return the cluster size;
-// otherwise return 0. This consensus is used only to cross-check the held
-// anchor in clock.c -- it never re-anchors the clock.
+// Core-only cluster for the widen-only watchdog. Among the successful
+// core (plain-SNTP) slots, find the largest cluster that mutually agrees
+// within `thresholdMs` after QPC-projection onto a common moment. If at
+// least 3 core sources fall in one cluster, write the cluster-center
+// value (projected to that moment) to *outUtc/*outQpc, the worst
+// in-cluster deviation to *outWorst, and return the cluster size;
+// otherwise return 0. The cluster carries NO trust: Clock_OnCoreWitness
+// may only widen the published interval from it -- it never re-anchors,
+// never clears a latch, never refreshes freshness.
 static int CoreOnlyConsensus(const NtpSourceResult results[NTP_SOURCE_COUNT],
                              int64_t qpcFreq, int64_t thresholdMs,
                              int64_t *outUtc, int64_t *outQpc,
@@ -1356,10 +1390,16 @@ static int CoreOnlyConsensus(const NtpSourceResult results[NTP_SOURCE_COUNT],
 TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
                       int64_t *outBestUtcMs,
                       int64_t *outBestQpc,
-                      int64_t *outMaxSpreadMs) {
-    if (outBestUtcMs)   *outBestUtcMs   = 0;
-    if (outBestQpc)     *outBestQpc     = 0;
-    if (outMaxSpreadMs) *outMaxSpreadMs = 0;
+                      int64_t *outAnchorErrMs,
+                      int64_t *outClusterUtcMs,
+                      int64_t *outClusterQpc,
+                      int     *outHaveCluster) {
+    if (outBestUtcMs)    *outBestUtcMs    = 0;
+    if (outBestQpc)      *outBestQpc      = 0;
+    if (outAnchorErrMs)  *outAnchorErrMs  = 0;
+    if (outClusterUtcMs) *outClusterUtcMs = 0;
+    if (outClusterQpc)   *outClusterQpc   = 0;
+    if (outHaveCluster)  *outHaveCluster  = 0;
 
     int64_t qpcFreq = Clock_QpcFreq();
     if (qpcFreq <= 0) return TRUST_INOP;
@@ -1381,12 +1421,12 @@ TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
         }
     }
 
-    // --- Path 1: both authenticated NTS anchors present ------------------
+    // --- Both authenticated NTS anchors present --------------------------
     // When both NTS slots respond we must produce a full TRUST_OK or
     // hard-fail to INOP. A conflicting or duplicate-family NTS pair is
     // MORE alarming than absent NTS (it suggests an attack on, or
-    // misconfiguration of, the authenticated layer), so we never downgrade
-    // it to the unauthenticated DEGRADED tier.
+    // misconfiguration of, the authenticated layer), so it never earns
+    // any weaker credit.
     if (ntsOkCount == 2) {
         // Continuity rule: a rotated pin is only trustworthy when a
         // CONTINUOUS enrolled pin from an independent operator vouches
@@ -1416,7 +1456,7 @@ TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
         // 200 ms gate) before it relaxes the cadence.
         InterlockedExchange64(&g_lastNtsSpreadMs, (LONG64)ntsAbs);
         if (ntsAbs > CONCUR_THRESHOLD_MS) {
-            if (outMaxSpreadMs) *outMaxSpreadMs = ntsAbs;
+            if (outAnchorErrMs) *outAnchorErrMs = ntsAbs;
             return TRUST_INOP;
         }
 
@@ -1425,33 +1465,55 @@ TrustState Ntp_Concur(const NtpSourceResult results[NTP_SOURCE_COUNT],
         int64_t midUtc = a->ntpUtcMs + ntsDelta / 2;
         int64_t midQpc = a->qpcAtT4;
 
-        int64_t worstCore = 0;
+        int64_t worstCore = 0, medianCore = 0;
         int coreConcur = CountCoreConcurring(results, midUtc, midQpc,
-                                             qpcFreq, &worstCore);
-        if (outMaxSpreadMs) *outMaxSpreadMs = worstCore;
-        if (coreConcur < 3) return TRUST_INOP;   // need >= 3 of 4
+                                             qpcFreq, &worstCore, &medianCore);
+        if (coreConcur < 3) {
+            if (outAnchorErrMs) *outAnchorErrMs = worstCore;
+            return TRUST_INOP;   // need >= 3 of 4
+        }
+
+        // --- Measured anchor uncertainty --------------------------------
+        // The midpoint's worst-case error when the two anchors' errors have
+        // opposite signs is bounded by the pair spread; when they share a
+        // sign (one anchor faulty, or a correlated upstream error) it is
+        // bounded by a single sample's asymmetry half-width plus what the
+        // server itself claims. Sum -- not max -- of the halves stays a
+        // bound in BOTH regimes:
+        //   base = ntsAbs/2 + worstNtsRtt/2 + serverRootErr(floor 15 ms)
+        // and the concurring cores' median deviation widens (never
+        // tightens) it, covering correlated-NTS error the pair spread
+        // cannot see (leap smear, shared upstream).
+        {
+            int64_t rttA = (int64_t)a->rttMs, rttB = (int64_t)b->rttMs;
+            int64_t worstRtt = rttA > rttB ? rttA : rttB;
+            int64_t rootA = (int64_t)a->rootErrMs, rootB = (int64_t)b->rootErrMs;
+            int64_t worstRoot = rootA > rootB ? rootA : rootB;
+            if (worstRoot < NTP_DISP_FLOOR_MS) worstRoot = NTP_DISP_FLOOR_MS;
+            int64_t anchorErr = ntsAbs / 2 + worstRtt / 2 + worstRoot;
+            if (medianCore > anchorErr) anchorErr = medianCore;
+            if (outAnchorErrMs) *outAnchorErrMs = anchorErr;
+        }
 
         if (outBestUtcMs) *outBestUtcMs = midUtc;
         if (outBestQpc)   *outBestQpc   = midQpc;
         return TRUST_OK;
     }
 
-    // --- Path 2: NTS unavailable -> consider core-only DEGRADED ----------
-    // Fewer than two authenticated anchors means we cannot produce a full
-    // OK verdict. If >= 3 core sources still mutually agree within the
-    // tighter DEGRADED_CONCUR_THRESHOLD_MS, surface a DEGRADED verdict
-    // carrying the core consensus. The caller gates this further on the
-    // last TRUST_OK being recent (< FRESH_WINDOW_MS); clock.c uses the
-    // consensus only to cross-check the held anchor, never to re-anchor.
+    // --- NTS unavailable: no trust, but maybe a witness -------------------
+    // Fewer than two authenticated anchors can never produce a verdict.
+    // If >= 3 core sources still mutually agree within the tight cluster
+    // threshold, report the cluster so the caller can feed the widen-only
+    // watchdog (Clock_OnCoreWitness): unauthenticated evidence may widen
+    // the published interval, never sustain or tighten a claim.
     int64_t coreUtc = 0, coreQpc = 0, coreWorst = 0;
     int nCore = CoreOnlyConsensus(results, qpcFreq,
-                                  DEGRADED_CONCUR_THRESHOLD_MS,
+                                  CORE_CLUSTER_THRESHOLD_MS,
                                   &coreUtc, &coreQpc, &coreWorst);
     if (nCore >= 3) {
-        if (outBestUtcMs)   *outBestUtcMs   = coreUtc;
-        if (outBestQpc)     *outBestQpc     = coreQpc;
-        if (outMaxSpreadMs) *outMaxSpreadMs = coreWorst;
-        return TRUST_DEGRADED;
+        if (outClusterUtcMs) *outClusterUtcMs = coreUtc;
+        if (outClusterQpc)   *outClusterQpc   = coreQpc;
+        if (outHaveCluster)  *outHaveCluster  = 1;
     }
     return TRUST_INOP;
 }
@@ -1556,10 +1618,10 @@ void Ntp_Shutdown(void) {
 }
 
 int Ntp_IsSynced(void) {
-    LONG64 last = g_lastSuccessTick;
-    if (last == 0) return 0;
-    LONG64 now = (LONG64)GetTickCount64();
-    return (now - last) <= FRESH_WINDOW_MS;
+    // Anchored at least once this run. The UI uses this only to choose
+    // between NO SIGNAL (was synced, lost it) and ACQUIRING (never yet);
+    // freshness itself is carried by the certainty interval.
+    return g_lastSuccessTick != 0;
 }
 
 int64_t Ntp_OffsetMs(void) {

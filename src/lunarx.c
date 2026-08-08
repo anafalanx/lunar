@@ -34,7 +34,6 @@ extern int LunarClock_Init(Tcl_Interp *interp);
 static const char *trust_name(TrustState s) {
     switch (s) {
         case TRUST_OK:          return "ok";
-        case TRUST_DEGRADED:    return "degraded";
         case TRUST_HOLDOVER:    return "holdover";
         case TRUST_REACQUIRING: return "reacquiring";
         case TRUST_INOP:        default: return "inop";

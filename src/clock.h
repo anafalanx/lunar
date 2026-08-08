@@ -54,21 +54,21 @@ typedef enum {
                             // (suspend/resume, session handoff): show the
                             // last verified time + age, not a running dial;
                             // exits only via a full authenticated cycle
-    TRUST_HOLDOVER    = 2,  // running projection with no live corroboration
-                            // (offline, gate failing, or polling stalled):
-                            // the error bound grows ~12 ms/min worst case
-    TRUST_DEGRADED    = 3,  // NTS unavailable, but >= 3 unauthenticated core
-                            // sources corroborate the held anchor within
-                            // 100 ms and the last authenticated cycle is
-                            // within the freshness window
-    TRUST_OK          = 4,  // full authenticated consensus
+    TRUST_HOLDOVER    = 2,  // running projection with no live authenticated
+                            // corroboration (offline, gate failing, polling
+                            // stalled): the certainty interval keeps growing
+    TRUST_OK          = 3,  // full authenticated consensus
 } TrustState;
+// There is deliberately NO intermediate "degraded" tier: trust is the
+// certainty interval itself (anchor measurement quality + growth since the
+// last authenticated anchor). Unauthenticated sources can only ever WIDEN
+// the interval (Clock_OnCoreWitness), never sustain or tighten a claim.
 
 // Everything a painter or badge needs, captured atomically.
 typedef struct {
     TrustState state;         // derived display state (includes staleness:
-                              // an OK/DEGRADED older than the corroboration
-                              // window is reported as TRUST_HOLDOVER)
+                              // an OK older than the corroboration window
+                              // is reported as TRUST_HOLDOVER)
     int64_t    utcMs;         // projected UTC ms; valid when
                               // state >= TRUST_HOLDOVER, else 0
     int64_t    boundMs;       // honest worst-case display error bound (ms);
@@ -125,23 +125,15 @@ void    Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc);
 //
 // After each parallel NTP polling cycle, ntp.c calls Clock_OnPollCycle()
 // with the concurrence verdict computed by Ntp_Concur. Cycle verdicts
-// only ever use three of the enum values:
+// use exactly two of the enum values:
 //   TRUST_OK       -- two operator-diverse NTS anchors and the required
 //                     core SNTP super-majority concur within 200 ms.
 //                     bestUtcMs / bestQpc update the anchor and rate,
 //                     and restore QPC continuity after a resume.
-//   TRUST_DEGRADED -- NTS is unavailable, but >= 3 core sources still
-//                     corroborate within the tighter 100 ms gate and the
-//                     last authenticated cycle is inside the freshness
-//                     window. bestUtcMs / bestQpc are NOT used to
-//                     re-anchor; they only cross-check the held
-//                     projection. Corroboration keeps the claimed error
-//                     bound tight but never steers the clockwork.
-//   TRUST_INOP     -- the gate failed or no sources answered. The anchor
-//                     is untouched; the display state derives to
-//                     TRUST_HOLDOVER (anchored, continuity intact),
-//                     TRUST_REACQUIRING (continuity broken) or TRUST_INOP
-//                     (never anchored).
+//   TRUST_INOP     -- anything else. The anchor is untouched; the display
+//                     state derives to TRUST_HOLDOVER (anchored,
+//                     continuity intact), TRUST_REACQUIRING (continuity
+//                     broken) or TRUST_INOP (never anchored).
 //
 // A gate-passing cycle whose consensus disagrees with our running
 // projection by more than 200 ms inflates the published error bound to
@@ -149,12 +141,26 @@ void    Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc);
 // LOCAL_FAULT_ESCAPE_N consecutive such cycles the consensus wins and
 // the clockwork snaps to it with a prominent TIME STEP log entry (our
 // anchor/rate are the broken party, not the network).
-// maxPairSpreadMs is the largest pairwise offset difference from the
-// cycle (used for audit / UI).
+//
+// anchorErrMs is the MEASURED uncertainty of this cycle's anchor
+// (authenticated pair spread/2 + worst NTS RTT/2 + server-claimed root
+// dispersion, widened to the concurring cores' median deviation --
+// computed by Ntp_Concur). It becomes the base of the published
+// certainty interval. Values <= 0 mean "unmeasured" and fall back to a
+// conservative 200 ms default (legacy/test callers).
 void    Clock_OnPollCycle(TrustState state,
                           int64_t bestUtcMs,
                           int64_t bestQpc,
-                          int64_t maxPairSpreadMs);
+                          int64_t anchorErrMs);
+
+// Widen-only watchdog intake: on an INOP cycle where >= 3 unauthenticated
+// core sources still cluster tightly, ntp.c reports the cluster here. If
+// it disagrees with the held projection by > 200 ms the published
+// interval is inflated to cover the disagreement (and the state drops to
+// HOLDOVER). Unauthenticated evidence can only ever WIDEN the claim --
+// it never clears a fault latch, refreshes freshness, re-anchors, or
+// steers the rate.
+void    Clock_OnCoreWitness(int64_t clusterUtcMs, int64_t clusterQpc);
 
 // QPC continuity was broken or become untrustworthy: system
 // suspend/resume, RDP session reconnect, or a timer gap long enough to
@@ -183,6 +189,7 @@ int     Clock_SystemDeltaMs(int64_t *outDeltaMs);
 // sleeping.
 void    Clock_TestAgeLastCycle(int64_t ageMs);
 void    Clock_TestAgeAnchor(int64_t ageMs);
+void    Clock_TestAgeTickOnly(int64_t ageMs);   // diverge tick64 from QPC
 #endif
 
 // Convenience for ntp.c: read the QPC at a defined moment.

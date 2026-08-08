@@ -141,6 +141,8 @@ int Nts_FetchSampleEx(const NtsProvider *p,
                       int64_t  *out_ntpUtcMs,
                       int64_t  *out_qpcAtT4,
                       uint32_t *out_rttMs,
+                      uint32_t *out_rootErrMs,   // server root disp + delay/2
+                                                 // (authenticated); may be NULL
                       NtsRotationPending *rot);
 
 #ifdef LUNAR_TESTING

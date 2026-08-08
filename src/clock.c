@@ -37,14 +37,18 @@ static int64_t    g_lastSyncQpc   = 0;   // QPC at last successful sync
 static int64_t    g_lastSyncTick64 = 0;  // GetTickCount64 at last accepted
                                          // anchor; unlike QPC-derived ages
                                          // this keeps counting across sleep
-static int64_t    g_lastCycleTick64 = 0; // GetTickCount64 at last
-                                         // corroborating cycle (OK accept or
-                                         // DEGRADED hold); drives staleness
 static uint64_t   g_displayGeneration = 1; // bumps on every display-state change
 
-// Trust tier published by the last poll cycle: TRUST_OK, TRUST_DEGRADED
-// or TRUST_HOLDOVER once anchored. The externally visible display state
-// is DERIVED from this plus the flags below (see DeriveDisplayLocked).
+// Measured uncertainty (ms) of the current anchor -- the base of the
+// published certainty interval. Set when an anchor is laid: real cycles
+// carry the value measured by Ntp_Concur; direct/legacy callers fall
+// back to the conservative default below.
+static int64_t    g_anchorErrMs        = 0;
+static int64_t    g_pendingAnchorErrMs = 0;   // staged by Clock_OnPollCycle
+
+// Trust tier published by the last poll cycle: TRUST_OK or TRUST_HOLDOVER
+// once anchored. The externally visible display state is DERIVED from
+// this plus the flags below (see DeriveDisplayLocked).
 static TrustState g_trust         = TRUST_INOP;
 
 // 1 while the QPC timescale has run uninterrupted since the last anchor.
@@ -78,26 +82,33 @@ static int        g_consecutiveLocalFaults = 0;
 
 // --- Display-derivation constants ------------------------------------------
 //
-// BOUND_BASE_MS: uncertainty of a freshly accepted anchor. The OK gate
-// requires mutual NTS agreement within 200 ms, so the midpoint anchor is
-// honest to about that width (RTT asymmetry included in practice).
+// ANCHOR_ERR_DEFAULT_MS: fallback base uncertainty when an anchor is laid
+// WITHOUT a measured anchorErrMs (legacy/test callers). Real cycles carry
+// the value measured by Ntp_Concur (pair spread/2 + worst NTS RTT/2 +
+// server root dispersion, widened to the concurring cores' median
+// deviation), typically 40-70 ms. 200 ms matches the OK gate's mutual-
+// agreement ceiling, the old flat floor.
 //
-// BOUND_DEGRADED_CAP_MS: while live core sources corroborate the held
-// projection within the 100 ms degraded gate, the claimed bound need not
-// grow past corroboration width + base.
+// CYCLE_STALE_AFTER_MS: an accepted cycle older than this no longer keeps
+// the OK claim alive and the display derives to HOLDOVER. Chosen above
+// the worst-case healthy renewal path: the poll scheduler (lunar.tcl)
+// relaxes the cadence up to a 300 s (5 min) ceiling when the clock is
+// well disciplined, and one cycle can take up to the 40 s cycle budget,
+// so a healthy slow renewal lands up to 340 s apart. 360 s clears that
+// with a 20 s margin, so a slow-but-successful relaxed cycle never
+// false-alarms to HOLDOVER, while a genuinely wedged poller is still
+// caught within ~6 min (proportionate to the relaxed cadence).
 //
-// CYCLE_STALE_AFTER_MS: a corroborating cycle older than this no longer
-// keeps the OK/DEGRADED claim alive and the display derives to HOLDOVER.
-// Chosen above the worst-case healthy renewal path: the poll scheduler
-// (lunar.tcl) relaxes the cadence up to a 300 s (5 min) ceiling when the
-// clock is well disciplined, and one cycle can take up to the 40 s cycle
-// budget, so a healthy slow renewal lands up to 340 s apart. 360 s clears
-// that with a 20 s margin, so a slow-but-successful relaxed cycle never
-// false-alarms to HOLDOVER, while a genuinely wedged poller is still caught
-// within ~6 min (proportionate to the relaxed cadence).
-#define BOUND_BASE_MS            200
-#define BOUND_DEGRADED_CAP_MS    300
+// CONTINUITY_TRIP_MIN_MS: DeriveDisplayLocked cross-checks the QPC-based
+// anchor age against the tick64-based age (tick64 keeps counting across
+// sleep; QPC pauses on some platforms). A divergence beyond
+// max(CONTINUITY_TRIP_MIN_MS, elapsed/100) means the QPC timescale
+// silently lost time (suspend/resume the power events did not report) --
+// the projection can no longer be defended, so continuity is tripped and
+// the display drops to REACQUIRING until an authenticated re-anchor.
+#define ANCHOR_ERR_DEFAULT_MS    200
 #define CYCLE_STALE_AFTER_MS  360000
+#define CONTINUITY_TRIP_MIN_MS  2000
 
 // --- Discipline-loop constants --------------------------------------------
 //
@@ -156,33 +167,47 @@ static void DeriveDisplayLocked(int64_t nowQpc, int64_t nowTick64,
 
     if (!g_haveSample || g_hardInop) return;                 // TRUST_INOP
 
+    // Continuity cross-check: the tick64 age keeps counting across sleep
+    // while QPC can silently pause. If the two disagree materially, the
+    // QPC timescale lost time behind our back (a suspend the power events
+    // never reported) and the projection can no longer be defended.
+    int64_t qpcElapsedMs  = QpcTicksToMs(nowQpc - g_lastSyncQpc);
+    int64_t tickElapsedMs = nowTick64 - g_lastSyncTick64;
+    if (qpcElapsedMs < 0)  qpcElapsedMs = 0;
+    if (tickElapsedMs < 0) tickElapsedMs = 0;
+    if (g_qpcContinuityOk) {
+        int64_t gap = tickElapsedMs - qpcElapsedMs;
+        if (gap < 0) gap = -gap;
+        int64_t tol = tickElapsedMs / 100;
+        if (tol < CONTINUITY_TRIP_MIN_MS) tol = CONTINUITY_TRIP_MIN_MS;
+        if (gap > tol) g_qpcContinuityOk = 0;   // logged via ObserveState
+    }
+
     if (!g_qpcContinuityOk) {                                // REACQUIRING
         out->state = TRUST_REACQUIRING;
         return;
     }
 
     // Anchored, continuity intact: the display is never below holdover.
-    // The OK/DEGRADED claim is only as fresh as its last corroborating
-    // cycle; past the staleness window the display is honest holdover.
+    // The OK claim is only as fresh as its last accepted cycle; past the
+    // staleness window the display is honest holdover.
     TrustState st = g_trust;
     if (st < TRUST_HOLDOVER) st = TRUST_HOLDOVER;
     if (st > TRUST_HOLDOVER &&
-        nowTick64 - g_lastCycleTick64 > CYCLE_STALE_AFTER_MS) {
+        nowTick64 - g_lastSyncTick64 > CYCLE_STALE_AFTER_MS) {
         st = TRUST_HOLDOVER;
     }
 
-    // Worst-case bound: anchor base + oscillator drift at the rate clamp
-    // since the last accepted anchor, inflated by any network-reported
-    // disagreement, capped while live corroboration is current.
-    int64_t elapsedMs  = QpcTicksToMs(nowQpc - g_lastSyncQpc);
-    if (elapsedMs < 0) elapsedMs = 0;
-    int64_t bound = BOUND_BASE_MS
-                  + (elapsedMs * RATE_CLAMP_PPM) / 1000000LL;
-    if (g_faultInflateMs > 0 && bound < g_faultInflateMs + BOUND_BASE_MS) {
-        bound = g_faultInflateMs + BOUND_BASE_MS;
-    }
-    if (st == TRUST_DEGRADED && bound > BOUND_DEGRADED_CAP_MS) {
-        bound = BOUND_DEGRADED_CAP_MS;
+    // The certainty interval: the anchor's MEASURED uncertainty plus
+    // worst-case oscillator drift since the anchor (the larger of the two
+    // elapsed measures, so a silently-paused QPC cannot shrink the claim),
+    // floored by any network-reported disagreement. Never capped.
+    int64_t elapsedMs = qpcElapsedMs > tickElapsedMs ? qpcElapsedMs
+                                                     : tickElapsedMs;
+    int64_t base  = g_anchorErrMs > 0 ? g_anchorErrMs : ANCHOR_ERR_DEFAULT_MS;
+    int64_t bound = base + (elapsedMs * RATE_CLAMP_PPM) / 1000000LL;
+    if (g_faultInflateMs > 0 && bound < g_faultInflateMs + base) {
+        bound = g_faultInflateMs + base;
     }
 
     out->state   = st;
@@ -247,7 +272,8 @@ void Clock_Init(void) {
     g_lastSyncUtcMs = 0;
     g_lastSyncQpc = 0;
     g_lastSyncTick64 = 0;
-    g_lastCycleTick64 = 0;
+    g_anchorErrMs = 0;
+    g_pendingAnchorErrMs = 0;
     g_trust = TRUST_INOP;
     g_qpcContinuityOk = 1;
     g_hardInop = 0;
@@ -324,7 +350,7 @@ void Clock_GetDisplay(ClockDisplay *out) {
     nowState = out->state;
     prevObserved = ObserveStateLocked(nowState);
     if (nowState == TRUST_HOLDOVER && prevObserved > TRUST_HOLDOVER) {
-        staleAgeMs = nowTick - g_lastCycleTick64;
+        staleAgeMs = nowTick - g_lastSyncTick64;
     }
     LeaveCriticalSection(&g_cs);
 
@@ -382,6 +408,18 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
     int     rateMeasured = 0;       // did this cycle refresh the rate?
     int64_t staleAgeDays = 0;       // only meaningful when ev==EV_FIRST_STALE
     int64_t nowTick64 = (int64_t)GetTickCount64();
+
+    // The QPC baseline of this anchor is localQpc -- the moment the NTS
+    // reply was captured -- which can be tens of seconds before this call
+    // (the cycle waits for its other slots). Back-date the tick baseline
+    // to the SAME instant, so the continuity cross-check (which compares
+    // elapsed-since-anchor on both timescales) starts from zero skew and
+    // only ever measures a genuine QPC pause.
+    {
+        int64_t sampleAgeMs = QpcTicksToMs(Clock_Qpc() - localQpc);
+        if (sampleAgeMs < 0) sampleAgeMs = 0;
+        nowTick64 -= sampleAgeMs;
+    }
 
     EnterCriticalSection(&g_cs);
 
@@ -477,12 +515,14 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
     }
 
     // An accepted authenticated sample refreshes every claim: the anchor
-    // age, the corroboration freshness, and it clears the unrenderable /
-    // network-disagreement latches.
-    g_lastSyncTick64  = nowTick64;
-    g_lastCycleTick64 = nowTick64;
-    g_hardInop        = 0;
-    g_faultInflateMs  = 0;
+    // age and freshness, the measured base of the certainty interval, and
+    // it clears the unrenderable / network-disagreement latches.
+    g_lastSyncTick64 = nowTick64;
+    g_anchorErrMs    = g_pendingAnchorErrMs > 0 ? g_pendingAnchorErrMs
+                                                : ANCHOR_ERR_DEFAULT_MS;
+    g_pendingAnchorErrMs = 0;   // one-shot: direct callers get the default
+    g_hardInop       = 0;
+    g_faultInflateMs = 0;
     BumpGenerationLocked();
 
     LeaveCriticalSection(&g_cs);
@@ -534,7 +574,6 @@ void Clock_OnSyncedNtpUtc(int64_t ntpUtcMs, int64_t localQpc) {
 static const char *TrustName(TrustState t) {
     switch (t) {
     case TRUST_OK:          return "OK";
-    case TRUST_DEGRADED:    return "DEGRADED";
     case TRUST_HOLDOVER:    return "HOLDOVER";
     case TRUST_REACQUIRING: return "REACQUIRING";
     default:                return "INOP";
@@ -543,9 +582,8 @@ static const char *TrustName(TrustState t) {
 
 // Called by ntp.c at the end of every polling cycle. The concurrence
 // verdict has already been computed by the caller. TRUST_OK re-anchors
-// from (bestUtcMs, bestQpc); TRUST_DEGRADED holds the existing anchor and
-// rate, using (bestUtcMs, bestQpc) only to cross-check the held projection
-// against the core consensus; TRUST_INOP leaves everything alone (the
+// from (bestUtcMs, bestQpc) and records anchorErrMs as the measured base
+// of the certainty interval; TRUST_INOP leaves everything alone (the
 // display derives to holdover on the held anchor). A gate-passing
 // consensus that disagrees with our projection by more than 200 ms
 // inflates the published bound and drops the tier to HOLDOVER; after
@@ -554,8 +592,7 @@ static const char *TrustName(TrustState t) {
 void Clock_OnPollCycle(TrustState state,
                        int64_t bestUtcMs,
                        int64_t bestQpc,
-                       int64_t maxPairSpreadMs) {
-    (void)maxPairSpreadMs;   // reserved for future audit-log use
+                       int64_t anchorErrMs) {
     if (!g_csInit) Clock_Init();
 
     // Phase 1 -- classify the cycle under a single lock acquisition,
@@ -569,8 +606,6 @@ void Clock_OnPollCycle(TrustState state,
         CYCLE_ESCAPE,         // Nth corroborated disagreement -> forced snap
         CYCLE_FAULT_HOLD,     // OK verdict disagrees with our projection ->
                               // holdover with the bound inflated to cover it
-        CYCLE_DEGRADED_HOLD,  // DEGRADED verdict, projection corroborated
-        CYCLE_DEGRADED_FAULT, // DEGRADED verdict disagrees -> holdover
         CYCLE_NO_CONSENSUS,   // gate failed -> holdover on the held anchor
         CYCLE_IGNORED,        // nothing usable: no anchor yet, or continuity
                               // is broken and the verdict cannot re-anchor
@@ -578,7 +613,6 @@ void Clock_OnPollCycle(TrustState state,
     TrustState prevPublished;
     int64_t    faultDiffMs = 0;
     int        faultCount  = 0;
-    int64_t    nowTick64   = (int64_t)GetTickCount64();
 
     EnterCriticalSection(&g_cs);
     prevPublished = g_trust;
@@ -614,37 +648,6 @@ void Clock_OnPollCycle(TrustState state,
             } else {
                 g_consecutiveLocalFaults = 0;
                 verdict = CYCLE_ACCEPT;
-            }
-        }
-    } else if (state == TRUST_DEGRADED) {
-        // NTS unavailable; core sources corroborate. We never re-anchor or
-        // update the rate from unauthenticated sources -- corroboration
-        // only refreshes the claimed bound on the held projection. It can
-        // neither create an anchor nor repair broken QPC continuity.
-        if (!g_haveSample || !g_qpcContinuityOk) {
-            verdict = CYCLE_IGNORED;
-        } else {
-            int64_t predicted = ProjectLocked(bestQpc);
-            int64_t diff      = bestUtcMs - predicted;
-            int64_t absDiff   = diff < 0 ? -diff : diff;
-            if (absDiff > 200) {
-                faultDiffMs = diff;
-                g_faultInflateMs = absDiff;
-                if (g_trust != TRUST_HOLDOVER) {
-                    g_trust = TRUST_HOLDOVER;
-                    BumpGenerationLocked();
-                }
-                verdict = CYCLE_DEGRADED_FAULT;
-            } else {
-                g_consecutiveLocalFaults = 0;
-                g_lastCycleTick64 = nowTick64;   // live corroboration
-                g_hardInop        = 0;
-                g_faultInflateMs  = 0;
-                if (g_trust != TRUST_DEGRADED) {
-                    g_trust = TRUST_DEGRADED;
-                    BumpGenerationLocked();
-                }
-                verdict = CYCLE_DEGRADED_HOLD;
             }
         }
     } else {
@@ -683,20 +686,6 @@ void Clock_OnPollCycle(TrustState state,
                    (long long)faultDiffMs,
                    faultCount, LOCAL_FAULT_ESCAPE_N);
         return;
-    case CYCLE_DEGRADED_FAULT:
-        Log_Append("clock: core consensus differs from the held anchor "
-                   "by %+lldms (>200ms); holding over with inflated bound "
-                   "(unauthenticated sources cannot re-anchor)",
-                   (long long)faultDiffMs);
-        return;
-    case CYCLE_DEGRADED_HOLD:
-        if (prevPublished != TRUST_DEGRADED) {
-            Log_Append("clock: trust %s \xe2\x86\x92"
-                       " DEGRADED (NTS unavailable; core sources corroborate "
-                       "the held anchor, running unauthenticated)",
-                       TrustName(prevPublished));
-        }
-        return;
     case CYCLE_ESCAPE:
     case CYCLE_ACCEPT:
         break;
@@ -713,6 +702,10 @@ void Clock_OnPollCycle(TrustState state,
                    "clockwork snaps to it",
                    (long long)faultDiffMs, faultCount);
     }
+    // Stage the measured anchor uncertainty for the anchor-laying below.
+    EnterCriticalSection(&g_cs);
+    g_pendingAnchorErrMs = anchorErrMs;
+    LeaveCriticalSection(&g_cs);
     Clock_OnSyncedNtpUtc(bestUtcMs, bestQpc);
 
     TrustState prevAtPublish;
@@ -728,6 +721,40 @@ void Clock_OnPollCycle(TrustState state,
                    ? "clock: trust %s \xe2\x86\x92 OK (recovered via forced re-anchor)"
                    : "clock: trust %s \xe2\x86\x92 OK (concurrence gate passed)",
                    TrustName(prevAtPublish));
+    }
+}
+
+// Widen-only watchdog: an INOP cycle whose unauthenticated core sources
+// still clustered tightly reports that cluster here. If it disagrees with
+// the held projection by > 200 ms, the published interval is inflated to
+// cover the disagreement -- unauthenticated evidence can only ever WIDEN
+// the claim (or, via the stop ceiling, blank the face). It never clears a
+// latch, refreshes freshness, re-anchors, or steers the rate.
+void Clock_OnCoreWitness(int64_t clusterUtcMs, int64_t clusterQpc) {
+    if (!g_csInit) Clock_Init();
+
+    int64_t grewToMs = 0;
+    EnterCriticalSection(&g_cs);
+    if (g_haveSample && g_qpcContinuityOk) {
+        int64_t predicted = ProjectLocked(clusterQpc);
+        int64_t diff      = clusterUtcMs - predicted;
+        int64_t absDiff   = diff < 0 ? -diff : diff;
+        if (absDiff > 200 && absDiff > g_faultInflateMs) {
+            g_faultInflateMs = absDiff;
+            grewToMs = absDiff;
+            if (g_trust > TRUST_HOLDOVER) {
+                g_trust = TRUST_HOLDOVER;
+                BumpGenerationLocked();
+            }
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+
+    if (grewToMs > 0) {
+        Log_Append("clock: unauthenticated core cluster disagrees with the "
+                   "held projection by %lldms; widening the interval "
+                   "(witness can widen, never tighten)",
+                   (long long)grewToMs);
     }
 }
 
@@ -799,16 +826,27 @@ int Clock_SystemDeltaMs(int64_t *outDeltaMs) {
 
 #ifdef LUNAR_TESTING
 void Clock_TestAgeLastCycle(int64_t ageMs) {
-    if (!g_csInit) Clock_Init();
-    EnterCriticalSection(&g_cs);
-    g_lastCycleTick64 -= ageMs;
-    LeaveCriticalSection(&g_cs);
+    // With staleness and the interval both keyed on the last accepted
+    // cycle, aging "the last cycle" and aging "the anchor" are the same
+    // operation: advance both elapsed timescales coherently (awake time
+    // passing), so the continuity cross-check does not trip.
+    Clock_TestAgeAnchor(ageMs);
 }
 
 void Clock_TestAgeAnchor(int64_t ageMs) {
     if (!g_csInit) Clock_Init();
     EnterCriticalSection(&g_cs);
     g_lastSyncQpc    -= (ageMs * g_qpcFreq + 999LL) / 1000LL;
+    g_lastSyncTick64 -= ageMs;
+    LeaveCriticalSection(&g_cs);
+}
+
+void Clock_TestAgeTickOnly(int64_t ageMs) {
+    // Simulate a suspend the power events never reported: wall time
+    // (tick64) advances while the QPC timescale stands still. The
+    // continuity cross-check in DeriveDisplayLocked must trip on this.
+    if (!g_csInit) Clock_Init();
+    EnterCriticalSection(&g_cs);
     g_lastSyncTick64 -= ageMs;
     LeaveCriticalSection(&g_cs);
 }

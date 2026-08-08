@@ -22,7 +22,6 @@
 typedef enum {
     CLOCK_TRUST_INOP,
     CLOCK_TRUST_OK,
-    CLOCK_TRUST_DEGRADED,
     CLOCK_TRUST_HOLDOVER,
     CLOCK_TRUST_REACQUIRING
 } ClockTrust;
@@ -341,7 +340,6 @@ static const WCHAR *state_label(ClockWidget *clock) {
     if (clock->stopped) return L"STOPPED";
     switch (clock->trust) {
         case CLOCK_TRUST_OK:          return L"TRUSTED";
-        case CLOCK_TRUST_DEGRADED:    return L"DEGRADED";
         case CLOCK_TRUST_HOLDOVER:    return L"ESTIMATED";
         case CLOCK_TRUST_REACQUIRING: return L"REACQUIRING";
         case CLOCK_TRUST_INOP:
@@ -355,7 +353,6 @@ static D2D1_COLOR_F state_color(ClockWidget *clock) {
         case CLOCK_TRUST_OK:       return rgb(46, 125, 50);
         case CLOCK_TRUST_INOP:     return clock->synced ? rgb(220, 50, 47)
                                                         : rgb(107, 113, 119);
-        case CLOCK_TRUST_DEGRADED:
         case CLOCK_TRUST_HOLDOVER:
         case CLOCK_TRUST_REACQUIRING:
         default:                   return rgb(184, 134, 11);
@@ -480,7 +477,6 @@ static void clock_event(void *clientData, XEvent *eventPtr) {
 static ClockTrust parse_trust(const char *name, int *ok) {
     *ok = 1;
     if (strcmp(name, "ok") == 0) return CLOCK_TRUST_OK;
-    if (strcmp(name, "degraded") == 0) return CLOCK_TRUST_DEGRADED;
     if (strcmp(name, "holdover") == 0) return CLOCK_TRUST_HOLDOVER;
     if (strcmp(name, "reacquiring") == 0) return CLOCK_TRUST_REACQUIRING;
     if (strcmp(name, "inop") == 0) return CLOCK_TRUST_INOP;

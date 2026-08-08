@@ -9,7 +9,7 @@
 # uncertainty-fan second hand at a representative bound. The display has
 # exactly two states (time-with-fan, always signature red; or no time):
 #   trusted   ok        ±207 ms  (near-hairline fan)
-#   degraded  degraded  ±300 ms  (slightly wider fan, same look)
+#   degraded  holdover  ±300 ms  (slightly wider fan; legacy stage name)
 #   wide      holdover  ±2.5 s   (fan visibly open)
 #   stopped   holdover  ±6.5 s   (> default 5 s ceiling: no time shown)
 #
@@ -25,7 +25,7 @@ source [file join $::LUNAR_ROOT lunar.tcl]   ;# runs lunar::main -> builds the U
 
 # --- deterministic engine stubs (no network) --------------------------------
 switch -- $::UISHOT_STATE {
-    degraded { set ::UISHOT_TRUST degraded ; set ::UISHOT_BOUND 300 }
+    degraded { set ::UISHOT_TRUST holdover ; set ::UISHOT_BOUND 300 }
     wide     { set ::UISHOT_TRUST holdover ; set ::UISHOT_BOUND 2500 }
     stopped  { set ::UISHOT_TRUST holdover ; set ::UISHOT_BOUND 6500 }
     default  { set ::UISHOT_TRUST ok       ; set ::UISHOT_BOUND 207 }
