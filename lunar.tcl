@@ -689,6 +689,48 @@ proc lunar::clock_marker_click {c x y} {
     lunar::status_note "[expr {[lindex $::lunar::armed $index] ? "armed" : "disarmed"}] $mark"
 }
 
+# The intermission: an Invaders-style game on the clock's face. One way
+# in -- a right-click on the dial's hub -- and one way out (Escape, or a
+# finished game left behind). The dial is merely borrowed: the timescale,
+# the status bar, and the chimes keep running underneath.
+proc lunar::clock_hub_click {c x y} {
+    set w [winfo width $c] ; set h [winfo height $c]
+    if {$w <= 1 || $h <= 1} return
+    set size [expr {min($w, $h)}]
+    set r [expr {hypot($x - $w / 2.0, $y - $h / 2.0)}]
+    if {$r > max(10.0, $size * 0.035)} return
+    lunar::invaders_start
+}
+
+proc lunar::invaders_start {} {
+    if {![llength [info commands ::lunarinvaders]]} return
+    if {[winfo exists .face.game]} return
+    # warm the audio endpoint during the attract screen, so the first
+    # shot doesn't land on a D3-parked device as a click
+    catch { ::lunar::prewarm }
+    # minimal size request: the game must never resize the window -- it
+    # takes whatever square the dial had (uniform-scaled, letterboxed)
+    ::lunarinvaders .face.game -width 224 -height 256
+    pack forget .face.clock
+    pack .face.game -fill both -expand 1 -padx 16 -pady 16
+    # The widget polls keys only while Tk's focus is on it -- otherwise
+    # Space aimed at (say) the focused gear button would both press the
+    # button and fire the cannon. Clicking the field reclaims focus.
+    bind .face.game <FocusIn>  { catch { .face.game focused 1 } }
+    bind .face.game <FocusOut> { catch { .face.game focused 0 } }
+    bind .face.game <Button-1> { focus .face.game }
+    focus .face.game
+    bind . <Escape> { lunar::invaders_end }
+}
+
+proc lunar::invaders_end {} {
+    if {![winfo exists .face.game]} return
+    bind . <Escape> {}
+    destroy .face.game
+    pack .face.clock -fill both -expand 1 -padx 16 -pady 16
+    catch { .face.clock redraw }
+}
+
 proc lunar::clock_face_static {c} {
     # A native Direct2D clock receives its actual HWND size directly. This
     # canvas fallback mirrors that geometry for source-only Tk runs.
@@ -942,6 +984,7 @@ proc lunar::build {} {
     }
     pack .face.clock -fill both -expand 1 -padx 16 -pady 16
     bind .face.clock <ButtonRelease-1> { lunar::clock_marker_click %W %x %y }
+    bind .face.clock <ButtonRelease-3> { lunar::clock_hub_click %W %x %y }
 
     # Stable left-to-right status summary: trust, uncertainty, SYS witness,
     # then the selected display zone. The face can be read at a glance; this
@@ -2128,8 +2171,8 @@ proc lunar::selftest {reportPath} {
     # verify the event log: store ingest, rolling rotation, dialog table,
     # live filter, and sort flip -- all under a scratch data dir so the
     # user's real events.log is never touched
+    set eg "BAD gate errored"
     catch {
-        set eg "BAD unset"
         set saveEnv [expr {[info exists ::env(LUNAR_DATA_DIR)] ? $::env(LUNAR_DATA_DIR) : ""}]
         set saveEvents $::lunar::events
         set saveMax $::lunar::events_file_max
@@ -2170,8 +2213,44 @@ proc lunar::selftest {reportPath} {
         if {$saveEnv ne ""} { set ::env(LUNAR_DATA_DIR) $saveEnv } else { unset -nocomplain ::env(LUNAR_DATA_DIR) }
         set ::lunar::events $saveEvents
         catch { file delete -force $tmp }
-        append txt "eventlog=$eg\n"
     }
+    append txt "eventlog=$eg\n"
+    # verify the intermission: deterministic sim reaches playing, scores,
+    # and thins the fleet (test-step: no sound, no hi-score writes). The
+    # gate runs under a scratch data dir -- widget CREATION already reads
+    # the hi-score file (and would mkdir the real profile) -- and the
+    # append sits OUTSIDE the catch so a gate error reads BAD, never a
+    # silently missing line.
+    set ig "BAD gate errored"
+    catch {
+        if {[llength [info commands ::lunarinvaders]]} {
+            set saveEnv2 [expr {[info exists ::env(LUNAR_DATA_DIR)] ? $::env(LUNAR_DATA_DIR) : ""}]
+            set tmp2 [file join $::env(TEMP) "lunar-selftest-inv-[pid]"]
+            file mkdir $tmp2
+            set ::env(LUNAR_DATA_DIR) $tmp2
+            toplevel .invt
+            wm withdraw .invt
+            ::lunarinvaders .invt.g -width 448 -height 512
+            pack .invt.g
+            set s0 [dict get [.invt.g state] mode]
+            .invt.g test-step 2 8     ;# ENTER pressed: attract -> playing
+            .invt.g test-step 1 0     ;# released
+            set s1 [dict get [.invt.g state] mode]
+            .invt.g test-step 900 4   ;# hold FIRE from the spawn column
+            set st [.invt.g state]
+            destroy .invt
+            if {$saveEnv2 ne ""} { set ::env(LUNAR_DATA_DIR) $saveEnv2 } else { unset -nocomplain ::env(LUNAR_DATA_DIR) }
+            catch { file delete -force $tmp2 }
+            set good [expr {$s0 eq "attract" && $s1 eq "playing" &&
+                            [dict get $st score] > 0 &&
+                            [dict get $st alive] < 55}]
+            if {$good} { set ig ok } else { set ig "BAD $s0 $s1 $st" }
+        } else {
+            set ig "skipped (source-only run)"
+        }
+    }
+    catch { destroy .invt }   ;# never leak the harness toplevel on a gate error
+    append txt "invaders=$ig\n"
     append txt "status=[expr {$ok ? {ok} : {FAIL}}]\n"
     if {!$ok} { append txt "error=$msg\n" }
     if {$reportPath ne ""} {
@@ -2230,6 +2309,26 @@ proc lunar::main {} {
     }
     if {[info exists ::env(LUNAR_OPEN_ABOUT)]    && $::env(LUNAR_OPEN_ABOUT)    ne ""} { after 400 {lunar::settings_dlg app} }
     if {[info exists ::env(LUNAR_OPEN_LOG)]      && $::env(LUNAR_OPEN_LOG)      ne ""} { after 400 lunar::log_dlg }
+    # value "stage" additionally advances a deterministic mid-game state
+    # (screenshot staging; test-step keeps it silent and off the disk).
+    # The hook starts the game directly -- launch is inside the acquiring
+    # window, when the face is legitimately idle.
+    if {[info exists ::env(LUNAR_OPEN_INVADERS)] && $::env(LUNAR_OPEN_INVADERS) ne ""} {
+        after 400 lunar::invaders_start
+        if {$::env(LUNAR_OPEN_INVADERS) eq "stage"} {
+            after 900 {
+                catch {
+                    .face.game test-step 2 8    ;# press ENTER: attract -> playing
+                    .face.game test-step 1 0
+                    .face.game test-step 800 4  ;# hold FIRE from the spawn column
+                    .face.game test-step 200 5  ;# drift left, still firing
+                    .face.game hold             ;# freeze the tableau: the live
+                                                ;# pump must not step (or PAUSE-
+                                                ;# banner) over the staged frame
+                }
+            }
+        }
+    }
     # LUNAR_BEEP=<n>: on launch, run the real prewarm->chime sequence n times
     # (prewarm ~300ms before each chime, ~1s apart), for audio testing
     # (cold-device reliability, overlap-drop). Default 1.

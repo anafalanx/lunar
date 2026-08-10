@@ -230,6 +230,10 @@ proc task_build {args} {
     stream [gcc] -std=c23 -O2 {*}$gf -DSTATIC_BUILD=1 -ffunction-sections -fdata-sections \
         -I$inc -I[P src] -I[P build] -c [P src lunarclock.c] -o [P build lunarclock.o]
 
+    puts "cc  src/invaders.c"
+    stream [gcc] -std=c23 -O2 {*}$gf -DSTATIC_BUILD=1 -ffunction-sections -fdata-sections \
+        -I$inc -I[P src] -I[P build] -c [P src invaders.c] -o [P build invaders.o]
+
     puts "cc  src/lunar_main.c"
     stream [gcc] -std=c23 -O2 {*}$gf -municode -DUNICODE -D_UNICODE -DSTATIC_BUILD=1 \
         -DLUNAR_STATIC_LUNARX -ffunction-sections -fdata-sections \
@@ -238,7 +242,7 @@ proc task_build {args} {
     puts "ld  -> build/lunar-bare.exe"
     set bare [P build lunar-bare.exe]
     stream [gcc] -municode -mwindows -static-libgcc -Wl,--gc-sections \
-        [P build lunar_main.o] [P build lunarx.o] [P build lunarclock.o] {*}$objs [P build lunar.res] \
+        [P build lunar_main.o] [P build lunarx.o] [P build lunarclock.o] [P build invaders.o] {*}$objs [P build lunar.res] \
         [file join $libd libtcl9tk90.a] [file join $libd libtcl90.a] \
         [file join $libd libtclstub.a] $mbedtls {*}$::SYSLIBS -o $bare
     if {!$dbg} { catch {stream [strip-exe] $bare} }

@@ -29,6 +29,7 @@
 #include "version.h"
 
 extern int LunarClock_Init(Tcl_Interp *interp);
+extern int LunarInvaders_Init(Tcl_Interp *interp);
 
 static const char *trust_name(TrustState s) {
     switch (s) {
@@ -169,6 +170,12 @@ static void Beep_Shutdown(void) {
     HANDLE t = g_beepThread;
     if (t) { WaitForSingleObject(t, 1500); CloseHandle(t); g_beepThread = nullptr; }
     InterlockedExchange(&g_beepBusy, 0);
+}
+
+/* The intermission (invaders.c) keeps quiet while a chime is in flight:
+ * PlaySound is process-global-single, and the instrument outranks the toy. */
+int Lunar_ChimeBusy(void) {
+    return g_beepBusy != 0;
 }
 
 /* lunar::beep -- play the chime once. */
@@ -659,6 +666,7 @@ int Lunarx_Init(Tcl_Interp *ip) {
     if (Tcl_InitStubs(ip, "9.0", 0) == nullptr) return TCL_ERROR;
     Tcl_CreateNamespace(ip, "::lunar", nullptr, nullptr);
     if (LunarClock_Init(ip) != TCL_OK) return TCL_ERROR;
+    if (LunarInvaders_Init(ip) != TCL_OK) return TCL_ERROR;
     Tcl_CreateObjCommand(ip, "::lunar::engine_start", EngineStart_Cmd, nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::syncnow",      SyncNow_Cmd,     nullptr, nullptr);
     Tcl_CreateObjCommand(ip, "::lunar::shutdown",     Shutdown_Cmd,    nullptr, nullptr);
